@@ -24,7 +24,7 @@ temp/
 .tmp/
 
 # Зависимости и модули
-vendor/
+#vendor/
 
 # Логи
 *.log
