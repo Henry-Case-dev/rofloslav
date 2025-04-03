@@ -1,0 +1,66 @@
+# Бинарные файлы и исполняемые файлы
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+build/
+
+# Файлы тестов
+*.test
+*.out
+coverage.txt
+
+# Конфигурационные файлы и секреты
+config.yaml
+config.yml
+secrets/
+credentials.json
+
+# Временные файлы
+tmp/
+temp/
+.tmp/
+
+# Зависимости и модули
+vendor/
+
+# Логи
+*.log
+logs/
+
+# Кеш и временные файлы IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.history/
+__debug_bin
+.fleet/
+
+# Другие специфические файлы
+.DS_Store
+Thumbs.db
+.project
+.classpath
+.settings/
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+*.sav
+*.tmp
+*.temp
+*.tlog
+
+# Файл с переменными окружения
+#.env 
+
+# Папка IDE Cursor
+.cursor/ 
+
+# Файл с секретными переменными окружения
+.env.secrets 
