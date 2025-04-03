@@ -10,16 +10,23 @@ COPY go.mod go.sum ./
 
 # Загружаем зависимости
 # Используем go mod download для кеширования, если зависимости не менялись
-RUN go mod download
+RUN echo "--- Running go mod download ---" && \
+    go mod download -x
+RUN echo "--- Go mod download finished ---"
 
 # Копируем остальной исходный код
 COPY . .
 
+RUN echo "--- Listing files before build ---"
+RUN ls -lR / # Показываем структуру файлов в корне
+RUN echo "--- Running go build ---"
 # Собираем приложение
 # CGO_ENABLED=0 - для статической линковки, важно для Alpine
 # -ldflags="-w -s" - уменьшает размер бинарника
+# -v - verbose output
 # Выходной файл будет называться 'main'
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o main .
+RUN CGO_ENABLED=0 GOOS=linux go build -v -ldflags="-w -s" -o main .
+RUN echo "--- Go build finished ---"
 
 # ---- Runtime Stage ----
 # Используем конкретную версию Alpine для предсказуемости
