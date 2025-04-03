@@ -43,23 +43,29 @@ func (s *Storage) AddMessage(chatID int64, message *tgbotapi.Message) {
 		s.messages[chatID] = s.messages[chatID][len(s.messages[chatID])-s.contextWindow:]
 	}
 
-	s.mutex.Unlock() // Разблокируем перед запуском горутины сохранения
+	s.mutex.Unlock() // Разблокируем перед возможным запуском горутины сохранения
 
-	// Автосохранение истории чата в файл
-	if s.autoSave {
-		// Логируем попытку запуска сохранения
-		log.Printf("[History Save] Чат %d: Инициирую сохранение истории (autoSave=true)", chatID)
-		go func(cid int64) {
-			if err := s.SaveChatHistory(cid); err != nil {
-				log.Printf("[History Save ERROR] Чат %d: Ошибка автосохранения: %v", cid, err)
-			} else {
-				// Логируем успешное завершение горутины сохранения
-				log.Printf("[History Save OK] Чат %d: Горутина автосохранения завершена успешно.", cid)
-			}
-		}(chatID)
-	} else {
-		log.Printf("[History Save] Чат %d: Автосохранение отключено (autoSave=false)", chatID)
-	}
+	// --- ОПТИМИЗАЦИЯ: Отключаем сохранение на каждое сообщение ---
+	// Это сохранение избыточно, т.к. есть периодическое сохранение
+	// и сохранение при выходе. Оставляем только для явного вызова
+	// или периодического сохранения.
+	/*
+		// Автосохранение истории чата в файл
+		if s.autoSave {
+			// Логируем попытку запуска сохранения
+			log.Printf("[History Save] Чат %d: Инициирую сохранение истории (autoSave=true)", chatID)
+			go func(cid int64) {
+				if err := s.SaveChatHistory(cid); err != nil {
+					log.Printf("[History Save ERROR] Чат %d: Ошибка автосохранения: %v", cid, err)
+				} else {
+					// Логируем успешное завершение горутины сохранения
+					log.Printf("[History Save OK] Чат %d: Горутина автосохранения завершена успешно.", cid)
+				}
+			}(chatID)
+		} else {
+			log.Printf("[History Save] Чат %d: Автосохранение отключено (autoSave=false)", chatID)
+		}
+	*/
 }
 
 // GetMessages возвращает историю сообщений для чата

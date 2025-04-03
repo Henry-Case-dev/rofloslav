@@ -57,10 +57,13 @@ Thumbs.db
 *.tlog
 
 # Файл с переменными окружения
-#.env 
+.env
 
 # Папка IDE Cursor
 .cursor/ 
 
 # Файл с секретными переменными окружения
 .env.secrets 
+
+# Конфигурационный файл Amvera (не нужен при использовании Dockerfile)
+amvera.yaml 

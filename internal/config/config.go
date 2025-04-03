@@ -79,6 +79,22 @@ func Load() (*Config, error) {
 	srachConfirmPrompt := getEnvOrDefault("SRACH_CONFIRM_PROMPT", "Это сообщение - часть срача? Ответь true или false:")
 	srachKeywordsRaw := getEnvOrDefault("SRACH_KEYWORDS", "")
 
+	// --- Логирование загруженных значений (до парсинга чисел) ---
+	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
+	log.Printf("[Config Load] GEMINI_API_KEY: ...%s (len %d)", truncateStringEnd(geminiAPIKey, 5), len(geminiAPIKey))
+	log.Printf("[Config Load] GEMINI_MODEL_NAME: %s", geminiModelName)
+	log.Printf("[Config Load] DEFAULT_PROMPT: %s...", truncateString(defaultPrompt, 50))
+	log.Printf("[Config Load] DIRECT_PROMPT: %s...", truncateString(directPrompt, 50))
+	log.Printf("[Config Load] DAILY_TAKE_PROMPT: %s...", truncateString(dailyTakePrompt, 50))
+	log.Printf("[Config Load] SUMMARY_PROMPT: %s...", truncateString(summaryPrompt, 50))
+	log.Printf("[Config Load] RATE_LIMIT_ERROR_MESSAGE: %s...", truncateString(rateLimitErrorMsg, 50))
+	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
+	log.Printf("[Config Load] SRACH_WARNING_PROMPT: %s...", truncateString(srachWarningPrompt, 50))
+	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
+	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", truncateString(srachConfirmPrompt, 50))
+	log.Printf("[Config Load] DEBUG: %s", debugStr)
+	// --- Конец логирования ---
+
 	// --- Парсинг ключевых слов ---
 	var srachKeywordsList []string
 	if srachKeywordsRaw != "" {
@@ -161,4 +177,19 @@ func getEnvOrDefault(key, defaultValue string) string {
 		log.Printf("Переменная окружения %s не установлена, используется значение по умолчанию: %s", key, defaultValue)
 	}
 	return defaultValue
+}
+
+// Вспомогательные функции для логирования
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
+}
+
+func truncateStringEnd(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[len(s)-maxLen:]
 }

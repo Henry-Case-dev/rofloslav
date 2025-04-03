@@ -14,6 +14,9 @@ RUN echo "--- Running go mod download ---" && \
     go mod download -x
 RUN echo "--- Go mod download finished ---"
 
+# Копируем файл .env (НЕБЕЗОПАСНО ДЛЯ СЕКРЕТОВ!)
+COPY .env ./
+
 # Копируем остальной исходный код
 COPY . .
 
