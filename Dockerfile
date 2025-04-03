@@ -25,7 +25,8 @@ RUN echo "--- Running go build ---"
 # -ldflags="-w -s" - уменьшает размер бинарника
 # -v - verbose output
 # Выходной файл будет называться 'main'
-RUN CGO_ENABLED=0 GOOS=linux go build -v -ldflags="-w -s" -o main .
+# Используем флаг -mod=vendor, чтобы брать зависимости из папки vendor/
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -v -ldflags="-w -s" -o main .
 RUN echo "--- Go build finished ---"
 
 # ---- Runtime Stage ----
