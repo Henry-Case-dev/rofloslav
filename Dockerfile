@@ -18,7 +18,7 @@ RUN echo "--- Go mod download finished ---"
 COPY . .
 
 RUN echo "--- Listing files before build ---"
-RUN ls -lR / # Показываем структуру файлов в корне
+# RUN ls -lR / # Показываем структуру файлов в корне (ЗАКОММЕНТИРОВАНО - слишком долгий вывод)
 RUN echo "--- Running go build ---"
 # Собираем приложение
 # CGO_ENABLED=0 - для статической линковки, важно для Alpine

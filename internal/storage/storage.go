@@ -117,6 +117,7 @@ func (s *Storage) AddMessagesToContext(chatID int64, messages []*tgbotapi.Messag
 	}
 
 	// Автосохранение истории чата в файл
+	// Это может вызываться при загрузке истории.
 	if s.autoSave {
 		go func(cid int64) {
 			if err := s.SaveChatHistory(cid); err != nil {
