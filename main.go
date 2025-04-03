@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/yourusername/telegrambot/internal/bot"
-	"github.com/yourusername/telegrambot/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/bot"
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
 )
 
 // handleRoot - простой обработчик HTTP запросов

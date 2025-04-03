@@ -1,4 +1,4 @@
-module github.com/yourusername/telegrambot
+module github.com/Henry-Case-dev/rofloslav
 
 go 1.22
 

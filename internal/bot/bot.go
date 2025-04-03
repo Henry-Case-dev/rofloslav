@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
+	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/yourusername/telegrambot/internal/config"
-	"github.com/yourusername/telegrambot/internal/gemini"
-	"github.com/yourusername/telegrambot/internal/storage"
 )
 
 // Bot представляет Telegram бота
