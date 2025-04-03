@@ -14,9 +14,6 @@ RUN echo "--- Running go mod download ---" && \
     go mod download -x
 RUN echo "--- Go mod download finished ---"
 
-# Копируем файл .env (НЕБЕЗОПАСНО ДЛЯ СЕКРЕТОВ!)
-COPY .env ./
-
 # Копируем остальной исходный код
 COPY . .
 
@@ -40,6 +37,10 @@ WORKDIR /
 
 # Копируем скомпилированный бинарник из стадии сборки
 COPY --from=builder /main .
+
+# Копируем файл .env из контекста сборки в финальный образ
+# Убедитесь, что .env НЕ содержит секретов!
+COPY .env ./
 
 # Устанавливаем данные часовых поясов (необходимо для TIME_ZONE=Asia/Yekaterinburg)
 RUN apk add --no-cache tzdata
