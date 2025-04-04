@@ -102,6 +102,24 @@ func New(cfg *config.Config) (*Bot, error) {
 	}
 	log.Println("Хранилище истории успешно инициализировано.") // Подтверждаем успех
 
+	// --- Установка команд для кнопки "Меню" Telegram ---
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: "🚀 Запустить/перезапустить бота"},
+		{Command: "menu", Description: "📖 Показать главное меню"},
+		{Command: "settings", Description: "⚙️ Открыть настройки"},
+		{Command: "summary", Description: "📊 Запросить саммари"},
+		{Command: "stop", Description: "⏸️ Поставить бота на паузу"},
+		{Command: "help", Description: "❓ Помощь"},
+		{Command: "ping", Description: "🏓 Проверить доступность"},
+	}
+	setCommandsConfig := tgbotapi.NewSetMyCommands(commands...)
+	if _, err := api.Request(setCommandsConfig); err != nil {
+		log.Printf("[WARN] Не удалось установить команды бота: %v", err)
+	} else {
+		log.Println("Команды бота успешно установлены.")
+	}
+	// --- Конец установки команд ---
+
 	bot := &Bot{
 		api:                   api,
 		gemini:                geminiClient,
@@ -496,6 +514,17 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		// Загружаем историю при старте (если есть)
 		go b.loadChatHistory(chatID) // ВКЛЮЧЕНО
 		b.sendReplyWithKeyboard(chatID, "Бот активирован. Генерирую случайные ответы. Используйте /settings для настройки.", getMainKeyboard())
+
+	// ДОБАВЛЕНО: Обработка /menu как алиаса для /start
+	case "menu":
+		settings, _ := b.loadChatSettings(chatID) // Загружаем или создаем настройки
+		b.settingsMutex.Lock()
+		settings.Active = true // Активируем бота, если он был неактивен
+		b.settingsMutex.Unlock()
+		// Загружаем историю при старте (если есть и она не загружена)
+		go b.loadChatHistory(chatID)
+		// Отправляем главную клавиатуру
+		b.sendReplyWithKeyboard(chatID, "Главное меню:", getMainKeyboard())
 
 	case "stop":
 		settings, _ := b.loadChatSettings(chatID)
@@ -913,14 +942,14 @@ func (b *Bot) isPotentialSrachTrigger(message *tgbotapi.Message) bool {
 
 // sendSrachWarning отправляет предупреждение о начале срача
 func (b *Bot) sendSrachWarning(chatID int64) {
-	warning, err := b.gemini.GenerateArbitraryResponse(b.config.SRACH_WARNING_PROMPT, "")
-	if err != nil {
-		log.Printf("Ошибка генерации предупреждения о сраче для чата %d: %v", chatID, err)
-		// Отправляем статичное сообщение в случае ошибки
+	// Отправляем текст напрямую из конфигурации
+	if b.config.SRACH_WARNING_PROMPT != "" {
+		b.sendReply(chatID, b.config.SRACH_WARNING_PROMPT)
+	} else {
+		// Отправляем статичное сообщение по умолчанию, если в конфиге пусто
+		log.Printf("[WARN] Чат %d: SRACH_WARNING_PROMPT не задан в конфигурации, используется стандартное сообщение.", chatID)
 		b.sendReply(chatID, "🚨 Внимание! Обнаружен потенциальный срач! 🚨")
-		return
 	}
-	b.sendReply(chatID, warning)
 }
 
 // confirmSrachWithLLM проверяет сообщение через LLM на принадлежность к срачу
