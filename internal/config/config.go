@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -38,12 +39,15 @@ type Config struct {
 	ContextWindow        int
 	Debug                bool
 	// Новые поля для S3
-	S3Endpoint   string
-	S3Region     string
-	S3AccessKey  string
-	S3SecretKey  string // Это секрет
-	S3BucketName string
-	S3UseSSL     bool
+	UseS3Storage      bool
+	S3Endpoint        string
+	S3Region          string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3BucketName      string
+	S3UseSSL          bool
+	// Интервал сохранения истории
+	HistorySaveInterval time.Duration
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -89,11 +93,14 @@ func Load() (*Config, error) {
 	// --- Загрузка переменных S3 ---
 	s3Endpoint := getEnvOrDefault("S3_ENDPOINT", "")
 	s3Region := getEnvOrDefault("S3_REGION", "us-east-1") // Стандартный регион как fallback
-	s3AccessKey := getEnvOrDefault("S3_ACCESS_KEY", "")
-	s3SecretKey := getEnvOrDefault("S3_SECRET_KEY", "")
+	s3AccessKeyID := getEnvOrDefault("S3_ACCESS_KEY_ID", "")
+	s3SecretAccessKey := getEnvOrDefault("S3_SECRET_ACCESS_KEY", "")
 	s3BucketName := getEnvOrDefault("S3_BUCKET_NAME", "")
 	s3UseSSLStr := getEnvOrDefault("S3_USE_SSL", "true")
 	s3UseSSL := s3UseSSLStr == "true"
+	useS3StorageStr := getEnvOrDefault("USE_S3_STORAGE", "false")
+	useS3Storage := useS3StorageStr == "true"
+	historySaveIntervalStr := getEnvOrDefault("HISTORY_SAVE_INTERVAL", "5m")
 	// --- Конец загрузки S3 ---
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
@@ -110,13 +117,14 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
 	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", truncateString(srachConfirmPrompt, 50))
 	log.Printf("[Config Load] DEBUG: %s", debugStr)
-	// Добавляем логирование S3 (кроме секрета)
 	log.Printf("[Config Load] S3_ENDPOINT: %s", s3Endpoint)
 	log.Printf("[Config Load] S3_REGION: %s", s3Region)
-	log.Printf("[Config Load] S3_ACCESS_KEY: %s...", truncateString(s3AccessKey, 5))
-	log.Printf("[Config Load] S3_SECRET_KEY: *** (set)") // Не логируем сам секрет
+	log.Printf("[Config Load] S3_ACCESS_KEY_ID: %s...", truncateString(s3AccessKeyID, 5))
+	log.Printf("[Config Load] S3_SECRET_ACCESS_KEY: *** (set)")
 	log.Printf("[Config Load] S3_BUCKET_NAME: %s", s3BucketName)
 	log.Printf("[Config Load] S3_USE_SSL: %t", s3UseSSL)
+	log.Printf("[Config Load] USE_S3_STORAGE: %t", useS3Storage)
+	log.Printf("[Config Load] HISTORY_SAVE_INTERVAL: %s", historySaveIntervalStr)
 	// --- Конец логирования ---
 
 	// --- Парсинг ключевых слов ---
@@ -165,6 +173,13 @@ func Load() (*Config, error) {
 
 	debug := debugStr == "true" || debugStr == "1" || debugStr == "yes"
 
+	// Парсинг интервала сохранения истории
+	historySaveInterval, err := time.ParseDuration(historySaveIntervalStr)
+	if err != nil {
+		log.Printf("Ошибка парсинга HISTORY_SAVE_INTERVAL: %v, используем 5m", err)
+		historySaveInterval = 5 * time.Minute
+	}
+
 	return &Config{
 		TelegramToken:              telegramToken,
 		GeminiAPIKey:               geminiAPIKey,
@@ -189,13 +204,14 @@ func Load() (*Config, error) {
 		MaxMessages:                maxMsg,
 		ContextWindow:              contextWindow,
 		Debug:                      debug,
-		// Присваиваем поля S3
-		S3Endpoint:   s3Endpoint,
-		S3Region:     s3Region,
-		S3AccessKey:  s3AccessKey,
-		S3SecretKey:  s3SecretKey,
-		S3BucketName: s3BucketName,
-		S3UseSSL:     s3UseSSL,
+		UseS3Storage:               useS3Storage,
+		S3Endpoint:                 s3Endpoint,
+		S3Region:                   s3Region,
+		S3AccessKeyID:              s3AccessKeyID,
+		S3SecretAccessKey:          s3SecretAccessKey,
+		S3BucketName:               s3BucketName,
+		S3UseSSL:                   s3UseSSL,
+		HistorySaveInterval:        historySaveInterval,
 	}, nil
 }
 

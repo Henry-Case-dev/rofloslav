@@ -20,7 +20,7 @@ import (
 type Bot struct {
 	api                *tgbotapi.BotAPI
 	gemini             *gemini.Client
-	storage            *storage.Storage
+	storage            storage.HistoryStorage
 	config             *config.Config
 	chatSettings       map[int64]*ChatSettings
 	settingsMutex      sync.RWMutex
@@ -80,32 +80,37 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil, fmt.Errorf("ошибка инициализации Gemini Client: %w", err)
 	}
 
-	storage := storage.New(cfg.ContextWindow, true) // Включаем автосохранение истории на диск
+	// Используем фабрику для создания хранилища (S3 или Local)
+	historyStorage, err := storage.NewHistoryStorage(cfg)
+	if err != nil {
+		// Фабрика уже логирует ошибку, но мы можем добавить еще или паниковать
+		return nil, fmt.Errorf("критическая ошибка инициализации хранилища истории: %w", err)
+	}
+	log.Println("Хранилище истории успешно инициализировано.") // Подтверждаем успех
 
 	bot := &Bot{
 		api:                api,
 		gemini:             geminiClient,
-		storage:            storage,
+		storage:            historyStorage,
 		config:             cfg,
 		chatSettings:       make(map[int64]*ChatSettings),
+		settingsMutex:      sync.RWMutex{},
 		stop:               make(chan struct{}),
 		lastSummaryRequest: make(map[int64]time.Time),
-		// autoSummaryTicker инициализируется в schedulePeriodicSummary
 	}
 
 	// Загрузка истории для всех чатов при старте (опционально, может занять время)
+	// S3Storage уже пытается загрузить при инициализации.
+	// Для LocalStorage этот вызов может быть нужен, если хотим предзагрузить.
 	// bot.loadAllChatHistoriesOnStart() // Раскомментируйте, если нужно
 
 	// Запуск планировщика для ежедневного тейка
 	go bot.scheduleDailyTake(cfg.DailyTakeTime, cfg.TimeZone)
 
-	// Запуск периодического сохранения истории для всех чатов (ВОССТАНОВЛЕНО)
-	go bot.scheduleHistorySaving()
-
 	// Запуск планировщика для автоматического саммари
 	go bot.schedulePeriodicSummary()
 
-	log.Println("Бот успешно инициализирован (с автосохранением истории)") // Обновляем лог
+	log.Println("Бот успешно инициализирован.") // Обновляем лог
 	return bot, nil
 }
 
@@ -137,7 +142,8 @@ func (b *Bot) Stop() {
 	}
 
 	// Сохраняем все истории перед выходом (ВОССТАНОВЛЕНО)
-	b.saveAllChatHistories()
+	log.Println("Сохранение истории всех чатов перед остановкой...")
+	b.saveAllChatHistories() // Используем метод, который вызывает SaveAllChatHistories интерфейса
 
 	log.Println("Бот остановлен.")
 }
@@ -147,6 +153,20 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	if update.Message != nil {
 		chatID := update.Message.Chat.ID
 		text := update.Message.Text
+
+		// --- ЗАГРУЗКА ИСТОРИИ ДЛЯ НОВОГО ЧАТА (если еще нет в кеше) ---
+		// Это нужно, чтобы при первом сообщении в "новом" для этого запуска бота чате
+		// мы подгрузили его историю из S3/файла, если она там есть.
+		b.storage.GetMessages(chatID) // Этот вызов для S3Storage ничего не делает, но для LocalStorage создаст запись в map, если ее нет
+		// Попробуем загрузить историю, если ее нет в кеше S3Storage или для LocalStorage
+		if len(b.storage.GetMessages(chatID)) == 0 { // Проверяем кеш
+			_, err := b.storage.LoadChatHistory(chatID) // Загружаем и добавляем в кеш/память
+			if err != nil {
+				log.Printf("[handleUpdate ERROR] Чат %d: Не удалось загрузить историю: %v", chatID, err)
+			}
+		}
+		// --- КОНЕЦ ЗАГРУЗКИ ИСТОРИИ ---
+
 		messageTime := update.Message.Time()
 
 		// --- Инициализация/Загрузка настроек чата --- (Используем loadChatSettings)
@@ -1302,9 +1322,14 @@ func (b *Bot) loadChatHistory(chatID int64) {
 	b.sendReply(chatID, fmt.Sprintf("✅ Контекст загружен: %d сообщений. Я готов к работе!", loadCount))
 }
 
-// scheduleHistorySaving запускает планировщик для периодического сохранения истории
+// scheduleHistorySaving запускает периодическое сохранение истории
 func (b *Bot) scheduleHistorySaving() {
-	ticker := time.NewTicker(30 * time.Minute) // Сохраняем каждые 30 минут
+	// Убедимся, что интервал > 0
+	if b.config.HistorySaveInterval <= 0 {
+		log.Println("[scheduleHistorySaving] Интервал сохранения истории не задан или равен 0. Периодическое сохранение отключено.")
+		return // Не запускаем, если интервал некорректный
+	}
+	ticker := time.NewTicker(b.config.HistorySaveInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1319,28 +1344,16 @@ func (b *Bot) scheduleHistorySaving() {
 	}
 }
 
-// saveAllChatHistories сохраняет историю всех активных чатов
+// saveAllChatHistories вызывает сохранение истории для всех чатов через интерфейс
 func (b *Bot) saveAllChatHistories() {
-	b.settingsMutex.RLock()
-	chats := make([]int64, 0, len(b.chatSettings))
-	for chatID := range b.chatSettings {
-		chats = append(chats, chatID)
+	if b.storage == nil {
+		log.Println("[saveAllChatHistories WARN] Хранилище еще не инициализировано.")
+		return
 	}
-	b.settingsMutex.RUnlock()
-
-	log.Printf("[Save All] Начинаю сохранение истории для %d чатов...", len(chats))
-	var wg sync.WaitGroup
-	for _, chatID := range chats {
-		wg.Add(1)
-		go func(cid int64) {
-			defer wg.Done()
-			if err := b.storage.SaveChatHistory(cid); err != nil {
-				log.Printf("[Save All ERROR] Ошибка сохранения истории для чата %d: %v", cid, err)
-			}
-		}(chatID)
+	log.Println("Запуск сохранения истории для всех чатов...")
+	if err := b.storage.SaveAllChatHistories(); err != nil {
+		log.Printf("Ошибка при сохранении истории всех чатов: %v", err)
 	}
-	wg.Wait() // Ждем завершения всех сохранений
-	log.Printf("[Save All] Сохранение истории для всех чатов завершено.")
 }
 
 // --- Конец восстановленных функций ---

@@ -1,11 +1,13 @@
 package storage
 
 import (
+	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
 )
 
 // --- Интерфейс Хранилища ---
@@ -45,130 +47,132 @@ type HistoryStorage interface {
 
 // --- Конец Интерфейса ---
 
-// Storage предоставляет хранилище для истории сообщений (ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ ДЛЯ ОБЩЕЙ ЛОГИКИ В ПАМЯТИ)
+// --- УДАЛЕНА СТАРАЯ СТРУКТУРА Storage и ЕЕ МЕТОДЫ ---
+/*
 type Storage struct {
 	messages      map[int64][]*tgbotapi.Message
 	contextWindow int
-	mutex         sync.RWMutex
-	autoSave      bool           // Нужен ли вызов SaveChatHistory после изменений
+	autoSave      bool
 	storageImpl   HistoryStorage // Ссылка на себя или S3/Local реализацию для вызова Save/Load
 }
 
-// New создает новое хранилище
-func New(contextWindow int, autoSave bool) *Storage {
-	return &Storage{
-		messages:      make(map[int64][]*tgbotapi.Message),
-		contextWindow: contextWindow,
-		mutex:         sync.RWMutex{},
-		autoSave:      autoSave,
-	}
+func New(contextWindow int, autoSave bool) *Storage { ... }
+func (s *Storage) AddMessage(...) { ... }
+func (s *Storage) GetMessages(...) []*tgbotapi.Message { ... }
+func (s *Storage) GetMessagesSince(...) []*tgbotapi.Message { ... }
+func (s *Storage) AddMessagesToContext(...) { ... }
+func (s *Storage) ClearChatHistory(...) { ... }
+*/
+// --- КОНЕЦ УДАЛЕННОГО КОДА ---
+
+// --- Структуры для конвертации ---
+
+type StoredMessage struct {
+	MessageID      int                      `json:"message_id"`
+	FromID         int64                    `json:"from_id"`
+	FromIsBot      bool                     `json:"from_is_bot"`
+	FromFirstName  string                   `json:"from_first_name"`
+	FromLastName   string                   `json:"from_last_name"`
+	FromUserName   string                   `json:"from_username"`
+	Date           int                      `json:"date"`
+	Text           string                   `json:"text"`
+	ReplyToMessage *StoredMessage           `json:"reply_to_message,omitempty"`
+	Entities       []tgbotapi.MessageEntity `json:"entities,omitempty"`
 }
 
-// AddMessage добавляет сообщение в хранилище и инициирует автосохранение
-func (s *Storage) AddMessage(chatID int64, message *tgbotapi.Message) {
-	s.mutex.Lock()
-
-	// Создаем историю для чата, если ее еще нет
-	if _, exists := s.messages[chatID]; !exists {
-		s.messages[chatID] = make([]*tgbotapi.Message, 0)
+func ConvertToStoredMessage(msg *tgbotapi.Message) *StoredMessage {
+	if msg == nil {
+		return nil
 	}
-
-	// Добавляем сообщение
-	s.messages[chatID] = append(s.messages[chatID], message)
-
-	// Удаляем старые сообщения, если превышен контекстный лимит
-	if len(s.messages[chatID]) > s.contextWindow {
-		s.messages[chatID] = s.messages[chatID][len(s.messages[chatID])-s.contextWindow:]
+	stored := &StoredMessage{
+		MessageID: msg.MessageID,
+		Date:      msg.Date,
+		Text:      msg.Text,
+		Entities:  msg.Entities,
 	}
-
-	s.mutex.Unlock() // Разблокируем перед возможным запуском горутины сохранения
-
-	// --- ОПТИМИЗАЦИЯ: Отключаем сохранение на каждое сообщение ---
-	// Это сохранение избыточно, т.к. есть периодическое сохранение
-	// и сохранение при выходе. Оставляем только для явного вызова
-	// или периодического сохранения.
-	/*
-		// Автосохранение истории чата в файл
-		if s.autoSave {
-			// Логируем попытку запуска сохранения
-			log.Printf("[History Save] Чат %d: Инициирую сохранение истории (autoSave=true)", chatID)
-			go func(cid int64) {
-				if err := s.SaveChatHistory(cid); err != nil {
-					log.Printf("[History Save ERROR] Чат %d: Ошибка автосохранения: %v", cid, err)
-				} else {
-					// Логируем успешное завершение горутины сохранения
-					log.Printf("[History Save OK] Чат %d: Горутина автосохранения завершена успешно.", cid)
-				}
-			}(chatID)
-		} else {
-			log.Printf("[History Save] Чат %d: Автосохранение отключено (autoSave=false)", chatID)
-		}
-	*/
+	if msg.From != nil {
+		stored.FromID = msg.From.ID
+		stored.FromIsBot = msg.From.IsBot
+		stored.FromFirstName = msg.From.FirstName
+		stored.FromLastName = msg.From.LastName
+		stored.FromUserName = msg.From.UserName
+	}
+	if msg.ReplyToMessage != nil {
+		stored.ReplyToMessage = ConvertToStoredMessage(msg.ReplyToMessage)
+	}
+	return stored
 }
 
-// GetMessages возвращает историю сообщений для чата
-func (s *Storage) GetMessages(chatID int64) []*tgbotapi.Message {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
-	if messages, exists := s.messages[chatID]; exists {
-		return messages
+func ConvertToAPIMessage(stored *StoredMessage) *tgbotapi.Message {
+	if stored == nil {
+		return nil
 	}
-
-	return []*tgbotapi.Message{}
+	msg := &tgbotapi.Message{
+		MessageID: stored.MessageID,
+		From: &tgbotapi.User{
+			ID:        stored.FromID,
+			IsBot:     stored.FromIsBot,
+			FirstName: stored.FromFirstName,
+			LastName:  stored.FromLastName,
+			UserName:  stored.FromUserName,
+		},
+		Date:     stored.Date,
+		Text:     stored.Text,
+		Entities: stored.Entities,
+	}
+	if stored.ReplyToMessage != nil {
+		msg.ReplyToMessage = ConvertToAPIMessage(stored.ReplyToMessage)
+	}
+	return msg
 }
 
-// GetMessagesSince возвращает сообщения начиная с указанного времени
-func (s *Storage) GetMessagesSince(chatID int64, since time.Time) []*tgbotapi.Message {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+// --- Конец структур ---
 
-	if messages, exists := s.messages[chatID]; exists {
-		result := make([]*tgbotapi.Message, 0)
-		for _, msg := range messages {
-			if msg.Time().After(since) {
-				result = append(result, msg)
+// --- Фабричная функция ---
+
+// NewHistoryStorage создает и возвращает подходящую реализацию HistoryStorage
+// на основе конфигурации.
+func NewHistoryStorage(cfg *config.Config) (HistoryStorage, error) {
+	if cfg.UseS3Storage {
+		log.Println("[Storage Factory] Используется конфигурация S3 хранилища.")
+		// Проверяем наличие обязательных S3 параметров
+		if cfg.S3Endpoint == "" || cfg.S3BucketName == "" || cfg.S3AccessKeyID == "" || cfg.S3SecretAccessKey == "" {
+			log.Println("[Storage Factory ERROR] Не заданы все необходимые параметры S3 (Endpoint, BucketName, AccessKeyID, SecretAccessKey). Используется LocalStorage.")
+			// Возвращаем LocalStorage как запасной вариант
+			// ИСПРАВЛЕНО: Обрабатываем ошибку от NewLocalStorage
+			localStorage, err := NewLocalStorage(cfg.ContextWindow)
+			if err != nil {
+				log.Printf("[Storage Factory ERROR] Ошибка инициализации запасного LocalStorage: %v", err)
+				// Возвращаем ошибку, т.к. не смогли создать даже запасной вариант
+				return nil, fmt.Errorf("ошибка инициализации запасного LocalStorage: %w", err)
 			}
+			return localStorage, nil // Возвращаем созданный LocalStorage
 		}
-		return result
-	}
 
-	return []*tgbotapi.Message{}
-}
-
-// AddMessagesToContext добавляет массив сообщений в контекст чата
-func (s *Storage) AddMessagesToContext(chatID int64, messages []*tgbotapi.Message) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	// Создаем историю для чата, если ее еще нет
-	if _, exists := s.messages[chatID]; !exists {
-		s.messages[chatID] = make([]*tgbotapi.Message, 0)
-	}
-
-	// Добавляем сообщения
-	s.messages[chatID] = append(s.messages[chatID], messages...)
-
-	// Удаляем старые сообщения, если превышен контекстный лимит
-	if len(s.messages[chatID]) > s.contextWindow {
-		s.messages[chatID] = s.messages[chatID][len(s.messages[chatID])-s.contextWindow:]
-	}
-
-	// Автосохранение истории чата в файл
-	// Это может вызываться при загрузке истории.
-	if s.autoSave {
-		go func(cid int64) {
-			if err := s.SaveChatHistory(cid); err != nil {
-				log.Printf("Ошибка автосохранения истории чата %d: %v", cid, err)
+		s3Store, err := NewS3Storage(cfg, cfg.ContextWindow)
+		if err != nil {
+			log.Printf("[Storage Factory ERROR] Ошибка инициализации S3 хранилища: %v. Используется LocalStorage.", err)
+			// Возвращаем LocalStorage как запасной вариант
+			// ИСПРАВЛЕНО: Обрабатываем ошибку от NewLocalStorage
+			localStorage, localErr := NewLocalStorage(cfg.ContextWindow)
+			if localErr != nil {
+				log.Printf("[Storage Factory ERROR] Ошибка инициализации запасного LocalStorage после ошибки S3: %v", localErr)
+				// Возвращаем исходную ошибку S3 + ошибку запасного варианта
+				return nil, fmt.Errorf("ошибка инициализации S3 (%v) и запасного LocalStorage (%w)", err, localErr)
 			}
-		}(chatID)
+			return localStorage, nil // Возвращаем созданный LocalStorage
+		}
+		log.Println("[Storage Factory] S3 хранилище успешно инициализировано.")
+		return s3Store, nil
+	} else {
+		log.Println("[Storage Factory] Используется конфигурация LocalStorage.")
+		// Возвращаем LocalStorage
+		// ИСПРАВЛЕНО: Обрабатываем ошибку от NewLocalStorage
+		localStorage, err := NewLocalStorage(cfg.ContextWindow)
+		if err != nil {
+			log.Printf("[Storage Factory ERROR] Ошибка инициализации LocalStorage: %v", err)
+			return nil, fmt.Errorf("ошибка инициализации LocalStorage: %w", err)
+		}
+		return localStorage, nil
 	}
-}
-
-// ClearChatHistory очищает историю сообщений для указанного чата в памяти
-func (s *Storage) ClearChatHistory(chatID int64) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	delete(s.messages, chatID)
-	log.Printf("[ClearChatHistory] Чат %d: История в памяти очищена.", chatID)
 }
