@@ -8,12 +8,50 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// Storage предоставляет хранилище для истории сообщений
+// --- Интерфейс Хранилища ---
+
+// HistoryStorage определяет методы для работы с хранилищем истории чатов.
+// Это позволяет использовать разные реализации (локальный файл, S3 и т.д.).
+type HistoryStorage interface {
+	// AddMessage добавляет одно сообщение в историю чата (в память).
+	AddMessage(chatID int64, message *tgbotapi.Message)
+
+	// AddMessagesToContext добавляет несколько сообщений в историю чата (в память).
+	AddMessagesToContext(chatID int64, messages []*tgbotapi.Message)
+
+	// GetMessages возвращает текущую историю сообщений для чата из памяти.
+	GetMessages(chatID int64) []*tgbotapi.Message
+
+	// GetMessagesSince возвращает сообщения из памяти, начиная с указанного времени.
+	GetMessagesSince(chatID int64, since time.Time) []*tgbotapi.Message
+
+	// LoadChatHistory загружает историю для указанного чата из персистентного хранилища (файл/S3).
+	// Возвращает nil, nil если история не найдена.
+	LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error)
+
+	// SaveChatHistory сохраняет текущую историю из памяти в персистентное хранилище (файл/S3).
+	SaveChatHistory(chatID int64) error
+
+	// ClearChatHistory очищает историю для чата из памяти.
+	ClearChatHistory(chatID int64)
+
+	// SaveAllChatHistories сохраняет историю всех чатов из памяти в персистентное хранилище.
+	SaveAllChatHistories() error
+
+	// LoadAllChatHistories (Опционально, может понадобиться для S3)
+	// Загружает историю для всех известных чатов (например, при старте).
+	// LoadAllChatHistories() error
+}
+
+// --- Конец Интерфейса ---
+
+// Storage предоставляет хранилище для истории сообщений (ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ ДЛЯ ОБЩЕЙ ЛОГИКИ В ПАМЯТИ)
 type Storage struct {
 	messages      map[int64][]*tgbotapi.Message
 	contextWindow int
 	mutex         sync.RWMutex
-	autoSave      bool
+	autoSave      bool           // Нужен ли вызов SaveChatHistory после изменений
+	storageImpl   HistoryStorage // Ссылка на себя или S3/Local реализацию для вызова Save/Load
 }
 
 // New создает новое хранилище

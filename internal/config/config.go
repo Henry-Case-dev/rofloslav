@@ -37,6 +37,13 @@ type Config struct {
 	MaxMessages          int
 	ContextWindow        int
 	Debug                bool
+	// Новые поля для S3
+	S3Endpoint   string
+	S3Region     string
+	S3AccessKey  string
+	S3SecretKey  string // Это секрет
+	S3BucketName string
+	S3UseSSL     bool
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -79,6 +86,16 @@ func Load() (*Config, error) {
 	srachConfirmPrompt := getEnvOrDefault("SRACH_CONFIRM_PROMPT", "Это сообщение - часть срача? Ответь true или false:")
 	srachKeywordsRaw := getEnvOrDefault("SRACH_KEYWORDS", "")
 
+	// --- Загрузка переменных S3 ---
+	s3Endpoint := getEnvOrDefault("S3_ENDPOINT", "")
+	s3Region := getEnvOrDefault("S3_REGION", "us-east-1") // Стандартный регион как fallback
+	s3AccessKey := getEnvOrDefault("S3_ACCESS_KEY", "")
+	s3SecretKey := getEnvOrDefault("S3_SECRET_KEY", "")
+	s3BucketName := getEnvOrDefault("S3_BUCKET_NAME", "")
+	s3UseSSLStr := getEnvOrDefault("S3_USE_SSL", "true")
+	s3UseSSL := s3UseSSLStr == "true"
+	// --- Конец загрузки S3 ---
+
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
 	log.Printf("[Config Load] GEMINI_API_KEY: ...%s (len %d)", truncateStringEnd(geminiAPIKey, 5), len(geminiAPIKey))
@@ -93,6 +110,13 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
 	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", truncateString(srachConfirmPrompt, 50))
 	log.Printf("[Config Load] DEBUG: %s", debugStr)
+	// Добавляем логирование S3 (кроме секрета)
+	log.Printf("[Config Load] S3_ENDPOINT: %s", s3Endpoint)
+	log.Printf("[Config Load] S3_REGION: %s", s3Region)
+	log.Printf("[Config Load] S3_ACCESS_KEY: %s...", truncateString(s3AccessKey, 5))
+	log.Printf("[Config Load] S3_SECRET_KEY: *** (set)") // Не логируем сам секрет
+	log.Printf("[Config Load] S3_BUCKET_NAME: %s", s3BucketName)
+	log.Printf("[Config Load] S3_USE_SSL: %t", s3UseSSL)
 	// --- Конец логирования ---
 
 	// --- Парсинг ключевых слов ---
@@ -165,6 +189,13 @@ func Load() (*Config, error) {
 		MaxMessages:                maxMsg,
 		ContextWindow:              contextWindow,
 		Debug:                      debug,
+		// Присваиваем поля S3
+		S3Endpoint:   s3Endpoint,
+		S3Region:     s3Region,
+		S3AccessKey:  s3AccessKey,
+		S3SecretKey:  s3SecretKey,
+		S3BucketName: s3BucketName,
+		S3UseSSL:     s3UseSSL,
 	}, nil
 }
 
