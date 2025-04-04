@@ -1,6 +1,6 @@
 # ---- Build Stage ----
-# Используем официальный образ Go 1.22 на Alpine для сборки
-FROM golang:1.22-alpine AS builder
+# Используем официальный образ Go 1.23 на Alpine для сборки (соответствует go.mod)
+FROM golang:1.23-alpine AS builder
 
 # Устанавливаем рабочую директорию внутри контейнера
 WORKDIR /
