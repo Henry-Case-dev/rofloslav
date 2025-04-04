@@ -28,6 +28,13 @@ type Bot struct {
 	summaryMutex       sync.RWMutex
 	lastSummaryRequest map[int64]time.Time
 	autoSummaryTicker  *time.Ticker
+
+	// Поле для отслеживания прямых обращений: chatID -> userID -> []timestamp
+	directReplyTimestamps map[int64]map[int64][]time.Time
+	directReplyMutex      sync.Mutex // Мьютекс для защиты directReplyTimestamps
+
+	// ID самого бота (для проверки Reply)
+	botID int64
 }
 
 // ChatSettings содержит настройки для каждого чата
@@ -74,6 +81,13 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil, fmt.Errorf("ошибка инициализации Telegram API: %w", err)
 	}
 
+	// Получаем ID бота
+	botUser, err := api.GetMe()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения информации о боте: %w", err)
+	}
+	log.Printf("Бот запущен как: %s (ID: %d)", botUser.UserName, botUser.ID)
+
 	// Используем новый конструктор Gemini клиента
 	geminiClient, err := gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.Debug)
 	if err != nil {
@@ -89,14 +103,18 @@ func New(cfg *config.Config) (*Bot, error) {
 	log.Println("Хранилище истории успешно инициализировано.") // Подтверждаем успех
 
 	bot := &Bot{
-		api:                api,
-		gemini:             geminiClient,
-		storage:            historyStorage,
-		config:             cfg,
-		chatSettings:       make(map[int64]*ChatSettings),
-		settingsMutex:      sync.RWMutex{},
-		stop:               make(chan struct{}),
-		lastSummaryRequest: make(map[int64]time.Time),
+		api:                   api,
+		gemini:                geminiClient,
+		storage:               historyStorage,
+		config:                cfg,
+		chatSettings:          make(map[int64]*ChatSettings),
+		settingsMutex:         sync.RWMutex{},
+		stop:                  make(chan struct{}),
+		summaryMutex:          sync.RWMutex{},
+		lastSummaryRequest:    make(map[int64]time.Time),
+		directReplyTimestamps: make(map[int64]map[int64][]time.Time),
+		directReplyMutex:      sync.Mutex{},
+		botID:                 botUser.ID,
 	}
 
 	// Загрузка истории для всех чатов при старте (опционально, может занять время)
@@ -150,231 +168,305 @@ func (b *Bot) Stop() {
 
 // handleUpdate обрабатывает входящие обновления
 func (b *Bot) handleUpdate(update tgbotapi.Update) {
-	if update.Message != nil {
-		chatID := update.Message.Chat.ID
-		text := update.Message.Text
+	if update.Message == nil { // Игнорируем не-сообщения
+		return
+	}
 
-		// --- ЗАГРУЗКА ИСТОРИИ ДЛЯ НОВОГО ЧАТА (если еще нет в кеше) ---
-		// Это нужно, чтобы при первом сообщении в "новом" для этого запуска бота чате
-		// мы подгрузили его историю из S3/файла, если она там есть.
-		b.storage.GetMessages(chatID) // Этот вызов для S3Storage ничего не делает, но для LocalStorage создаст запись в map, если ее нет
-		// Попробуем загрузить историю, если ее нет в кеше S3Storage или для LocalStorage
-		if len(b.storage.GetMessages(chatID)) == 0 { // Проверяем кеш
-			_, err := b.storage.LoadChatHistory(chatID) // Загружаем и добавляем в кеш/память
-			if err != nil {
-				log.Printf("[handleUpdate ERROR] Чат %d: Не удалось загрузить историю: %v", chatID, err)
-			}
-		}
-		// --- КОНЕЦ ЗАГРУЗКИ ИСТОРИИ ---
+	message := update.Message
+	chatID := message.Chat.ID
+	userID := message.From.ID // ID пользователя, отправившего сообщение
+	text := message.Text
 
-		messageTime := update.Message.Time()
-
-		// --- Инициализация/Загрузка настроек чата --- (Используем loadChatSettings)
-		settings, err := b.loadChatSettings(chatID)
-		if err != nil {
-			log.Printf("handleUpdate: Ошибка загрузки/создания настроек для чата %d: %v", chatID, err)
-			return // Не можем обработать без настроек
-		}
-		// --- Конец инициализации ---
-
-		// --- Обработка отмены ввода --- (остается без изменений)
-		b.settingsMutex.RLock()
-		currentPendingSetting := settings.PendingSetting
-		b.settingsMutex.RUnlock()
-		if text == "/cancel" && currentPendingSetting != "" {
-			b.settingsMutex.Lock()
-			settings.PendingSetting = "" // Сбрасываем ожидание
-			b.settingsMutex.Unlock()
-			b.sendReply(chatID, "Ввод отменен.")
-			b.sendSettingsKeyboard(chatID) // Показываем меню настроек снова
-			return
-		}
-		// --- Конец обработки отмены ---
-
-		// --- Обработка ввода ожидаемой настройки --- (остается без изменений)
-		if currentPendingSetting != "" {
-			isValidInput := false
-			parsedValue, err := strconv.Atoi(text)
-
-			if err != nil {
-				b.sendReply(chatID, "Ошибка: Введите числовое значение или /cancel для отмены.")
-			} else {
-				b.settingsMutex.Lock() // Блокируем для изменения настроек
-				switch currentPendingSetting {
-				case "min_messages":
-					if parsedValue > 0 && parsedValue <= settings.MaxMessages {
-						settings.MinMessages = parsedValue
-						isValidInput = true
-					} else {
-						b.sendReply(chatID, fmt.Sprintf("Ошибка: Минимальное значение должно быть больше 0 и не больше максимального (%d).", settings.MaxMessages))
-					}
-				case "max_messages":
-					if parsedValue >= settings.MinMessages {
-						settings.MaxMessages = parsedValue
-						isValidInput = true
-					} else {
-						b.sendReply(chatID, fmt.Sprintf("Ошибка: Максимальное значение должно быть не меньше минимального (%d).", settings.MinMessages))
-					}
-				case "daily_time":
-					if parsedValue >= 0 && parsedValue <= 23 {
-						settings.DailyTakeTime = parsedValue
-						// Перезапускаем планировщик тейка с новым временем (если он уже был запущен)
-						// Простая реализация: просто логируем, сложная - требует управления горутиной
-						log.Printf("Настройка времени тейка изменена на %d для чата %d. Перезапустите бота для применения ко всем чатам или реализуйте динамическое обновление.", parsedValue, chatID)
-						isValidInput = true
-					} else {
-						b.sendReply(chatID, "Ошибка: Введите час от 0 до 23.")
-					}
-				case "summary_interval":
-					if parsedValue >= 0 { // 0 - выключено
-						settings.SummaryIntervalHours = parsedValue
-						settings.LastAutoSummaryTime = time.Time{} // Сбрасываем таймер при изменении интервала
-						log.Printf("Интервал авто-саммари для чата %d изменен на %d ч.", chatID, parsedValue)
-						isValidInput = true
-					} else {
-						b.sendReply(chatID, "Ошибка: Интервал не может быть отрицательным (0 - выключить).")
-					}
-				}
-
-				if isValidInput {
-					settings.PendingSetting = "" // Сбрасываем ожидание после успешного ввода
-					b.sendReply(chatID, "Настройка успешно обновлена!")
-				}
-				b.settingsMutex.Unlock() // Разблокируем после изменения
-
-				if isValidInput {
-					b.sendSettingsKeyboard(chatID) // Показываем обновленное меню
-				}
-			}
-			return // Прекращаем дальнейшую обработку сообщения, т.к. это был ввод настройки
-		}
-		// --- Конец обработки ввода ---
-
-		// --- Обработка команд (если это не был ввод настройки) --- (остается без изменений)
-		if update.Message.IsCommand() {
-			b.handleCommand(update.Message)
-			return
-		}
-		// --- Конец обработки команд ---
-
-		// --- Логика Анализа Срачей ---
-		b.settingsMutex.RLock()
-		srachEnabled := settings.SrachAnalysisEnabled
-		b.settingsMutex.RUnlock()
-
-		if srachEnabled {
-			isPotentialSrachMsg := b.isPotentialSrachTrigger(update.Message)
-
-			b.settingsMutex.Lock()
-			currentState := settings.SrachState
-			lastTriggerTime := settings.LastSrachTriggerTime
-
-			if isPotentialSrachMsg {
-				if settings.SrachState == "none" {
-					settings.SrachState = "detected"
-					settings.SrachStartTime = messageTime
-					settings.SrachMessages = []string{formatMessageForAnalysis(update.Message)}
-					settings.LastSrachTriggerTime = messageTime // Запоминаем время триггера
-					settings.SrachLlmCheckCounter = 0           // Сбрасываем счетчик LLM при старте
-					// Разблокируем перед отправкой сообщения
-					b.settingsMutex.Unlock()
-					b.sendSrachWarning(chatID) // Объявляем начало
-					log.Printf("Чат %d: Обнаружен потенциальный срач.", chatID)
-					goto SaveMessage // Переходим к сохранению
-				} else if settings.SrachState == "detected" {
-					settings.SrachMessages = append(settings.SrachMessages, formatMessageForAnalysis(update.Message))
-					settings.LastSrachTriggerTime = messageTime // Обновляем время последнего триггера
-					settings.SrachLlmCheckCounter++             // Увеличиваем счетчик
-
-					// Проверяем каждое N-е (N=3) сообщение через LLM асинхронно
-					const llmCheckInterval = 3
-					if settings.SrachLlmCheckCounter%llmCheckInterval == 0 {
-						msgTextToCheck := update.Message.Text // Копируем текст перед запуском горутины
-						go func() {
-							isConfirmed := b.confirmSrachWithLLM(chatID, msgTextToCheck)
-							log.Printf("[LLM Srach Confirm] Чат %d: Сообщение ID %d. Результат LLM: %t",
-								chatID, update.Message.MessageID, isConfirmed)
-							// Пока только логируем, не меняем SrachState
-						}()
-					}
-				}
-			} else if currentState == "detected" {
-				// Сообщение не триггер, но срач был активен
-				settings.SrachMessages = append(settings.SrachMessages, formatMessageForAnalysis(update.Message))
-
-				// Проверка на завершение срача по таймеру
-				const srachTimeout = 5 * time.Minute // Тайм-аут 5 минут
-				if !lastTriggerTime.IsZero() && messageTime.Sub(lastTriggerTime) > srachTimeout {
-					log.Printf("Чат %d: Срач считается завершенным по тайм-ауту (%v).", chatID, srachTimeout)
-					b.settingsMutex.Unlock()
-					go b.analyseSrach(chatID) // Запускаем анализ в горутине
-					goto SaveMessage          // Переходим к сохранению
-				}
-			}
-			b.settingsMutex.Unlock() // Разблокируем, если не вышли раньше
-		}
-		// --- Конец Логики Анализа Срачей ---
-
-	SaveMessage: // Метка для перехода после обработки срача
-		// --- Обработка обычных сообщений --- (Переносим сохранение сюда)
-		// Сохраняем сообщение в общую историю (всегда)
-		b.storage.AddMessage(chatID, update.Message)
-
-		// Проверяем, является ли сообщение ответом на сообщение бота или обращением к боту
-		isReplyToBot := update.Message.ReplyToMessage != nil &&
-			update.Message.ReplyToMessage.From != nil &&
-			update.Message.ReplyToMessage.From.ID == b.api.Self.ID
-		mentionsBot := false
-		if len(update.Message.Entities) > 0 {
-			for _, entity := range update.Message.Entities {
-				if entity.Type == "mention" {
-					mention := update.Message.Text[entity.Offset : entity.Offset+entity.Length]
-					if mention == "@"+b.api.Self.UserName {
-						mentionsBot = true
-						break
-					}
-				}
-			}
-		}
-
-		// Отвечаем на прямое обращение к боту
-		if isReplyToBot || mentionsBot {
-			log.Printf("Обнаружено прямое обращение к боту, отправляю ответ")
-			go b.sendDirectResponse(chatID, update.Message)
-			return
-		}
-
-		// Увеличиваем счетчик сообщений и проверяем, нужно ли отвечать
-		b.settingsMutex.Lock()
-		settings.MessageCount++
-		// Проверяем, активен ли бот и не идет ли анализ срача (чтобы не мешать)
-		shouldReply := settings.Active && settings.SrachState != "analyzing" && settings.MinMessages > 0 && settings.MessageCount >= rand.Intn(settings.MaxMessages-settings.MinMessages+1)+settings.MinMessages
-		if shouldReply {
-			settings.MessageCount = 0 // Сбрасываем счетчик
-		}
-		b.settingsMutex.Unlock()
-
-		// Отвечаем, если нужно
-		if shouldReply {
-			go b.sendAIResponse(chatID)
-		}
-
-		// Проверяем, было ли это обновление о входе бота в чат
-		if update.Message.NewChatMembers != nil {
-			for _, member := range update.Message.NewChatMembers {
-				if member.ID == b.api.Self.ID {
-					log.Printf("Бот добавлен в чат: %d (%s)", chatID, update.Message.Chat.Title)
-					go b.loadChatHistory(chatID) // Загрузка истории ВКЛЮЧЕНА
-					b.sendReplyWithKeyboard(chatID, "Привет! Я готов к работе. Используйте /settings для настройки.", getMainKeyboard())
+	// --- Логика определения прямого обращения ---
+	isDirectReply := false
+	if message.ReplyToMessage != nil && message.ReplyToMessage.From.ID == b.botID {
+		isDirectReply = true // Это ответ на сообщение бота
+		log.Printf("[DEBUG] Чат %d: Обнаружен прямой ответ (Reply) на сообщение бота от userID %d", chatID, userID)
+	} else if message.Entities != nil {
+		for _, entity := range message.Entities {
+			if entity.Type == "mention" {
+				mention := text[entity.Offset : entity.Offset+entity.Length]
+				// Сравниваем с username бота (можно улучшить, если username меняется)
+				if mention == "@"+b.api.Self.UserName {
+					isDirectReply = true // Это упоминание бота
+					log.Printf("[DEBUG] Чат %d: Обнаружено упоминание (Mention) бота от userID %d", chatID, userID)
 					break
 				}
 			}
 		}
-		// --- Конец обработки обычных сообщений ---
+	}
+	// --- Конец определения прямого обращения ---
 
-	} else if update.CallbackQuery != nil {
-		// Обработка кнопок (остается без изменений)
-		b.handleCallback(update.CallbackQuery)
+	// Добавляем сообщение в хранилище ДО генерации ответа
+	b.storage.AddMessage(chatID, message)
+
+	// --- ЗАГРУЗКА ИСТОРИИ ДЛЯ НОВОГО ЧАТА (если еще нет в кеше) ---
+	// Это нужно, чтобы при первом сообщении в "новом" для этого запуска бота чате
+	// мы подгрузили его историю из S3/файла, если она там есть.
+	b.storage.GetMessages(chatID) // Этот вызов для S3Storage ничего не делает, но для LocalStorage создаст запись в map, если ее нет
+	// Попробуем загрузить историю, если ее нет в кеше S3Storage или для LocalStorage
+	if len(b.storage.GetMessages(chatID)) == 0 { // Проверяем кеш
+		_, err := b.storage.LoadChatHistory(chatID) // Загружаем и добавляем в кеш/память
+		if err != nil {
+			log.Printf("[handleUpdate ERROR] Чат %d: Не удалось загрузить историю: %v", chatID, err)
+		}
+	}
+	// --- КОНЕЦ ЗАГРУЗКИ ИСТОРИИ ---
+
+	messageTime := message.Time()
+
+	// --- Инициализация/Загрузка настроек чата --- (Используем loadChatSettings)
+	settings, err := b.loadChatSettings(chatID)
+	if err != nil {
+		log.Printf("handleUpdate: Ошибка загрузки/создания настроек для чата %d: %v", chatID, err)
+		return // Не можем обработать без настроек
+	}
+	// --- Конец инициализации ---
+
+	// --- Обработка отмены ввода --- (остается без изменений)
+	b.settingsMutex.RLock()
+	currentPendingSetting := settings.PendingSetting
+	b.settingsMutex.RUnlock()
+	if text == "/cancel" && currentPendingSetting != "" {
+		b.settingsMutex.Lock()
+		settings.PendingSetting = "" // Сбрасываем ожидание
+		b.settingsMutex.Unlock()
+		b.sendReply(chatID, "Ввод отменен.")
+		b.sendSettingsKeyboard(chatID) // Показываем меню настроек снова
+		return
+	}
+	// --- Конец обработки отмены ---
+
+	// --- Обработка ввода ожидаемой настройки --- (остается без изменений)
+	if currentPendingSetting != "" {
+		isValidInput := false
+		parsedValue, err := strconv.Atoi(text)
+
+		if err != nil {
+			b.sendReply(chatID, "Ошибка: Введите числовое значение или /cancel для отмены.")
+		} else {
+			b.settingsMutex.Lock() // Блокируем для изменения настроек
+			switch currentPendingSetting {
+			case "min_messages":
+				if parsedValue > 0 && parsedValue <= settings.MaxMessages {
+					settings.MinMessages = parsedValue
+					isValidInput = true
+				} else {
+					b.sendReply(chatID, fmt.Sprintf("Ошибка: Минимальное значение должно быть больше 0 и не больше максимального (%d).", settings.MaxMessages))
+				}
+			case "max_messages":
+				if parsedValue >= settings.MinMessages {
+					settings.MaxMessages = parsedValue
+					isValidInput = true
+				} else {
+					b.sendReply(chatID, fmt.Sprintf("Ошибка: Максимальное значение должно быть не меньше минимального (%d).", settings.MinMessages))
+				}
+			case "daily_time":
+				if parsedValue >= 0 && parsedValue <= 23 {
+					settings.DailyTakeTime = parsedValue
+					// Перезапускаем планировщик тейка с новым временем (если он уже был запущен)
+					// Простая реализация: просто логируем, сложная - требует управления горутиной
+					log.Printf("Настройка времени тейка изменена на %d для чата %d. Перезапустите бота для применения ко всем чатам или реализуйте динамическое обновление.", parsedValue, chatID)
+					isValidInput = true
+				} else {
+					b.sendReply(chatID, "Ошибка: Введите час от 0 до 23.")
+				}
+			case "summary_interval":
+				if parsedValue >= 0 { // 0 - выключено
+					settings.SummaryIntervalHours = parsedValue
+					settings.LastAutoSummaryTime = time.Time{} // Сбрасываем таймер при изменении интервала
+					log.Printf("Интервал авто-саммари для чата %d изменен на %d ч.", chatID, parsedValue)
+					isValidInput = true
+				} else {
+					b.sendReply(chatID, "Ошибка: Интервал не может быть отрицательным (0 - выключить).")
+				}
+			}
+
+			if isValidInput {
+				settings.PendingSetting = "" // Сбрасываем ожидание после успешного ввода
+				b.sendReply(chatID, "Настройка успешно обновлена!")
+			}
+			b.settingsMutex.Unlock() // Разблокируем после изменения
+
+			if isValidInput {
+				b.sendSettingsKeyboard(chatID) // Показываем обновленное меню
+			}
+		}
+		return // Прекращаем дальнейшую обработку сообщения, т.к. это был ввод настройки
+	}
+	// --- Конец обработки ввода ---
+
+	// --- Обработка команд (если это не был ввод настройки) --- (остается без изменений)
+	if message.IsCommand() {
+		b.handleCommand(message)
+		return
+	}
+	// --- Конец обработки команд ---
+
+	// --- Логика Анализа Срачей ---
+	b.settingsMutex.RLock()
+	srachEnabled := settings.SrachAnalysisEnabled
+	b.settingsMutex.RUnlock()
+
+	if srachEnabled {
+		isPotentialSrachMsg := b.isPotentialSrachTrigger(message)
+
+		b.settingsMutex.Lock()
+		currentState := settings.SrachState
+		lastTriggerTime := settings.LastSrachTriggerTime
+
+		if isPotentialSrachMsg {
+			if settings.SrachState == "none" {
+				settings.SrachState = "detected"
+				settings.SrachStartTime = messageTime
+				settings.SrachMessages = []string{formatMessageForAnalysis(message)}
+				settings.LastSrachTriggerTime = messageTime // Запоминаем время триггера
+				settings.SrachLlmCheckCounter = 0           // Сбрасываем счетчик LLM при старте
+				// Разблокируем перед отправкой сообщения
+				b.settingsMutex.Unlock()
+				b.sendSrachWarning(chatID) // Объявляем начало
+				log.Printf("Чат %d: Обнаружен потенциальный срач.", chatID)
+				goto SaveMessage // Переходим к сохранению
+			} else if settings.SrachState == "detected" {
+				settings.SrachMessages = append(settings.SrachMessages, formatMessageForAnalysis(message))
+				settings.LastSrachTriggerTime = messageTime // Обновляем время последнего триггера
+				settings.SrachLlmCheckCounter++             // Увеличиваем счетчик
+
+				// Проверяем каждое N-е (N=3) сообщение через LLM асинхронно
+				const llmCheckInterval = 3
+				if settings.SrachLlmCheckCounter%llmCheckInterval == 0 {
+					msgTextToCheck := message.Text // Копируем текст перед запуском горутины
+					go func() {
+						isConfirmed := b.confirmSrachWithLLM(chatID, msgTextToCheck)
+						log.Printf("[LLM Srach Confirm] Чат %d: Сообщение ID %d. Результат LLM: %t",
+							chatID, message.MessageID, isConfirmed)
+						// Пока только логируем, не меняем SrachState
+					}()
+				}
+			}
+		} else if currentState == "detected" {
+			// Сообщение не триггер, но срач был активен
+			settings.SrachMessages = append(settings.SrachMessages, formatMessageForAnalysis(message))
+
+			// Проверка на завершение срача по таймеру
+			const srachTimeout = 5 * time.Minute // Тайм-аут 5 минут
+			if !lastTriggerTime.IsZero() && messageTime.Sub(lastTriggerTime) > srachTimeout {
+				log.Printf("Чат %d: Срач считается завершенным по тайм-ауту (%v).", chatID, srachTimeout)
+				b.settingsMutex.Unlock()
+				go b.analyseSrach(chatID) // Запускаем анализ в горутине
+				goto SaveMessage          // Переходим к сохранению
+			}
+		}
+		b.settingsMutex.Unlock() // Разблокируем, если не вышли раньше
+	}
+	// --- Конец Логики Анализа Срачей ---
+
+SaveMessage: // Метка для перехода после обработки срача
+	// --- Обработка обычных сообщений --- (Переносим сохранение сюда)
+	// Сохраняем сообщение в общую историю (всегда)
+	b.storage.AddMessage(chatID, message)
+
+	// Проверяем, является ли сообщение ответом на сообщение бота или обращением к боту
+	isReplyToBot := message.ReplyToMessage != nil &&
+		message.ReplyToMessage.From != nil &&
+		message.ReplyToMessage.From.ID == b.api.Self.ID
+	mentionsBot := false
+	if len(message.Entities) > 0 {
+		for _, entity := range message.Entities {
+			if entity.Type == "mention" {
+				mention := message.Text[entity.Offset : entity.Offset+entity.Length]
+				if mention == "@"+b.api.Self.UserName {
+					mentionsBot = true
+					break
+				}
+			}
+		}
+	}
+
+	// Отвечаем на прямое обращение к боту
+	if isReplyToBot || mentionsBot {
+		log.Printf("Обнаружено прямое обращение к боту, отправляю ответ")
+		go b.sendDirectResponse(chatID, message)
+		return
+	}
+
+	// Увеличиваем счетчик сообщений и проверяем, нужно ли отвечать
+	b.settingsMutex.Lock()
+	settings.MessageCount++
+	// Проверяем, активен ли бот и не идет ли анализ срача (чтобы не мешать)
+	shouldReply := settings.Active && settings.SrachState != "analyzing" && settings.MinMessages > 0 && settings.MessageCount >= rand.Intn(settings.MaxMessages-settings.MinMessages+1)+settings.MinMessages
+	if shouldReply {
+		settings.MessageCount = 0 // Сбрасываем счетчик
+	}
+	b.settingsMutex.Unlock()
+
+	// Отвечаем, если нужно
+	if shouldReply {
+		go b.sendAIResponse(chatID)
+	}
+
+	// Проверяем, было ли это обновление о входе бота в чат
+	if message.NewChatMembers != nil {
+		for _, member := range message.NewChatMembers {
+			if member.ID == b.api.Self.ID {
+				log.Printf("Бот добавлен в чат: %d (%s)", chatID, message.Chat.Title)
+				go b.loadChatHistory(chatID) // Загрузка истории ВКЛЮЧЕНА
+				b.sendReplyWithKeyboard(chatID, "Привет! Я готов к работе. Используйте /settings для настройки.", getMainKeyboard())
+				break
+			}
+		}
+	}
+	// --- Конец обработки обычных сообщений ---
+
+	if isDirectReply {
+		// --- Обработка лимита прямых ответов ---
+		now := time.Now()
+		b.directReplyMutex.Lock()
+
+		if _, chatExists := b.directReplyTimestamps[chatID]; !chatExists {
+			b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
+		}
+		if _, userExists := b.directReplyTimestamps[chatID][userID]; !userExists {
+			b.directReplyTimestamps[chatID][userID] = make([]time.Time, 0)
+		}
+
+		// Очищаем старые временные метки
+		validTimestamps := make([]time.Time, 0)
+		cutoff := now.Add(-b.config.DirectReplyRateLimitWindow)
+		for _, ts := range b.directReplyTimestamps[chatID][userID] {
+			if ts.After(cutoff) {
+				validTimestamps = append(validTimestamps, ts)
+			}
+		}
+		b.directReplyTimestamps[chatID][userID] = validTimestamps
+
+		// Проверяем лимит
+		if len(b.directReplyTimestamps[chatID][userID]) >= b.config.DirectReplyRateLimitCount {
+			// Лимит превышен
+			log.Printf("[Rate Limit] Чат %d, Пользователь %d: Превышен лимит прямых ответов (%d/%d за %v). Отвечаем по спец. промпту.",
+				chatID, userID, len(b.directReplyTimestamps[chatID][userID]), b.config.DirectReplyRateLimitCount, b.config.DirectReplyRateLimitWindow)
+			b.directReplyMutex.Unlock() // Разблокируем перед вызовом LLM
+
+			// Генерируем ответ по спец. промпту (без контекста)
+			response, err := b.gemini.GenerateArbitraryResponse(b.config.RateLimitDirectReplyPrompt, "") // Контекст не нужен
+			if err != nil {
+				log.Printf("[Rate Limit ERROR] Чат %d: Ошибка генерации ответа при превышении лимита: %v", chatID, err)
+			} else {
+				b.sendReply(chatID, response)
+			}
+			return // Выходим, чтобы не генерировать обычный прямой ответ
+		} else {
+			// Лимит не превышен, добавляем метку и генерируем обычный прямой ответ
+			log.Printf("[Direct Reply] Чат %d, Пользователь %d: Лимит не превышен (%d/%d). Добавляем метку.",
+				chatID, userID, len(b.directReplyTimestamps[chatID][userID]), b.config.DirectReplyRateLimitCount)
+			b.directReplyTimestamps[chatID][userID] = append(b.directReplyTimestamps[chatID][userID], now)
+			b.directReplyMutex.Unlock() // Разблокируем перед вызовом LLM
+
+			// Генерируем ответ по промпту DIRECT_PROMPT (без контекста)
+			b.sendDirectResponse(chatID, message) // Используем существующую функцию
+			return
+		}
+		// --- Конец обработки лимита ---
 	}
 }
 
@@ -1324,35 +1416,36 @@ func (b *Bot) loadChatHistory(chatID int64) {
 
 // scheduleHistorySaving запускает периодическое сохранение истории
 func (b *Bot) scheduleHistorySaving() {
-	// Убедимся, что интервал > 0
 	if b.config.HistorySaveInterval <= 0 {
-		log.Println("[scheduleHistorySaving] Интервал сохранения истории не задан или равен 0. Периодическое сохранение отключено.")
-		return // Не запускаем, если интервал некорректный
-	}
-	ticker := time.NewTicker(b.config.HistorySaveInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			b.saveAllChatHistories()
-		case <-b.stop:
-			// При остановке бота сохраняем все истории
-			b.saveAllChatHistories()
-			return
-		}
-	}
-}
-
-// saveAllChatHistories вызывает сохранение истории для всех чатов через интерфейс
-func (b *Bot) saveAllChatHistories() {
-	if b.storage == nil {
-		log.Println("[saveAllChatHistories WARN] Хранилище еще не инициализировано.")
+		log.Println("[HistorySave Scheduler] Интервал сохранения истории не задан или <= 0. Периодическое сохранение отключено.")
 		return
 	}
-	log.Println("Запуск сохранения истории для всех чатов...")
+
+	log.Printf("[HistorySave Scheduler] Запуск планировщика сохранения истории с интервалом: %v", b.config.HistorySaveInterval)
+	ticker := time.NewTicker(b.config.HistorySaveInterval)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				log.Printf("[HistorySave Scheduler] Тикер сработал. Вызов saveAllChatHistories...")
+				b.saveAllChatHistories()
+			case <-b.stop:
+				ticker.Stop()
+				log.Println("[HistorySave Scheduler] Планировщик сохранения истории остановлен.")
+				return
+			}
+		}
+	}()
+}
+
+// saveAllChatHistories сохраняет историю всех чатов
+func (b *Bot) saveAllChatHistories() {
+	log.Println("[Bot SaveAll] Начало сохранения всех историй чатов...")
 	if err := b.storage.SaveAllChatHistories(); err != nil {
-		log.Printf("Ошибка при сохранении истории всех чатов: %v", err)
+		log.Printf("[Bot SaveAll ERROR] Ошибка при сохранении всех историй: %v", err)
+	} else {
+		log.Println("[Bot SaveAll] Сохранение всех историй чатов завершено успешно.")
 	}
 }
 

@@ -32,7 +32,7 @@ type S3Storage struct {
 
 // NewS3Storage создает новый экземпляр S3Storage.
 func NewS3Storage(cfg *config.Config, contextWindow int) (*S3Storage, error) {
-	log.Printf("[S3Storage] Инициализация S3 клиента для эндпоинта: %s, бакет: %s", cfg.S3Endpoint, cfg.S3BucketName)
+	log.Printf("[S3Storage] Инициализация S3 клиента для эндпоинта: %s, бакет: %s, SSL: %t, Region: %s", cfg.S3Endpoint, cfg.S3BucketName, cfg.S3UseSSL, cfg.S3Region)
 
 	// Инициализация клиента MinIO
 	minioClient, err := minio.New(cfg.S3Endpoint, &minio.Options{
@@ -53,11 +53,13 @@ func NewS3Storage(cfg *config.Config, contextWindow int) (*S3Storage, error) {
 		log.Printf("[S3Storage ERROR] Ошибка проверки существования бакета '%s': %v", cfg.S3BucketName, err)
 		return nil, fmt.Errorf("ошибка проверки бакета '%s': %w", cfg.S3BucketName, err)
 	}
-	if !exists {
-		log.Printf("[S3Storage ERROR] Бакет '%s' не найден!", cfg.S3BucketName)
+	if exists {
+		log.Printf("[S3Storage] Проверка бакета '%s': УСПЕШНО (существует).", cfg.S3BucketName)
+	} else {
+		log.Printf("[S3Storage ERROR] Проверка бакета '%s': НЕ НАЙДЕН!", cfg.S3BucketName)
 		return nil, fmt.Errorf("бакет '%s' не найден", cfg.S3BucketName)
 	}
-	log.Printf("[S3Storage] Бакет '%s' найден. S3 клиент успешно инициализирован.", cfg.S3BucketName)
+	log.Printf("[S3Storage] S3 клиент успешно инициализирован и бакет '%s' найден.", cfg.S3BucketName)
 
 	s3Store := &S3Storage{
 		client:        minioClient,
@@ -238,7 +240,7 @@ func (s3 *S3Storage) SaveChatHistory(chatID int64) error {
 	}
 
 	objectName := s3.getObjectName(chatID)
-	// log.Printf("[S3Storage] Сохраняю историю для чата %d в S3: %s/%s (%d сообщений)", chatID, s3.bucketName, objectName, len(messages))
+	log.Printf("[S3Storage Save] Чат %d: Начинаю сохранение в S3 объект: %s/%s (%d сообщений в кеше)", chatID, s3.bucketName, objectName, len(messages))
 
 	var storedMessages []*StoredMessage
 	for _, msg := range messages {
@@ -254,23 +256,22 @@ func (s3 *S3Storage) SaveChatHistory(chatID int64) error {
 		return fmt.Errorf("ошибка маршалинга истории для S3: %w", err)
 	}
 
-	// Создаем ридер из байтов JSON
-	reader := bytes.NewReader(data)
-	dataSize := int64(len(data))
-
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Таймаут на загрузку
 	defer cancel()
 
-	// Загружаем объект в S3
-	_, err = s3.client.PutObject(ctx, s3.bucketName, objectName, reader, dataSize, minio.PutObjectOptions{
-		ContentType: "application/json", // Указываем тип контента
-	})
+	// PutObject загружает данные в S3.
+	// Размер объекта будет определен автоматически.
+	// Используем bytes.NewReader для передачи среза байт как io.Reader.
+	contentType := "application/json"
+	log.Printf("[S3Storage Save] Чат %d: Вызов PutObject для %s/%s (Размер данных: %d байт, ContentType: %s)", chatID, s3.bucketName, objectName, len(data), contentType)
+
+	info, err := s3.client.PutObject(ctx, s3.bucketName, objectName, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
-		log.Printf("[S3Storage ERROR] Чат %d: Ошибка загрузки объекта '%s' в S3: %v", chatID, objectName, err)
+		log.Printf("[S3Storage Save ERROR] Чат %d: Ошибка PutObject для %s/%s: %v", chatID, s3.bucketName, objectName, err)
 		return fmt.Errorf("ошибка сохранения истории в S3: %w", err)
 	}
 
-	log.Printf("[S3Storage OK] Чат %d: История (%d сообщ.) записана в S3 '%s'.", chatID, len(storedMessages), objectName)
+	log.Printf("[S3Storage Save OK] Чат %d: Успешно сохранено в S3: %s/%s (Версия: %s, Размер: %d байт)", chatID, s3.bucketName, objectName, info.VersionID, info.Size)
 	return nil
 }
 

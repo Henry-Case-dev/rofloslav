@@ -48,6 +48,10 @@ type Config struct {
 	S3UseSSL          bool
 	// Интервал сохранения истории
 	HistorySaveInterval time.Duration
+	// Новые поля для лимита прямых ответов
+	RateLimitDirectReplyPrompt string
+	DirectReplyRateLimitCount  int
+	DirectReplyRateLimitWindow time.Duration
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -101,6 +105,10 @@ func Load() (*Config, error) {
 	useS3StorageStr := getEnvOrDefault("USE_S3_STORAGE", "false")
 	useS3Storage := useS3StorageStr == "true"
 	historySaveIntervalStr := getEnvOrDefault("HISTORY_SAVE_INTERVAL", "5m")
+	// --- Загрузка переменных лимита прямых ответов ---
+	rateLimitPrompt := getEnvOrDefault("RATE_LIMIT_DIRECT_REPLY_PROMPT", "Я устал, отдохни.") // Простое значение по умолчанию
+	rateLimitCountStr := getEnvOrDefault("DIRECT_REPLY_RATE_LIMIT_COUNT", "3")
+	rateLimitWindowStr := getEnvOrDefault("DIRECT_REPLY_RATE_LIMIT_WINDOW", "10m")
 	// --- Конец загрузки S3 ---
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
@@ -125,6 +133,9 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] S3_USE_SSL: %t", s3UseSSL)
 	log.Printf("[Config Load] USE_S3_STORAGE: %t", useS3Storage)
 	log.Printf("[Config Load] HISTORY_SAVE_INTERVAL: %s", historySaveIntervalStr)
+	log.Printf("[Config Load] RATE_LIMIT_DIRECT_REPLY_PROMPT: %s...", truncateString(rateLimitPrompt, 50))
+	log.Printf("[Config Load] DIRECT_REPLY_RATE_LIMIT_COUNT: %s", rateLimitCountStr)
+	log.Printf("[Config Load] DIRECT_REPLY_RATE_LIMIT_WINDOW: %s", rateLimitWindowStr)
 	// --- Конец логирования ---
 
 	// --- Парсинг ключевых слов ---
@@ -180,6 +191,18 @@ func Load() (*Config, error) {
 		historySaveInterval = 5 * time.Minute
 	}
 
+	// --- Парсинг значений лимита прямых ответов ---
+	rateLimitCount, err := strconv.Atoi(rateLimitCountStr)
+	if err != nil || rateLimitCount < 1 {
+		log.Printf("Ошибка парсинга DIRECT_REPLY_RATE_LIMIT_COUNT ('%s'): %v, используем 3", rateLimitCountStr, err)
+		rateLimitCount = 3
+	}
+	rateLimitWindow, err := time.ParseDuration(rateLimitWindowStr)
+	if err != nil {
+		log.Printf("Ошибка парсинга DIRECT_REPLY_RATE_LIMIT_WINDOW ('%s'): %v, используем 10m", rateLimitWindowStr, err)
+		rateLimitWindow = 10 * time.Minute
+	}
+
 	return &Config{
 		TelegramToken:              telegramToken,
 		GeminiAPIKey:               geminiAPIKey,
@@ -212,6 +235,9 @@ func Load() (*Config, error) {
 		S3BucketName:               s3BucketName,
 		S3UseSSL:                   s3UseSSL,
 		HistorySaveInterval:        historySaveInterval,
+		RateLimitDirectReplyPrompt: rateLimitPrompt,
+		DirectReplyRateLimitCount:  rateLimitCount,
+		DirectReplyRateLimitWindow: rateLimitWindow,
 	}, nil
 }
 

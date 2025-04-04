@@ -133,22 +133,24 @@ func ConvertToAPIMessage(stored *StoredMessage) *tgbotapi.Message {
 // NewHistoryStorage создает и возвращает подходящую реализацию HistoryStorage
 // на основе конфигурации.
 func NewHistoryStorage(cfg *config.Config) (HistoryStorage, error) {
+	log.Printf("[Storage Factory] Проверка конфигурации: UseS3Storage=%t", cfg.UseS3Storage)
 	if cfg.UseS3Storage {
-		log.Println("[Storage Factory] Используется конфигурация S3 хранилища.")
+		log.Println("[Storage Factory] Попытка инициализации S3 хранилища.")
 		// Проверяем наличие обязательных S3 параметров
 		if cfg.S3Endpoint == "" || cfg.S3BucketName == "" || cfg.S3AccessKeyID == "" || cfg.S3SecretAccessKey == "" {
-			log.Println("[Storage Factory ERROR] Не заданы все необходимые параметры S3 (Endpoint, BucketName, AccessKeyID, SecretAccessKey). Используется LocalStorage.")
+			log.Printf("[Storage Factory WARN] Не заданы все необходимые параметры S3. Endpoint: '%s', Bucket: '%s', AccessKeyID set: %t, SecretKey set: %t. Откат на LocalStorage.",
+				cfg.S3Endpoint, cfg.S3BucketName, cfg.S3AccessKeyID != "", cfg.S3SecretAccessKey != "")
 			// Возвращаем LocalStorage как запасной вариант
-			// ИСПРАВЛЕНО: Обрабатываем ошибку от NewLocalStorage
 			localStorage, err := NewLocalStorage(cfg.ContextWindow)
 			if err != nil {
-				log.Printf("[Storage Factory ERROR] Ошибка инициализации запасного LocalStorage: %v", err)
-				// Возвращаем ошибку, т.к. не смогли создать даже запасной вариант
+				log.Printf("[Storage Factory ERROR] Ошибка инициализации ЗАПАСНОГО LocalStorage: %v", err)
 				return nil, fmt.Errorf("ошибка инициализации запасного LocalStorage: %w", err)
 			}
-			return localStorage, nil // Возвращаем созданный LocalStorage
+			log.Println("[Storage Factory] Успешно создан ЗАПАСНОЙ LocalStorage.")
+			return localStorage, nil
 		}
 
+		log.Println("[Storage Factory] Все параметры S3 заданы, вызываю NewS3Storage...")
 		s3Store, err := NewS3Storage(cfg, cfg.ContextWindow)
 		if err != nil {
 			log.Printf("[Storage Factory ERROR] Ошибка инициализации S3 хранилища: %v. Используется LocalStorage.", err)
@@ -160,6 +162,7 @@ func NewHistoryStorage(cfg *config.Config) (HistoryStorage, error) {
 				// Возвращаем исходную ошибку S3 + ошибку запасного варианта
 				return nil, fmt.Errorf("ошибка инициализации S3 (%v) и запасного LocalStorage (%w)", err, localErr)
 			}
+			log.Println("[Storage Factory] Успешно создан ЗАПАСНОЙ LocalStorage.")
 			return localStorage, nil // Возвращаем созданный LocalStorage
 		}
 		log.Println("[Storage Factory] S3 хранилище успешно инициализировано.")
