@@ -186,10 +186,18 @@ func (b *Bot) Stop() {
 
 // handleUpdate обрабатывает входящие обновления
 func (b *Bot) handleUpdate(update tgbotapi.Update) {
-	if update.Message == nil { // Игнорируем не-сообщения
+	// --- СНАЧАЛА проверяем CallbackQuery от Inline кнопок ---
+	if update.CallbackQuery != nil {
+		b.handleCallbackQuery(update.CallbackQuery)
+		return // Завершаем обработку, т.к. это был callback
+	}
+
+	// --- ЕСЛИ НЕ CallbackQuery, ТО проверяем обычное сообщение ---
+	if update.Message == nil { // Игнорируем остальные типы обновлений
 		return
 	}
 
+	// --- Дальнейшая обработка update.Message --- (код остается как был)
 	message := update.Message
 	chatID := message.Chat.ID
 	userID := message.From.ID // ID пользователя, отправившего сообщение
@@ -464,34 +472,161 @@ SaveMessage: // Метка для перехода после обработки
 		}
 	}
 	// --- Конец обработки обычных сообщений ---
-
 }
 
-// --- Вспомогательные функции отправки сообщений ---
+// handleCallbackQuery обрабатывает нажатия на inline кнопки
+func (b *Bot) handleCallbackQuery(callbackQuery *tgbotapi.CallbackQuery) {
+	// 1. Отвечаем на CallbackQuery, чтобы убрать "часики" на кнопке
+	callback := tgbotapi.NewCallback(callbackQuery.ID, "") // Можно добавить текст, который всплывет у пользователя
+	if _, err := b.api.Request(callback); err != nil {
+		log.Printf("Ошибка ответа на CallbackQuery: %v", err)
+	}
 
-// sendReply отправляет простое текстовое сообщение в чат
-func (b *Bot) sendReply(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("Ошибка отправки сообщения в чат %d: %v", chatID, err)
+	// 2. Получаем данные из callback
+	data := callbackQuery.Data
+	chatID := callbackQuery.Message.Chat.ID
+	messageID := callbackQuery.Message.MessageID
+	// userID := callbackQuery.From.ID // ID пользователя, который нажал кнопку
+
+	log.Printf("Получен CallbackQuery: Data='%s', ChatID=%d, MessageID=%d, UserID=%d",
+		data, chatID, messageID, callbackQuery.From.ID)
+
+	// 3. Обрабатываем разные кнопки
+	switch data {
+	case "summary":
+		// Вызываем обработчик команды саммари
+		b.handleSummaryCommand(chatID)
+
+	case "settings":
+		// Отправляем клавиатуру настроек, редактируя исходное сообщение
+		b.editToSettingsKeyboard(chatID, messageID)
+
+	case "stop":
+		// Ставим бота на паузу
+		settings, _ := b.loadChatSettings(chatID)
+		b.settingsMutex.Lock()
+		settings.Active = false
+		b.settingsMutex.Unlock()
+		// Уведомляем и возвращаем главную клавиатуру
+		b.editToMainKeyboard(chatID, messageID, "Бот поставлен на паузу.")
+
+	case "back_to_main":
+		// Возвращаемся к главной клавиатуре из настроек
+		b.editToMainKeyboard(chatID, messageID, "Главное меню:")
+
+	// --- Обработка кнопок изменения настроек ---
+	case "set_min_messages", "set_max_messages", "set_daily_time", "set_summary_interval":
+		b.handleSetNumericSettingCallback(chatID, messageID, data)
+
+	case "toggle_srach_on", "toggle_srach_off":
+		// Передаем ID callbackQuery
+		b.handleToggleSrachCallback(chatID, messageID, data == "toggle_srach_on", callbackQuery.ID)
+
+	default:
+		log.Printf("Неизвестный CallbackQuery data: %s", data)
+		// Можно отправить уведомление пользователю
+		// answer := tgbotapi.NewCallbackWithAlert(callbackQuery.ID, "Неизвестное действие")
+		// b.api.AnswerCallbackQuery(answer)
 	}
 }
 
-// sendReplyWithKeyboard отправляет сообщение с клавиатурой
-func (b *Bot) sendReplyWithKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = keyboard
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("Ошибка отправки сообщения с клавиатурой в чат %d: %v", chatID, err)
-	}
-}
+// --- Новые вспомогательные функции для Callback ---
 
-// editMessageMarkup изменяет клавиатуру существующего сообщения
-func (b *Bot) editMessageMarkup(chatID int64, messageID int, markup tgbotapi.InlineKeyboardMarkup) {
-	editMsg := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
+// editToMainKeyboard редактирует сообщение, чтобы показать главную клавиатуру
+func (b *Bot) editToMainKeyboard(chatID int64, messageID int, text string) {
+	keyboard := getMainKeyboard()
+	editMsg := tgbotapi.NewEditMessageTextAndMarkup(chatID, messageID, text, keyboard)
 	if _, err := b.api.Send(editMsg); err != nil {
-		// Логируем ошибку, но не фатально, т.к. сообщение уже есть
-		log.Printf("Ошибка редактирования клавиатуры сообщения %d в чате %d: %v", messageID, chatID, err)
+		log.Printf("Ошибка редактирования сообщения на главную клавиатуру (ChatID: %d, MsgID: %d): %v", chatID, messageID, err)
+	}
+}
+
+// editToSettingsKeyboard редактирует сообщение, чтобы показать клавиатуру настроек
+func (b *Bot) editToSettingsKeyboard(chatID int64, messageID int) {
+	settings, err := b.loadChatSettings(chatID)
+	if err != nil {
+		log.Printf("editToSettingsKeyboard: Не удалось загрузить настройки для чата %d: %v", chatID, err)
+		b.sendReply(chatID, "Ошибка получения настроек.") // Отправляем новое сообщение, если редактирование невозможно
+		return
+	}
+	b.settingsMutex.RLock()
+	keyboard := getSettingsKeyboard(
+		settings.MinMessages,
+		settings.MaxMessages,
+		settings.DailyTakeTime,
+		settings.SummaryIntervalHours,
+		settings.SrachAnalysisEnabled,
+	)
+	b.settingsMutex.RUnlock()
+
+	editMsg := tgbotapi.NewEditMessageTextAndMarkup(chatID, messageID, "⚙️ Настройки:", keyboard)
+	if _, err := b.api.Send(editMsg); err != nil {
+		log.Printf("Ошибка редактирования сообщения на клавиатуру настроек (ChatID: %d, MsgID: %d): %v", chatID, messageID, err)
+	}
+}
+
+// handleSetNumericSettingCallback обрабатывает нажатие кнопок для установки числовых настроек
+func (b *Bot) handleSetNumericSettingCallback(chatID int64, messageID int, settingKey string) {
+	settings, err := b.loadChatSettings(chatID)
+	if err != nil {
+		log.Printf("handleSetNumericSettingCallback: Не удалось загрузить настройки для чата %d: %v", chatID, err)
+		return
+	}
+
+	var promptText string
+	settingToSet := ""
+
+	switch settingKey {
+	case "set_min_messages":
+		promptText = b.config.PromptEnterMinMessages
+		settingToSet = "min_messages"
+	case "set_max_messages":
+		promptText = b.config.PromptEnterMaxMessages
+		settingToSet = "max_messages"
+	case "set_daily_time":
+		promptText = fmt.Sprintf(b.config.PromptEnterDailyTime, b.config.TimeZone) // Добавляем таймзону в промпт
+		settingToSet = "daily_time"
+	case "set_summary_interval":
+		promptText = b.config.PromptEnterSummaryInterval
+		settingToSet = "summary_interval"
+	default:
+		log.Printf("Неизвестный ключ настройки: %s", settingKey)
+		return
+	}
+
+	// Устанавливаем ожидание ввода
+	b.settingsMutex.Lock()
+	settings.PendingSetting = settingToSet
+	b.settingsMutex.Unlock()
+
+	// Отправляем сообщение с запросом ввода (не редактируем старое, а отправляем новое)
+	b.sendReply(chatID, promptText+"\nИли введите /cancel для отмены.")
+}
+
+// handleToggleSrachCallback обрабатывает нажатие кнопки включения/выключения анализа срачей
+func (b *Bot) handleToggleSrachCallback(chatID int64, messageID int, enable bool, callbackQueryID string) {
+	settings, err := b.loadChatSettings(chatID)
+	if err != nil {
+		log.Printf("handleToggleSrachCallback: Не удалось загрузить настройки для чата %d: %v", chatID, err)
+		return
+	}
+
+	// Обновляем настройку
+	b.settingsMutex.Lock()
+	settings.SrachAnalysisEnabled = enable
+	b.settingsMutex.Unlock()
+
+	// Обновляем клавиатуру в сообщении
+	b.editToSettingsKeyboard(chatID, messageID) // Эта функция перерисует клавиатуру с новым состоянием
+
+	// Отправляем уведомление (можно через AnswerCallbackQuery с show_alert=true)
+	alertText := "Анализ срачей включен 🔥"
+	if !enable {
+		alertText = "Анализ срачей выключен 💀"
+	}
+	alertCallback := tgbotapi.NewCallbackWithAlert(callbackQueryID, alertText)
+	if _, err := b.api.Request(alertCallback); err != nil {
+		log.Printf("Ошибка ответа на CallbackQuery (toggle srach): %v", err)
 	}
 }
 
@@ -1032,4 +1167,23 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen])
+}
+
+// --- Вспомогательные функции отправки сообщений (ВОССТАНОВЛЕНО) ---
+
+// sendReply отправляет простое текстовое сообщение в чат
+func (b *Bot) sendReply(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Ошибка отправки сообщения в чат %d: %v", chatID, err)
+	}
+}
+
+// sendReplyWithKeyboard отправляет сообщение с клавиатурой
+func (b *Bot) sendReplyWithKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Ошибка отправки сообщения с клавиатурой в чат %d: %v", chatID, err)
+	}
 }
