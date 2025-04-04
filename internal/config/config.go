@@ -12,14 +12,18 @@ import (
 
 // Config содержит все параметры конфигурации бота
 type Config struct {
-	TelegramToken         string
-	GeminiAPIKey          string
-	GeminiModelName       string
-	DefaultPrompt         string
-	DirectPrompt          string
-	DailyTakePrompt       string
-	SummaryPrompt         string
-	RateLimitErrorMessage string
+	TelegramToken   string
+	GeminiAPIKey    string
+	GeminiModelName string
+	DefaultPrompt   string
+	DirectPrompt    string
+	DailyTakePrompt string
+	SummaryPrompt   string
+	// RateLimitErrorMessage string // УДАЛЕНО
+	// Новые компоненты сообщения о лимите /summary
+	SummaryRateLimitStaticPrefix string
+	SummaryRateLimitInsultPrompt string
+	SummaryRateLimitStaticSuffix string
 	// Новые промпты для ввода
 	PromptEnterMinMessages     string
 	PromptEnterMaxMessages     string
@@ -75,7 +79,7 @@ func Load() (*Config, error) {
 	directPrompt := getEnvOrDefault("DIRECT_PROMPT", "Ответь кратко.")
 	dailyTakePrompt := getEnvOrDefault("DAILY_TAKE_PROMPT", "Какая тема дня?")
 	summaryPrompt := getEnvOrDefault("SUMMARY_PROMPT", "Сделай саммари.")
-	rateLimitErrorMsg := getEnvOrDefault("RATE_LIMIT_ERROR_MESSAGE", "Слишком часто! Попробуйте позже.")
+	// rateLimitErrorMsg := getEnvOrDefault("RATE_LIMIT_ERROR_MESSAGE", "Слишком часто! Попробуйте позже.") // УДАЛЕНО
 	timeZone := getEnvOrDefault("TIME_ZONE", "UTC")
 	dailyTakeTimeStr := getEnvOrDefault("DAILY_TAKE_TIME", "19")
 	minMsgStr := getEnvOrDefault("MIN_MESSAGES", "10")
@@ -93,6 +97,11 @@ func Load() (*Config, error) {
 	srachAnalysisPrompt := getEnvOrDefault("SRACH_ANALYSIS_PROMPT", "Анализирую срач...")
 	srachConfirmPrompt := getEnvOrDefault("SRACH_CONFIRM_PROMPT", "Это сообщение - часть срача? Ответь true или false:")
 	srachKeywordsRaw := getEnvOrDefault("SRACH_KEYWORDS", "")
+
+	// --- Загрузка НОВЫХ переменных (компоненты лимита саммари) ---
+	summaryLimitPrefix := getEnvOrDefault("SUMMARY_RATE_LIMIT_STATIC_PREFIX", "Саммари можно запрашивать не чаще, чем раз в 10 минут.")
+	summaryLimitPrompt := getEnvOrDefault("SUMMARY_RATE_LIMIT_INSULT_PROMPT", "Сгенерируй короткое, грубое оскорбление в одно предложение.")
+	summaryLimitSuffix := getEnvOrDefault("SUMMARY_RATE_LIMIT_STATIC_SUFFIX", "Осталось подождать: %s.")
 
 	// --- Загрузка переменных S3 ---
 	s3Endpoint := getEnvOrDefault("S3_ENDPOINT", "")
@@ -119,7 +128,10 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] DIRECT_PROMPT: %s...", truncateString(directPrompt, 50))
 	log.Printf("[Config Load] DAILY_TAKE_PROMPT: %s...", truncateString(dailyTakePrompt, 50))
 	log.Printf("[Config Load] SUMMARY_PROMPT: %s...", truncateString(summaryPrompt, 50))
-	log.Printf("[Config Load] RATE_LIMIT_ERROR_MESSAGE: %s...", truncateString(rateLimitErrorMsg, 50))
+	// log.Printf("[Config Load] RATE_LIMIT_ERROR_MESSAGE: %s...", truncateString(rateLimitErrorMsg, 50)) // УДАЛЕНО
+	log.Printf("[Config Load] SUMMARY_RATE_LIMIT_STATIC_PREFIX: %s...", truncateString(summaryLimitPrefix, 50))
+	log.Printf("[Config Load] SUMMARY_RATE_LIMIT_INSULT_PROMPT: %s...", truncateString(summaryLimitPrompt, 50))
+	log.Printf("[Config Load] SUMMARY_RATE_LIMIT_STATIC_SUFFIX: %s...", truncateString(summaryLimitSuffix, 50))
 	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
 	log.Printf("[Config Load] SRACH_WARNING_PROMPT: %s...", truncateString(srachWarningPrompt, 50))
 	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
@@ -204,40 +216,43 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		TelegramToken:              telegramToken,
-		GeminiAPIKey:               geminiAPIKey,
-		GeminiModelName:            geminiModelName,
-		DefaultPrompt:              defaultPrompt,
-		DirectPrompt:               directPrompt,
-		DailyTakePrompt:            dailyTakePrompt,
-		SummaryPrompt:              summaryPrompt,
-		RateLimitErrorMessage:      rateLimitErrorMsg,
-		PromptEnterMinMessages:     promptEnterMin,
-		PromptEnterMaxMessages:     promptEnterMax,
-		PromptEnterDailyTime:       promptEnterDailyTime,
-		PromptEnterSummaryInterval: promptEnterSummaryInterval,
-		SRACH_WARNING_PROMPT:       srachWarningPrompt,
-		SRACH_ANALYSIS_PROMPT:      srachAnalysisPrompt,
-		SRACH_CONFIRM_PROMPT:       srachConfirmPrompt,
-		SrachKeywords:              srachKeywordsList,
-		DailyTakeTime:              dailyTakeTime,
-		TimeZone:                   timeZone,
-		SummaryIntervalHours:       summaryIntervalHours,
-		MinMessages:                minMsg,
-		MaxMessages:                maxMsg,
-		ContextWindow:              contextWindow,
-		Debug:                      debug,
-		UseS3Storage:               useS3Storage,
-		S3Endpoint:                 s3Endpoint,
-		S3Region:                   s3Region,
-		S3AccessKeyID:              s3AccessKeyID,
-		S3SecretAccessKey:          s3SecretAccessKey,
-		S3BucketName:               s3BucketName,
-		S3UseSSL:                   s3UseSSL,
-		HistorySaveInterval:        historySaveInterval,
-		RateLimitDirectReplyPrompt: rateLimitPrompt,
-		DirectReplyRateLimitCount:  rateLimitCount,
-		DirectReplyRateLimitWindow: rateLimitWindow,
+		TelegramToken:   telegramToken,
+		GeminiAPIKey:    geminiAPIKey,
+		GeminiModelName: geminiModelName,
+		DefaultPrompt:   defaultPrompt,
+		DirectPrompt:    directPrompt,
+		DailyTakePrompt: dailyTakePrompt,
+		SummaryPrompt:   summaryPrompt,
+		// RateLimitErrorMessage:      rateLimitErrorMsg, // УДАЛЕНО
+		SummaryRateLimitStaticPrefix: summaryLimitPrefix,
+		SummaryRateLimitInsultPrompt: summaryLimitPrompt,
+		SummaryRateLimitStaticSuffix: summaryLimitSuffix,
+		PromptEnterMinMessages:       promptEnterMin,
+		PromptEnterMaxMessages:       promptEnterMax,
+		PromptEnterDailyTime:         promptEnterDailyTime,
+		PromptEnterSummaryInterval:   promptEnterSummaryInterval,
+		SRACH_WARNING_PROMPT:         srachWarningPrompt,
+		SRACH_ANALYSIS_PROMPT:        srachAnalysisPrompt,
+		SRACH_CONFIRM_PROMPT:         srachConfirmPrompt,
+		SrachKeywords:                srachKeywordsList,
+		DailyTakeTime:                dailyTakeTime,
+		TimeZone:                     timeZone,
+		SummaryIntervalHours:         summaryIntervalHours,
+		MinMessages:                  minMsg,
+		MaxMessages:                  maxMsg,
+		ContextWindow:                contextWindow,
+		Debug:                        debug,
+		UseS3Storage:                 useS3Storage,
+		S3Endpoint:                   s3Endpoint,
+		S3Region:                     s3Region,
+		S3AccessKeyID:                s3AccessKeyID,
+		S3SecretAccessKey:            s3SecretAccessKey,
+		S3BucketName:                 s3BucketName,
+		S3UseSSL:                     s3UseSSL,
+		HistorySaveInterval:          historySaveInterval,
+		RateLimitDirectReplyPrompt:   rateLimitPrompt,
+		DirectReplyRateLimitCount:    rateLimitCount,
+		DirectReplyRateLimitWindow:   rateLimitWindow,
 	}, nil
 }
 

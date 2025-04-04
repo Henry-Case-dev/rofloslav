@@ -303,7 +303,60 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	}
 	// --- Конец обработки команд ---
 
-	// --- Логика Анализа Срачей ---
+	// --- НОВЫЙ БЛОК: Обработка лимита прямых ответов --- (ПЕРЕМЕЩЕНО СЮДА)
+	if isDirectReply {
+		// Логика проверки и обработки лимита...
+		now := time.Now()
+		b.directReplyMutex.Lock()
+
+		if _, chatExists := b.directReplyTimestamps[chatID]; !chatExists {
+			b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
+		}
+		if _, userExists := b.directReplyTimestamps[chatID][userID]; !userExists {
+			b.directReplyTimestamps[chatID][userID] = make([]time.Time, 0)
+		}
+
+		// Очищаем старые временные метки
+		validTimestamps := make([]time.Time, 0)
+		cutoff := now.Add(-b.config.DirectReplyRateLimitWindow)
+		for _, ts := range b.directReplyTimestamps[chatID][userID] {
+			if ts.After(cutoff) {
+				validTimestamps = append(validTimestamps, ts)
+			}
+		}
+		b.directReplyTimestamps[chatID][userID] = validTimestamps
+
+		// Проверяем лимит
+		if len(b.directReplyTimestamps[chatID][userID]) >= b.config.DirectReplyRateLimitCount {
+			// Лимит превышен
+			log.Printf("[Rate Limit] Чат %d, Пользователь %d: Превышен лимит прямых ответов (%d/%d за %v). Отвечаем по спец. промпту.",
+				chatID, userID, len(b.directReplyTimestamps[chatID][userID]), b.config.DirectReplyRateLimitCount, b.config.DirectReplyRateLimitWindow)
+			b.directReplyMutex.Unlock() // Разблокируем перед вызовом LLM
+
+			// Генерируем ответ по спец. промпту (без контекста)
+			response, err := b.gemini.GenerateArbitraryResponse(b.config.RateLimitDirectReplyPrompt, "") // Контекст не нужен
+			if err != nil {
+				log.Printf("[Rate Limit ERROR] Чат %d: Ошибка генерации ответа при превышении лимита: %v", chatID, err)
+			} else {
+				b.sendReply(chatID, response)
+			}
+			return // Выходим, так как обработали прямое обращение (с лимитом)
+		} else {
+			// Лимит не превышен, добавляем метку и генерируем обычный прямой ответ
+			log.Printf("[Direct Reply] Чат %d, Пользователь %d: Лимит не превышен (%d/%d). Добавляем метку.",
+				chatID, userID, len(b.directReplyTimestamps[chatID][userID]), b.config.DirectReplyRateLimitCount)
+			b.directReplyTimestamps[chatID][userID] = append(b.directReplyTimestamps[chatID][userID], now)
+			b.directReplyMutex.Unlock() // Разблокируем перед вызовом LLM
+
+			// Генерируем ответ по промпту DIRECT_PROMPT (без контекста)
+			b.sendDirectResponse(chatID, message) // Используем существующую функцию
+			return                                // Выходим, так как обработали прямое обращение (без лимита)
+		}
+		// --- Конец обработки лимита ---
+	}
+	// --- КОНЕЦ НОВОГО БЛОКА ---
+
+	// --- Логика Анализа Срачей --- (Теперь идет ПОСЛЕ обработки прямых ответов)
 	b.settingsMutex.RLock()
 	srachEnabled := settings.SrachAnalysisEnabled
 	b.settingsMutex.RUnlock()
@@ -362,33 +415,9 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	// --- Конец Логики Анализа Срачей ---
 
 SaveMessage: // Метка для перехода после обработки срача
-	// --- Обработка обычных сообщений --- (Переносим сохранение сюда)
+	// --- Обработка обычных сообщений ---
 	// Сохраняем сообщение в общую историю (всегда)
-	b.storage.AddMessage(chatID, message)
-
-	// Проверяем, является ли сообщение ответом на сообщение бота или обращением к боту
-	isReplyToBot := message.ReplyToMessage != nil &&
-		message.ReplyToMessage.From != nil &&
-		message.ReplyToMessage.From.ID == b.api.Self.ID
-	mentionsBot := false
-	if len(message.Entities) > 0 {
-		for _, entity := range message.Entities {
-			if entity.Type == "mention" {
-				mention := message.Text[entity.Offset : entity.Offset+entity.Length]
-				if mention == "@"+b.api.Self.UserName {
-					mentionsBot = true
-					break
-				}
-			}
-		}
-	}
-
-	// Отвечаем на прямое обращение к боту
-	if isReplyToBot || mentionsBot {
-		log.Printf("Обнаружено прямое обращение к боту, отправляю ответ")
-		go b.sendDirectResponse(chatID, message)
-		return
-	}
+	// b.storage.AddMessage(chatID, message) // УЖЕ СДЕЛАНО В НАЧАЛЕ ФУНКЦИИ
 
 	// Увеличиваем счетчик сообщений и проверяем, нужно ли отвечать
 	b.settingsMutex.Lock()
@@ -418,853 +447,426 @@ SaveMessage: // Метка для перехода после обработки
 	}
 	// --- Конец обработки обычных сообщений ---
 
-	if isDirectReply {
-		// --- Обработка лимита прямых ответов ---
-		now := time.Now()
-		b.directReplyMutex.Lock()
+}
 
-		if _, chatExists := b.directReplyTimestamps[chatID]; !chatExists {
-			b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
-		}
-		if _, userExists := b.directReplyTimestamps[chatID][userID]; !userExists {
-			b.directReplyTimestamps[chatID][userID] = make([]time.Time, 0)
-		}
+// --- Вспомогательные функции отправки сообщений ---
 
-		// Очищаем старые временные метки
-		validTimestamps := make([]time.Time, 0)
-		cutoff := now.Add(-b.config.DirectReplyRateLimitWindow)
-		for _, ts := range b.directReplyTimestamps[chatID][userID] {
-			if ts.After(cutoff) {
-				validTimestamps = append(validTimestamps, ts)
-			}
-		}
-		b.directReplyTimestamps[chatID][userID] = validTimestamps
-
-		// Проверяем лимит
-		if len(b.directReplyTimestamps[chatID][userID]) >= b.config.DirectReplyRateLimitCount {
-			// Лимит превышен
-			log.Printf("[Rate Limit] Чат %d, Пользователь %d: Превышен лимит прямых ответов (%d/%d за %v). Отвечаем по спец. промпту.",
-				chatID, userID, len(b.directReplyTimestamps[chatID][userID]), b.config.DirectReplyRateLimitCount, b.config.DirectReplyRateLimitWindow)
-			b.directReplyMutex.Unlock() // Разблокируем перед вызовом LLM
-
-			// Генерируем ответ по спец. промпту (без контекста)
-			response, err := b.gemini.GenerateArbitraryResponse(b.config.RateLimitDirectReplyPrompt, "") // Контекст не нужен
-			if err != nil {
-				log.Printf("[Rate Limit ERROR] Чат %d: Ошибка генерации ответа при превышении лимита: %v", chatID, err)
-			} else {
-				b.sendReply(chatID, response)
-			}
-			return // Выходим, чтобы не генерировать обычный прямой ответ
-		} else {
-			// Лимит не превышен, добавляем метку и генерируем обычный прямой ответ
-			log.Printf("[Direct Reply] Чат %d, Пользователь %d: Лимит не превышен (%d/%d). Добавляем метку.",
-				chatID, userID, len(b.directReplyTimestamps[chatID][userID]), b.config.DirectReplyRateLimitCount)
-			b.directReplyTimestamps[chatID][userID] = append(b.directReplyTimestamps[chatID][userID], now)
-			b.directReplyMutex.Unlock() // Разблокируем перед вызовом LLM
-
-			// Генерируем ответ по промпту DIRECT_PROMPT (без контекста)
-			b.sendDirectResponse(chatID, message) // Используем существующую функцию
-			return
-		}
-		// --- Конец обработки лимита ---
+// sendReply отправляет простое текстовое сообщение в чат
+func (b *Bot) sendReply(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Ошибка отправки сообщения в чат %d: %v", chatID, err)
 	}
 }
 
-// handleCommand обрабатывает команды
+// sendReplyWithKeyboard отправляет сообщение с клавиатурой
+func (b *Bot) sendReplyWithKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Ошибка отправки сообщения с клавиатурой в чат %d: %v", chatID, err)
+	}
+}
+
+// editMessageMarkup изменяет клавиатуру существующего сообщения
+func (b *Bot) editMessageMarkup(chatID int64, messageID int, markup tgbotapi.InlineKeyboardMarkup) {
+	editMsg := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
+	if _, err := b.api.Send(editMsg); err != nil {
+		// Логируем ошибку, но не фатально, т.к. сообщение уже есть
+		log.Printf("Ошибка редактирования клавиатуры сообщения %d в чате %d: %v", messageID, chatID, err)
+	}
+}
+
+// --- Обработка команд ---
+
+// handleCommand обрабатывает команды, начинающиеся с "/"
 func (b *Bot) handleCommand(message *tgbotapi.Message) {
-	command := message.Command()
 	chatID := message.Chat.ID
+	command := message.Command()
+	args := message.CommandArguments() // Аргументы после команды
+
+	log.Printf("Получена команда '%s' с аргументами '%s' от %s в чате %d", command, args, message.From.UserName, chatID)
 
 	switch command {
 	case "start":
+		settings, _ := b.loadChatSettings(chatID) // Загружаем или создаем настройки
 		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.Active = true
-		}
+		settings.Active = true // Активируем бота по умолчанию при /start
 		b.settingsMutex.Unlock()
-
-		b.sendReplyWithKeyboard(chatID, "Бот запущен и готов к работе!", getMainKeyboard())
+		// Загружаем историю при старте (если есть)
+		go b.loadChatHistory(chatID) // ВКЛЮЧЕНО
+		b.sendReplyWithKeyboard(chatID, "Бот активирован. Генерирую случайные ответы. Используйте /settings для настройки.", getMainKeyboard())
 
 	case "stop":
+		settings, _ := b.loadChatSettings(chatID)
 		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.Active = false
-		}
+		settings.Active = false
 		b.settingsMutex.Unlock()
-
-		b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
-
-	case "summary":
-		// Проверяем ограничение по времени
-		b.summaryMutex.RLock()
-		lastRequestTime, ok := b.lastSummaryRequest[chatID]
-		b.summaryMutex.RUnlock()
-
-		// Ограничение в 10 минут
-		const rateLimitDuration = 10 * time.Minute
-		timeSinceLastRequest := time.Since(lastRequestTime)
-
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: /summary вызван. Последний запрос был: %v (ok=%t). Прошло: %s. Лимит: %s.",
-				chatID, lastRequestTime, ok, timeSinceLastRequest.Round(time.Second), rateLimitDuration)
-			log.Printf("[DEBUG] Чат %d: Сравниваем %s < %s ?", chatID, timeSinceLastRequest.Round(time.Second), rateLimitDuration)
-			log.Printf("[DEBUG] Чат %d: Сообщение об ошибке из конфига: '%s'", chatID, b.config.RateLimitErrorMessage)
-		}
-
-		if ok && timeSinceLastRequest < rateLimitDuration {
-			remainingTime := rateLimitDuration - timeSinceLastRequest
-			// Формируем сообщение
-			errorMsgText := b.config.RateLimitErrorMessage // Получаем текст из конфига
-			fullErrorMsg := fmt.Sprintf("%s Осталось подождать: %s.",
-				errorMsgText, // Используем полученный текст
-				remainingTime.Round(time.Second).String(),
-			)
-			if b.config.Debug {
-				log.Printf("[DEBUG] Чат %d: Rate limit активен. Текст ошибки из конфига: '%s'. Формированное сообщение: '%s'", chatID, errorMsgText, fullErrorMsg)
-			}
-			// Отправляем сформированное сообщение
-			b.sendReply(chatID, fullErrorMsg)
-			return
-		}
-
-		// Если ограничение прошло или запроса еще не было, обновляем время и генерируем саммари
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Rate limit пройден. Обновляю время последнего запроса на %v.", chatID, time.Now())
-		}
-		b.summaryMutex.Lock()
-		b.lastSummaryRequest[chatID] = time.Now()
-		b.summaryMutex.Unlock()
-
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Начинаю генерацию саммари (после обновления времени).", chatID)
-		}
-		go b.generateSummary(chatID) // Запускаем в горутине, чтобы не блокировать
+		b.sendReply(chatID, "Бот деактивирован. Не буду отвечать на сообщения.")
 
 	case "settings":
-		b.sendSettingsKeyboard(chatID)
+		b.sendSettingsKeyboard(chatID) // Отправляем меню настроек
 
-	case "menu": // Добавляем обработку /menu
-		b.sendReplyWithKeyboard(chatID, "Главное меню:", getMainKeyboard())
+	case "summary":
+		b.handleSummaryCommand(chatID)
 
-	case "srach": // Добавляем обработку /srach
-		b.toggleSrachAnalysis(chatID)
-		b.sendSettingsKeyboard(chatID) // Показываем обновленное меню настроек
+	case "ping":
+		b.sendReply(chatID, "Pong!")
 
-		// Можно добавить default для неизвестных команд
-		// default:
-		// 	b.sendReply(chatID, "Неизвестная команда.")
-	}
-}
-
-// handleCallback обрабатывает нажатия на кнопки
-func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
-	chatID := callback.Message.Chat.ID
-
-	// Общий ключ для PendingSetting (пока не используется, т.к. PendingSetting хранится для chatID)
-	// pendingKey := fmt.Sprintf("%d", chatID)
-
-	var promptText string
-	var settingToSet string
-
-	switch callback.Data {
-	case "set_min_messages":
-		settingToSet = "min_messages"
-		promptText = b.config.PromptEnterMinMessages
-	case "set_max_messages":
-		settingToSet = "max_messages"
-		promptText = b.config.PromptEnterMaxMessages
-	case "set_daily_time":
-		settingToSet = "daily_time"
-		promptText = fmt.Sprintf(b.config.PromptEnterDailyTime, b.config.TimeZone) // Подставляем часовой пояс в промпт
-	case "set_summary_interval":
-		settingToSet = "summary_interval"
-		promptText = b.config.PromptEnterSummaryInterval
-	case "back_to_main":
-		b.settingsMutex.Lock()
-		// Сбрасываем ожидание ввода при выходе из настроек
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.PendingSetting = ""
-			deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID) // Удаляем само меню настроек
-			b.api.Request(deleteMsg)
-		}
-		b.settingsMutex.Unlock()
-
-		// Отправляем основное меню
-		b.sendReplyWithKeyboard(chatID, "Бот готов к работе!", getMainKeyboard())
-		b.answerCallback(callback.ID, "") // Отвечаем на колбэк
-		return                            // Выходим, дальнейшая обработка не нужна
-
-	case "summary": // Обработка кнопки саммари из основного меню
-		b.answerCallback(callback.ID, "Запрашиваю саммари...")
-		// Корректно имитируем сообщение с командой
-		// Создаем базовое сообщение, похожее на то, что пришло бы от пользователя
-		fakeMessage := &tgbotapi.Message{
-			MessageID: callback.Message.MessageID, // Можно использовать ID кнопки для контекста, но не обязательно
-			From:      callback.From,              // Кто нажал кнопку
-			Chat:      callback.Message.Chat,      // В каком чате
-			Date:      int(time.Now().Unix()),     // Текущее время
-			Text:      "/summary",                 // Текст команды
-			Entities: []tgbotapi.MessageEntity{ // Указываем, что это команда
-				{Type: "bot_command", Offset: 0, Length: len("/summary")},
-			},
-		}
-		b.handleCommand(fakeMessage) // Передаем имитированное сообщение
-		return                       // Выходим
-
-	case "settings": // Обработка кнопки настроек из основного меню
-		// Удаляем сообщение с основным меню
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
-		b.sendSettingsKeyboard(chatID)
-		b.answerCallback(callback.ID, "") // Отвечаем на колбэк
-		return                            // Выходим
-
-	case "stop": // Обработка кнопки паузы из основного меню
-		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.Active = false
-		}
-		b.settingsMutex.Unlock()
-		// Удаляем сообщение с основным меню
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
-		// Отправляем текстовое подтверждение
-		b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
-		b.answerCallback(callback.ID, "Бот остановлен")
-		return // Выходим
-
-	// Новые коллбэки для управления анализом срачей
-	case "toggle_srach_on":
-		b.setSrachAnalysis(chatID, true)
-		b.answerCallback(callback.ID, "🔥 Анализ срачей включен")
-		b.updateSettingsKeyboard(callback) // Обновляем сообщение с клавиатурой
-		return                             // Выходим, дальнейшая обработка не нужна
-	case "toggle_srach_off":
-		b.setSrachAnalysis(chatID, false)
-		b.answerCallback(callback.ID, "💀 Анализ срачей выключен")
-		b.updateSettingsKeyboard(callback) // Обновляем сообщение с клавиатурой
-		return                             // Выходим, дальнейшая обработка не нужна
+	case "help":
+		helpText := `Доступные команды:
+/start - Активировать бота в чате
+/stop - Деактивировать бота в чате
+/settings - Открыть меню настроек
+/summary - Запросить саммари последних сообщений
+/ping - Проверить доступность бота
+/help - Показать это сообщение`
+		b.sendReply(chatID, helpText)
 
 	default:
-		log.Printf("Неизвестный callback data: %s", callback.Data)
-		b.answerCallback(callback.ID, "Неизвестное действие")
-		return // Выходим
-	}
-
-	// Если мы дошли сюда, значит, была нажата кнопка "Установить..."
-	if settingToSet != "" {
-		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.PendingSetting = settingToSet // Устанавливаем ожидание
-		}
-		b.settingsMutex.Unlock()
-
-		// Отправляем сообщение с запросом ввода
-		// Сначала удаляем старое меню настроек
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
-		// Затем отправляем промпт
-		b.sendReply(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
-		b.answerCallback(callback.ID, "Ожидаю ввода...")
+		b.sendReply(chatID, "Неизвестная команда.")
 	}
 }
 
-// sendAIResponse генерирует и отправляет ответ нейросети
-func (b *Bot) sendAIResponse(chatID int64) {
-	if b.config.Debug {
-		log.Printf("[DEBUG] Генерация AI ответа для чата %d", chatID)
-	}
+// handleSummaryCommand обрабатывает команду /summary
+func (b *Bot) handleSummaryCommand(chatID int64) {
+	b.summaryMutex.Lock()
+	lastReq, ok := b.lastSummaryRequest[chatID]
+	now := time.Now()
+	// Лимит запросов саммари - 10 минут
+	limitDuration := 10 * time.Minute
+	if ok && now.Sub(lastReq) < limitDuration {
+		// Лимит превышен
+		remainingTime := limitDuration - now.Sub(lastReq)
+		remainingStr := remainingTime.Round(time.Second).String()
 
-	// Получаем историю сообщений
-	messages := b.storage.GetMessages(chatID)
-	if len(messages) == 0 {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Нет сообщений для чата %d, ответ не отправлен", chatID)
-		}
-		return
-	}
-
-	// Получаем настройки промпта
-	b.settingsMutex.RLock()
-	settings, exists := b.chatSettings[chatID]
-	prompt := b.config.DefaultPrompt
-	if exists && settings.CustomPrompt != "" {
-		prompt = settings.CustomPrompt
-	}
-	b.settingsMutex.RUnlock()
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Используется промпт: %s", prompt[:min(30, len(prompt))]+"...")
-		log.Printf("[DEBUG] Количество сообщений в контексте: %d", len(messages))
-	}
-
-	// Отправляем запрос к Gemini
-	response, err := b.gemini.GenerateResponse(prompt, messages)
-	if err != nil {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Ошибка при генерации ответа: %v. Полный текст ошибки: %s", err, err.Error())
-			log.Printf("[DEBUG] API ключ: %s... (первые 5 символов)", b.config.GeminiAPIKey[:5])
-		} else {
-			log.Printf("Ошибка при генерации ответа: %v", err)
-		}
-		return
-	}
-
-	// Отправляем ответ в чат
-	b.sendReply(chatID, response)
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Успешно отправлен AI ответ в чат %d", chatID)
-	}
-}
-
-// generateSummary создает и отправляет саммари диалога
-func (b *Bot) generateSummary(chatID int64) {
-	// Получаем сообщения за последние 24 часа
-	messages := b.storage.GetMessagesSince(chatID, time.Now().Add(-24*time.Hour))
-	if len(messages) == 0 {
-		b.sendReply(chatID, "Недостаточно сообщений для создания саммари.")
-		return
-	}
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Создаю саммари для чата %d. Найдено сообщений: %d", chatID, len(messages))
-	}
-
-	// Используем только промпт для саммари без комбинирования
-	summaryPrompt := b.config.SummaryPrompt
-
-	const maxAttempts = 3 // Максимальное количество попыток генерации
-	const minWords = 10   // Минимальное количество слов в саммари
-
-	var finalSummary string
-	var lastErr error // Сохраняем последнюю ошибку API
-	var attempt int
-
-	for attempt = 1; attempt <= maxAttempts; attempt++ {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Попытка генерации саммари №%d", chatID, attempt)
-		}
-
-		// Отправляем запрос к Gemini с промптом для саммари
-		summary, err := b.gemini.GenerateResponse(summaryPrompt, messages)
+		// Генерируем оскорбление с помощью Gemini
+		insultPrompt := b.config.SummaryRateLimitInsultPrompt
+		insult, err := b.gemini.GenerateArbitraryResponse(insultPrompt, "") // Без контекста
 		if err != nil {
-			lastErr = err // Сохраняем последнюю ошибку
-			if b.config.Debug {
-				log.Printf("[DEBUG] Чат %d: Ошибка при генерации саммари (попытка %d): %v", chatID, attempt, err)
-			}
-			// При ошибке API нет смысла повторять сразу без паузы
-			if attempt < maxAttempts {
-				time.Sleep(1 * time.Second)
-			}
-			continue // Переходим к следующей попытке
-		}
-
-		// Проверяем количество слов
-		wordCount := len(strings.Fields(summary))
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Сгенерировано саммари (попытка %d), слов: %d. Текст: %s...", chatID, attempt, wordCount, truncateString(summary, 50))
-		}
-
-		if wordCount >= minWords {
-			finalSummary = summary
-			lastErr = nil // Сбрасываем ошибку при успехе
-			break         // Успешная генерация, выходим из цикла
-		}
-
-		// Если слов мало, добавляем небольшую задержку перед следующей попыткой
-		if attempt < maxAttempts {
-			time.Sleep(1 * time.Second)
-		}
-	}
-
-	// Проверяем результат после всех попыток
-	if finalSummary == "" {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Не удалось сгенерировать достаточно длинное саммари после %d попыток.", chatID, maxAttempts)
-		}
-		errMsg := "Не удалось создать достаточно информативное саммари после нескольких попыток."
-		if lastErr != nil { // Если последняя попытка завершилась ошибкой API или предыдущие были неудачными
-			errMsg += fmt.Sprintf(" Последняя ошибка: %v", lastErr)
-		}
-		b.sendReply(chatID, errMsg)
-		return
-	}
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Саммари успешно создано для чата %d после %d попыток", chatID, attempt)
-	}
-
-	// Отправляем финальное саммари
-	finalMessageText := fmt.Sprintf("📋 *Саммари диалога за последние 24 часа:*\n\n%s", finalSummary)
-	msg := tgbotapi.NewMessage(chatID, finalMessageText)
-	msg.ParseMode = "Markdown"
-	_, sendErr := b.api.Send(msg)
-	if sendErr != nil {
-		log.Printf("Ошибка отправки финального саммари в чат %d: %v", chatID, sendErr)
-	}
-}
-
-// Вспомогательные методы для работы с Telegram API
-func (b *Bot) sendReply(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-
-	_, err := b.api.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка отправки сообщения: %v", err)
-	}
-}
-
-func (b *Bot) sendReplyWithKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = keyboard
-
-	_, err := b.api.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка отправки сообщения: %v", err)
-	}
-}
-
-func (b *Bot) answerCallback(callbackID string, text string) {
-	callback := tgbotapi.NewCallback(callbackID, text)
-	_, err := b.api.Request(callback)
-	if err != nil {
-		log.Printf("Ошибка ответа на callback: %v", err)
-	}
-}
-
-func (b *Bot) sendSettingsKeyboard(chatID int64) {
-	settings, err := b.loadChatSettings(chatID) // Используем уже исправленную функцию
-	if err != nil {
-		log.Printf("sendSettingsKeyboard: Ошибка загрузки/создания настроек для чата %d: %v", chatID, err)
-		// Можно отправить сообщение об ошибке пользователю
-		return
-	}
-
-	b.settingsMutex.RLock()
-	prevMessageID := settings.LastMessageID // Используем LastMessageID
-	summaryInterval := settings.SummaryIntervalHours
-	srachEnabled := settings.SrachAnalysisEnabled
-	// Копируем нужные значения перед разблокировкой
-	minMessages := settings.MinMessages
-	maxMessages := settings.MaxMessages
-	dailyTakeTime := settings.DailyTakeTime
-	b.settingsMutex.RUnlock()
-
-	// Удаляем предыдущее сообщение с меню, если оно существует
-	if prevMessageID != 0 {
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, prevMessageID)
-		_, err := b.api.Request(deleteMsg)
-		if err != nil {
-			// Логируем ошибку, но не прерываем отправку нового меню
-			log.Printf("Ошибка при удалении предыдущего меню (ID: %d) в чате %d: %v", prevMessageID, chatID, err)
-		}
-	}
-
-	text := fmt.Sprintf("⚙️ *Настройки бота*\n\n"+
-		"Ответ после: %d - %d сообщ.\n"+
-		"Тема дня: %d:00 (%s)\n"+
-		"Авто-саммари: %s\n"+
-		"Анализ срачей: %s",
-		minMessages, maxMessages,
-		dailyTakeTime, b.config.TimeZone,
-		formatSummaryInterval(summaryInterval),
-		formatEnabled(srachEnabled))
-
-	// Передаем все 5 аргументов
-	keyboard := getSettingsKeyboard(minMessages, maxMessages, dailyTakeTime, summaryInterval, srachEnabled)
-
-	// Отправляем новое меню и сохраняем его ID
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = keyboard
-
-	sentMsg, err := b.api.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка отправки сообщения настроек: %v", err)
-		return
-	}
-
-	// Сохраняем ID отправленного сообщения
-	b.settingsMutex.Lock()
-	if settings, exists := b.chatSettings[chatID]; exists { // Проверяем еще раз на случай удаления чата
-		settings.LastMessageID = sentMsg.MessageID // Используем LastMessageID
-		settings.PendingSetting = ""               // Сбрасываем ожидание ввода при показе меню
-	}
-	b.settingsMutex.Unlock()
-}
-
-// formatSummaryInterval форматирует интервал саммари для отображения
-func formatSummaryInterval(hours int) string {
-	if hours <= 0 {
-		return "Выкл."
-	}
-	return fmt.Sprintf("каждые %d ч.", hours)
-}
-
-// sendDirectResponse отправляет ответ на прямое обращение к боту
-func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
-	if b.config.Debug {
-		log.Printf("[DEBUG] Отправка прямого ответа в чат %d на сообщение от %s (%s)",
-			chatID, message.From.FirstName, message.From.UserName)
-	}
-
-	// Получаем некоторый контекст из истории
-	messages := b.storage.GetMessages(chatID)
-
-	// Для прямого ответа используем только DIRECT_PROMPT
-	response, err := b.gemini.GenerateResponse(b.config.DirectPrompt, messages)
-	if err != nil {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Ошибка при генерации прямого ответа: %v. Полный текст ошибки: %s", err, err.Error())
-			log.Printf("[DEBUG] API ключ: %s... (первые 5 символов)", b.config.GeminiAPIKey[:5])
-			log.Printf("[DEBUG] Промпт для прямого ответа: %s", b.config.DirectPrompt)
-			log.Printf("[DEBUG] Количество сообщений в контексте: %d", len(messages))
-		} else {
-			log.Printf("Ошибка при генерации прямого ответа: %v", err)
-		}
-		return
-	}
-
-	// Создаем сообщение с ответом на исходное сообщение
-	msg := tgbotapi.NewMessage(chatID, response)
-	msg.ParseMode = "Markdown"
-	msg.ReplyToMessageID = message.MessageID
-
-	_, err = b.api.Send(msg)
-	if err != nil {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Ошибка отправки сообщения: %v. Полный текст ошибки: %s", err, err.Error())
-		} else {
-			log.Printf("Ошибка отправки сообщения: %v", err)
-		}
-	} else if b.config.Debug {
-		log.Printf("[DEBUG] Успешно отправлен прямой ответ в чат %d", chatID)
-	}
-}
-
-// scheduleDailyTake запускает планировщик для ежедневного тейка
-func (b *Bot) scheduleDailyTake(dailyTakeTime int, timeZone string) {
-	// Получаем локацию из конфига
-	loc, err := time.LoadLocation(timeZone)
-	if err != nil {
-		log.Printf("Ошибка загрузки часового пояса, используем UTC: %v", err)
-		loc = time.UTC
-	}
-
-	for {
-		now := time.Now().In(loc)
-		targetTime := time.Date(
-			now.Year(), now.Month(), now.Day(),
-			dailyTakeTime, 0, 0, 0,
-			loc,
-		)
-
-		// Если сейчас уже после времени запуска, планируем на завтра
-		if now.After(targetTime) {
-			targetTime = targetTime.Add(24 * time.Hour)
-		}
-
-		// Вычисляем время до следующего запуска
-		sleepDuration := targetTime.Sub(now)
-		log.Printf("Запланирован тейк через %v (в %s по %s)",
-			sleepDuration, targetTime.Format("15:04"), timeZone)
-
-		// Спим до нужного времени
-		time.Sleep(sleepDuration)
-
-		// Отправляем тейк во все активные чаты
-		b.sendDailyTakeToAllChats()
-	}
-}
-
-// sendDailyTakeToAllChats отправляет ежедневный тейк во все активные чаты
-func (b *Bot) sendDailyTakeToAllChats() {
-	if b.config.Debug {
-		log.Printf("[DEBUG] Запуск ежедневного тейка для всех активных чатов")
-	}
-
-	// Используем только промпт для ежедневного тейка без комбинирования
-	dailyTakePrompt := b.config.DailyTakePrompt
-
-	// Генерируем тейк с промптом
-	take, err := b.gemini.GenerateResponse(dailyTakePrompt, nil)
-	if err != nil {
-		if b.config.Debug {
-			log.Printf("[DEBUG] Ошибка при генерации ежедневного тейка: %v. Полный текст ошибки: %s", err, err.Error())
-			log.Printf("[DEBUG] API ключ: %s... (первые 5 символов)", b.config.GeminiAPIKey[:5])
-			log.Printf("[DEBUG] Промпт для тейка: %s", dailyTakePrompt)
-		} else {
-			log.Printf("Ошибка при генерации ежедневного тейка: %v", err)
-		}
-		return
-	}
-
-	message := "🔥 *Тема дня:*\n\n" + take
-
-	// Отправляем во все активные чаты
-	b.settingsMutex.RLock()
-	defer b.settingsMutex.RUnlock()
-
-	activeChats := 0
-	for chatID, settings := range b.chatSettings {
-		if settings.Active {
-			activeChats++
-			go func(cid int64) {
-				b.sendReply(cid, message)
-			}(chatID)
-		}
-	}
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Тема дня отправлена в %d активных чатов", activeChats)
-	}
-}
-
-// Вспомогательная функция для min
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// schedulePeriodicSummary запускает планировщик для автоматической генерации саммари
-func (b *Bot) schedulePeriodicSummary() {
-	// Проверяем необходимость запуска планировщика
-	// (Можно добавить проверку, есть ли вообще чаты с включенным авто-саммари,
-	// но для простоты пока запускаем тикер всегда)
-
-	log.Println("Запуск планировщика автоматического саммари...")
-	// Запускаем тикер, например, раз в час. Более частая проверка не имеет смысла,
-	// так как минимальный интервал - 1 час.
-	ticker := time.NewTicker(1 * time.Hour)
-	b.autoSummaryTicker = ticker // Сохраняем тикер, чтобы можно было остановить
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			b.checkAndRunAutoSummaries()
-		case <-b.stop:
-			log.Println("Остановка планировщика автоматического саммари.")
+			log.Printf("[Summary Rate Limit ERROR] Чат %d: Ошибка генерации оскорбления: %v", chatID, err)
+			// Отправляем только статичную часть в случае ошибки
+			errorMessage := fmt.Sprintf("%s %s",
+				b.config.SummaryRateLimitStaticPrefix,
+				fmt.Sprintf(b.config.SummaryRateLimitStaticSuffix, remainingStr))
+			b.summaryMutex.Unlock() // Разблокируем перед отправкой
+			b.sendReply(chatID, errorMessage)
 			return
 		}
+
+		// Собираем полное сообщение
+		fullMessage := fmt.Sprintf("%s %s %s",
+			b.config.SummaryRateLimitStaticPrefix,
+			insult,
+			fmt.Sprintf(b.config.SummaryRateLimitStaticSuffix, remainingStr))
+
+		b.summaryMutex.Unlock() // Разблокируем перед отправкой
+		b.sendReply(chatID, fullMessage)
+		return
 	}
+	// Лимит не превышен, обновляем время последнего запроса
+	b.lastSummaryRequest[chatID] = now
+	b.summaryMutex.Unlock() // Разблокируем перед выполнением саммари
+
+	b.sendReply(chatID, "Генерирую саммари за последние 24 часа...")
+	go b.generateAndSendSummary(chatID) // Запускаем в горутине
 }
 
-// checkAndRunAutoSummaries проверяет все чаты и запускает генерацию саммари, если пора
-func (b *Bot) checkAndRunAutoSummaries() {
-	now := time.Now()
-	if b.config.Debug {
-		log.Printf("[AutoSummary Check] Проверка необходимости авто-саммари в %v", now)
-	}
+// --- Управление настройками чата ---
 
-	b.settingsMutex.RLock()
-	chatsToCheck := make(map[int64]*ChatSettings)
-	for chatID, settings := range b.chatSettings {
-		// Копируем настройки, чтобы не держать мьютекс во время генерации
-		chatsToCheck[chatID] = settings
-	}
-	b.settingsMutex.RUnlock()
-
-	for chatID, settings := range chatsToCheck {
-		if settings.Active && settings.SummaryIntervalHours > 0 {
-			durationSinceLast := now.Sub(settings.LastAutoSummaryTime)
-			requiredInterval := time.Duration(settings.SummaryIntervalHours) * time.Hour
-
-			if durationSinceLast >= requiredInterval {
-				if b.config.Debug {
-					log.Printf("[AutoSummary Run] Чат %d: Пора генерировать саммари. Интервал: %dч. Прошло: %v. Последнее: %v",
-						chatID, settings.SummaryIntervalHours, durationSinceLast, settings.LastAutoSummaryTime)
-				}
-				// Обновляем время *перед* запуском, чтобы избежать двойного запуска при долгой генерации
-				b.updateLastAutoSummaryTime(chatID, now)
-				// Запускаем генерацию в отдельной горутине
-				go b.generateSummary(chatID)
-			}
-		}
-	}
-}
-
-// updateLastAutoSummaryTime обновляет время последнего авто-саммари для чата
-func (b *Bot) updateLastAutoSummaryTime(chatID int64, t time.Time) {
-	b.settingsMutex.Lock()
-	if settings, exists := b.chatSettings[chatID]; exists {
-		settings.LastAutoSummaryTime = t
-	}
-	b.settingsMutex.Unlock()
-}
-
-// loadChatSettings загружает настройки для чата из памяти или создает новые.
+// loadChatSettings загружает настройки для чата или создает новые по умолчанию
 func (b *Bot) loadChatSettings(chatID int64) (*ChatSettings, error) {
-	b.settingsMutex.RLock() // Блокируем на чтение
+	b.settingsMutex.RLock()
 	settings, exists := b.chatSettings[chatID]
 	b.settingsMutex.RUnlock()
 
 	if exists {
-		// Настройки найдены в памяти
 		return settings, nil
 	}
 
-	// Настройки не найдены в памяти - создаем новые
-	// Блокируем на запись, так как будем изменять мапу
+	// Если настроек нет, создаем по умолчанию
+	log.Printf("Создаю новые настройки по умолчанию для чата %d", chatID)
 	b.settingsMutex.Lock()
 	defer b.settingsMutex.Unlock()
 
-	// Повторная проверка на случай, если другой поток создал настройки, пока мы ждали блокировки
+	// Перепроверяем на случай, если другой поток создал настройки, пока мы ждали Lock
 	settings, exists = b.chatSettings[chatID]
 	if exists {
 		return settings, nil
 	}
 
-	// Создаем новые настройки
-	log.Printf("Создаю новые настройки по умолчанию для чата %d", chatID)
 	newSettings := &ChatSettings{
-		Active:               true,
-		CustomPrompt:         b.config.DefaultPrompt,
+		Active:               true, // Бот активен по умолчанию
 		MinMessages:          b.config.MinMessages,
 		MaxMessages:          b.config.MaxMessages,
-		MessageCount:         0,
-		LastMessageID:        0,
-		PendingSetting:       "",
-		SummaryIntervalHours: b.config.SummaryIntervalHours,
-		LastAutoSummaryTime:  time.Time{},
-		// Инициализация полей Srach Analysis
-		SrachAnalysisEnabled: true,
+		DailyTakeTime:        b.config.DailyTakeTime,
+		SummaryIntervalHours: b.config.SummaryIntervalHours, // Используем значение из Config
+		SrachAnalysisEnabled: true,                          // Анализ срачей включен по умолчанию
 		SrachState:           "none",
-		SrachStartTime:       time.Time{},
-		SrachMessages:        make([]string, 0),
-		LastSrachTriggerTime: time.Time{},
-		SrachLlmCheckCounter: 0,
-		// Добавляем поля, которые используются в sendSettingsKeyboard, если они есть в структуре
-		DailyTakeTime: b.config.DailyTakeTime, // Убедимся, что это поле существует в ChatSettings
-		// LastMessageID уже есть выше
 	}
-
-	// Добавляем новые настройки в мапу
 	b.chatSettings[chatID] = newSettings
-
-	// Нет необходимости сохранять в файл, так как настройки только в памяти
-
 	return newSettings, nil
 }
 
-// Добавляем вспомогательные функции для управления SrachAnalysis
-func (b *Bot) setSrachAnalysis(chatID int64, enabled bool) {
-	b.settingsMutex.Lock()
-	defer b.settingsMutex.Unlock()
-	if settings, exists := b.chatSettings[chatID]; exists {
-		settings.SrachAnalysisEnabled = enabled
-		log.Printf("Чат %d: Анализ срачей %s", chatID, formatEnabled(enabled))
-		// Можно добавить сохранение настроек, если они персистентны
-	}
-}
-
-func (b *Bot) toggleSrachAnalysis(chatID int64) {
-	b.settingsMutex.Lock()
-	defer b.settingsMutex.Unlock()
-	if settings, exists := b.chatSettings[chatID]; exists {
-		settings.SrachAnalysisEnabled = !settings.SrachAnalysisEnabled
-		log.Printf("Чат %d: Анализ срачей переключен на %s", chatID, formatEnabled(settings.SrachAnalysisEnabled))
-		// Можно добавить сохранение настроек
-	}
-}
-
-// updateSettingsKeyboard обновляет существующее сообщение с меню настроек
-func (b *Bot) updateSettingsKeyboard(callback *tgbotapi.CallbackQuery) {
-	chatID := callback.Message.Chat.ID
-
+// sendSettingsKeyboard отправляет клавиатуру настроек
+func (b *Bot) sendSettingsKeyboard(chatID int64) {
 	settings, err := b.loadChatSettings(chatID)
 	if err != nil {
-		log.Printf("updateSettingsKeyboard: Ошибка загрузки/создания настроек для чата %d: %v", chatID, err)
+		log.Printf("sendSettingsKeyboard: Не удалось загрузить настройки для чата %d: %v", chatID, err)
+		b.sendReply(chatID, "Ошибка получения настроек.")
+		return
+	}
+	b.settingsMutex.RLock()
+	keyboard := getSettingsKeyboard(
+		settings.MinMessages,
+		settings.MaxMessages,
+		settings.DailyTakeTime,
+		settings.SummaryIntervalHours,
+		settings.SrachAnalysisEnabled,
+	)
+	b.settingsMutex.RUnlock()
+	b.sendReplyWithKeyboard(chatID, "⚙️ Настройки:", keyboard)
+}
+
+// --- Отправка ответов AI ---
+
+// sendAIResponse генерирует и отправляет ответ с помощью Gemini
+func (b *Bot) sendAIResponse(chatID int64) {
+	log.Printf("[DEBUG] Генерация AI ответа для чата %d", chatID)
+	settings, _ := b.loadChatSettings(chatID) // Настройки должны быть уже загружены
+
+	// Получаем историю сообщений
+	messages := b.storage.GetMessages(chatID)
+	if len(messages) == 0 {
+		log.Printf("[DEBUG] Нет сообщений в истории для чата %d, ответ не генерируется", chatID)
 		return
 	}
 
+	// Выбираем промпт
 	b.settingsMutex.RLock()
-	// Копируем значения
-	minMessages := settings.MinMessages
-	maxMessages := settings.MaxMessages
-	dailyTakeTime := settings.DailyTakeTime
-	summaryInterval := settings.SummaryIntervalHours
-	srachEnabled := settings.SrachAnalysisEnabled
+	prompt := settings.CustomPrompt
+	if prompt == "" {
+		prompt = b.config.DefaultPrompt
+	}
 	b.settingsMutex.RUnlock()
 
-	text := fmt.Sprintf("⚙️ *Настройки бота*\n\n"+
-		"Ответ после: %d - %d сообщ.\n"+
-		"Тема дня: %d:00 (%s)\n"+
-		"Авто-саммари: %s\n"+
-		"Анализ срачей: %s",
-		minMessages, maxMessages,
-		dailyTakeTime, b.config.TimeZone,
-		formatSummaryInterval(summaryInterval),
-		formatEnabled(srachEnabled))
+	log.Printf("[DEBUG] Используется промпт: %s...", truncateString(prompt, 50))
+	log.Printf("[DEBUG] Количество сообщений в контексте: %d", len(messages))
 
-	keyboard := getSettingsKeyboard(minMessages, maxMessages, dailyTakeTime, summaryInterval, srachEnabled)
-
-	// Обновляем существующее сообщение
-	edit := tgbotapi.NewEditMessageTextAndMarkup(chatID, callback.Message.MessageID, text, keyboard)
-	edit.ParseMode = "Markdown"
-
-	_, err = b.api.Send(edit)
+	response, err := b.gemini.GenerateResponse(prompt, messages)
 	if err != nil {
-		log.Printf("Ошибка обновления сообщения настроек (EditMessageTextAndMarkup) в чате %d: %v", chatID, err)
+		log.Printf("Ошибка генерации ответа AI для чата %d: %v", chatID, err)
+		// Можно отправить сообщение об ошибке пользователю или просто пропустить
+		// b.sendReply(chatID, "Извините, не могу сейчас ответить.")
+		return
 	}
+
+	b.sendReply(chatID, response)
+	log.Printf("[DEBUG] Успешно отправлен AI ответ в чат %d", chatID)
 }
 
-// formatEnabled форматирует булево значение для отображения
-func formatEnabled(enabled bool) string {
-	if enabled {
-		return "Вкл 🔥"
+// sendDirectResponse генерирует ответ на прямое обращение
+func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
+	// Эта функция теперь вызывается только когда лимит НЕ превышен.
+	// Она использует DIRECT_PROMPT без контекста истории.
+	log.Printf("[DEBUG] Генерация ПРЯМОГО ответа для чата %d (лимит не превышен)", chatID)
+
+	response, err := b.gemini.GenerateArbitraryResponse(b.config.DirectPrompt, "") // Без контекста
+	if err != nil {
+		log.Printf("Ошибка генерации прямого ответа для чата %d: %v", chatID, err)
+		return
 	}
-	return "Выкл 💀"
+
+	b.sendReply(chatID, response)
+	log.Printf("[DEBUG] Успешно отправлен ПРЯМОЙ ответ в чат %d", chatID)
 }
 
-// --- Новые вспомогательные функции для анализа срачей ---
+// --- Планировщики ---
 
-// isPotentialSrachTrigger проверяет, может ли сообщение быть триггером срача
-// (Reply, Mention или ключевое слово)
-func (b *Bot) isPotentialSrachTrigger(msg *tgbotapi.Message) bool {
-	if msg == nil {
-		return false
+// scheduleDailyTake запускает ежедневную отправку "темы дня"
+func (b *Bot) scheduleDailyTake(hour int, timeZone string) {
+	loc, err := time.LoadLocation(timeZone)
+	if err != nil {
+		log.Printf("Ошибка загрузки временной зоны '%s': %v, использую UTC", timeZone, err)
+		loc = time.UTC
 	}
-	// 1. Проверка на Reply
-	if msg.ReplyToMessage != nil {
-		return true
+
+	now := time.Now().In(loc)
+	nextTake := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, loc)
+	if now.After(nextTake) {
+		nextTake = nextTake.Add(24 * time.Hour) // Если время уже прошло, планируем на завтра
 	}
-	// 2. Проверка на Mention
-	if len(msg.Entities) > 0 {
-		for _, entity := range msg.Entities {
-			if entity.Type == "mention" || entity.Type == "text_mention" {
-				return true
-			}
+
+	duration := nextTake.Sub(now)
+	log.Printf("Запланирован тейк через %v (в %d:00 по %s)", duration, hour, loc.String())
+
+	timer := time.NewTimer(duration)
+
+	for {
+		select {
+		case <-timer.C:
+			log.Println("Время ежедневного тейка!")
+			b.sendDailyTakeToAllActiveChats()
+			// Перепланируем на следующий день
+			now = time.Now().In(loc)
+			nextTake = time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, loc).Add(24 * time.Hour)
+			duration = nextTake.Sub(now)
+			timer.Reset(duration)
+			log.Printf("Следующий тейк запланирован через %v", duration)
+		case <-b.stop:
+			log.Println("Остановка планировщика тейков.")
+			timer.Stop()
+			return
 		}
 	}
-	// 3. Проверка по ключевым словам из конфига
-	if len(b.config.SrachKeywords) > 0 && msg.Text != "" {
-		messageLower := strings.ToLower(msg.Text)
-		for _, keyword := range b.config.SrachKeywords {
-			// Можно усложнить до поиска целых слов, если нужно.
-			if strings.Contains(messageLower, keyword) {
-				if b.config.Debug {
-					log.Printf("[Srach Detect] Найдено ключевое слово '%s' в сообщении: \"%s...\"", keyword, truncateString(msg.Text, 50))
+}
+
+// sendDailyTakeToAllActiveChats отправляет "тему дня" во все активные чаты
+func (b *Bot) sendDailyTakeToAllActiveChats() {
+	b.settingsMutex.RLock()
+	// Копируем ID активных чатов, чтобы не держать мьютекс во время отправки
+	activeChatIDs := make([]int64, 0)
+	for chatID, settings := range b.chatSettings {
+		if settings.Active {
+			activeChatIDs = append(activeChatIDs, chatID)
+		}
+	}
+	b.settingsMutex.RUnlock()
+
+	if len(activeChatIDs) == 0 {
+		log.Println("Нет активных чатов для отправки тейка.")
+		return
+	}
+
+	log.Printf("Генерация тейка дня для %d чатов...", len(activeChatIDs))
+	takePrompt := b.config.DailyTakePrompt
+	dailyTake, err := b.gemini.GenerateArbitraryResponse(takePrompt, "") // Без контекста
+	if err != nil {
+		log.Printf("Ошибка генерации тейка дня: %v", err)
+		return
+	}
+
+	log.Printf("Тейк дня сгенерирован: \"%s\"", dailyTake)
+	for _, chatID := range activeChatIDs {
+		b.sendReply(chatID, "🔥 Тема дня 🔥\n\n"+dailyTake)
+		time.Sleep(1 * time.Second) // Небольшая задержка между отправками
+	}
+	log.Println("Тейк дня отправлен во все активные чаты.")
+}
+
+// schedulePeriodicSummary запускает периодическую генерацию саммари
+func (b *Bot) schedulePeriodicSummary() {
+	// Используем общий ticker, проверяем интервал для каждого чата индивидуально
+	// Частота тикера может быть, например, раз в час или чаще
+	tickerInterval := 1 * time.Hour // Проверяем каждый час
+	log.Printf("Запуск планировщика автоматического саммари с интервалом проверки %v...", tickerInterval)
+	ticker := time.NewTicker(tickerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.checkAndSendAutoSummaries()
+		case <-b.stop:
+			log.Println("Остановка планировщика авто-саммари.")
+			return
+		}
+	}
+}
+
+// checkAndSendAutoSummaries проверяет и отправляет авто-саммари для чатов
+func (b *Bot) checkAndSendAutoSummaries() {
+	b.settingsMutex.RLock()
+	// Копируем настройки чатов для проверки
+	chatsToCheck := make(map[int64]*ChatSettings)
+	for id, s := range b.chatSettings {
+		// Копируем структуру, чтобы избежать гонки при чтении/записи
+		copiedSettings := *s
+		chatsToCheck[id] = &copiedSettings
+	}
+	b.settingsMutex.RUnlock()
+
+	now := time.Now()
+	for chatID, settings := range chatsToCheck {
+		if settings.Active && settings.SummaryIntervalHours > 0 {
+			intervalDuration := time.Duration(settings.SummaryIntervalHours) * time.Hour
+			// Проверяем, прошло ли достаточно времени с последнего авто-саммари
+			if settings.LastAutoSummaryTime.IsZero() || now.Sub(settings.LastAutoSummaryTime) >= intervalDuration {
+				log.Printf("Авто-саммари для чата %d (интервал %d ч). Последнее: %v", chatID, settings.SummaryIntervalHours, settings.LastAutoSummaryTime)
+
+				// Обновляем время ДО запуска генерации, чтобы избежать повторной отправки при ошибке
+				b.settingsMutex.Lock()
+				// Перепроверяем существование чата на случай удаления
+				if currentSettings, ok := b.chatSettings[chatID]; ok {
+					currentSettings.LastAutoSummaryTime = now
+					b.settingsMutex.Unlock()            // Разблокируем перед генерацией
+					go b.generateAndSendSummary(chatID) // Запускаем генерацию
+				} else {
+					b.settingsMutex.Unlock()
+					log.Printf("Чат %d был удален, пропускаем авто-саммари.", chatID)
 				}
-				return true
 			}
 		}
 	}
-
-	// TODO: Добавить оценку тональности через LLM?
-	return false
 }
 
-// formatMessageForAnalysis форматирует сообщение для передачи в LLM при анализе срача
-func formatMessageForAnalysis(msg *tgbotapi.Message) string {
-	if msg == nil {
-		return ""
+// generateAndSendSummary генерирует и отправляет саммари чата
+func (b *Bot) generateAndSendSummary(chatID int64) {
+	log.Printf("Генерация саммари для чата %d", chatID)
+	// Получаем сообщения за последние 24 часа
+	since := time.Now().Add(-24 * time.Hour)
+	messages := b.storage.GetMessagesSince(chatID, since)
+
+	if len(messages) < 5 { // Не генерируем саммари, если сообщений мало
+		log.Printf("Слишком мало сообщений (%d) для саммари в чате %d", len(messages), chatID)
+		// Можно отправить сообщение "Недостаточно сообщений для саммари"
+		return
 	}
+
+	// Преобразуем сообщения в текст для Gemini
+	var contextText strings.Builder
+	for _, msg := range messages {
+		contextText.WriteString(formatMessageForAnalysis(msg)) // Используем ту же функцию форматирования
+		contextText.WriteString("\n")
+	}
+
+	summary, err := b.gemini.GenerateArbitraryResponse(b.config.SummaryPrompt, contextText.String())
+	if err != nil {
+		log.Printf("Ошибка генерации саммари для чата %d: %v", chatID, err)
+		b.sendReply(chatID, "Не удалось сгенерировать саммари. Попробуйте позже.")
+		return
+	}
+
+	b.sendReply(chatID, "📊 Саммари за последние 24 часа 📊\n\n"+summary)
+	log.Printf("Саммари успешно отправлено в чат %d", chatID)
+}
+
+// --- Управление историей ---
+
+// saveAllChatHistories вызывает метод сохранения у текущего storage implementation
+func (b *Bot) saveAllChatHistories() {
+	if err := b.storage.SaveAllChatHistories(); err != nil {
+		log.Printf("Ошибка при сохранении истории всех чатов: %v", err)
+	} else {
+		log.Println("История всех чатов успешно сохранена.")
+	}
+}
+
+// loadChatHistory загружает историю для одного чата (используется при /start или добавлении бота)
+func (b *Bot) loadChatHistory(chatID int64) {
+	log.Printf("Загрузка истории для чата %d...", chatID)
+	_, err := b.storage.LoadChatHistory(chatID) // LoadChatHistory в реализации Local/S3 обновит кеш
+	if err != nil {
+		log.Printf("Ошибка загрузки истории для чата %d: %v", chatID, err)
+	} else {
+		log.Printf("История для чата %d успешно загружена (или не найдена).", chatID)
+	}
+}
+
+// --- Анализ срачей ---
+
+// formatMessageForAnalysis форматирует сообщение для передачи в LLM для анализа
+func formatMessageForAnalysis(msg *tgbotapi.Message) string {
 	userName := "UnknownUser"
 	if msg.From != nil {
 		userName = msg.From.UserName
@@ -1272,221 +874,133 @@ func formatMessageForAnalysis(msg *tgbotapi.Message) string {
 			userName = msg.From.FirstName
 		}
 	}
-	// Добавляем информацию об ответе, если есть
-	replyInfo := ""
-	if msg.ReplyToMessage != nil && msg.ReplyToMessage.From != nil {
-		replyUser := msg.ReplyToMessage.From.UserName
-		if replyUser == "" {
-			replyUser = msg.ReplyToMessage.From.FirstName
+	return fmt.Sprintf("%s (%d): %s", userName, msg.From.ID, msg.Text)
+}
+
+// isPotentialSrachTrigger проверяет, может ли сообщение быть триггером срача
+func (b *Bot) isPotentialSrachTrigger(message *tgbotapi.Message) bool {
+	textLower := strings.ToLower(message.Text)
+
+	// 1. Проверка на ключевые слова
+	for _, keyword := range b.config.SrachKeywords {
+		if strings.Contains(textLower, keyword) {
+			log.Printf("[Srach Detect] Чат %d: Найдено ключевое слово '%s' в сообщении ID %d", message.Chat.ID, keyword, message.MessageID)
+			return true
 		}
-		replyInfo = fmt.Sprintf(" (in reply to %s)", replyUser)
 	}
 
-	return fmt.Sprintf("[%s]%s: %s", userName, replyInfo, msg.Text)
+	// 2. Проверка на ответ (reply)
+	if message.ReplyToMessage != nil {
+		log.Printf("[Srach Detect] Чат %d: Обнаружен ответ (reply) в сообщении ID %d", message.Chat.ID, message.MessageID)
+		return true
+	}
+
+	// 3. Проверка на упоминание (mention) другого пользователя (не бота)
+	if message.Entities != nil {
+		for _, entity := range message.Entities {
+			if entity.Type == "mention" {
+				mention := message.Text[entity.Offset : entity.Offset+entity.Length]
+				if mention != "@"+b.api.Self.UserName { // Игнорируем упоминания самого бота
+					log.Printf("[Srach Detect] Чат %d: Обнаружено упоминание '%s' в сообщении ID %d", message.Chat.ID, mention, message.MessageID)
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
-// sendSrachWarning отправляет сообщение о начале срача
+// sendSrachWarning отправляет предупреждение о начале срача
 func (b *Bot) sendSrachWarning(chatID int64) {
-	prompt := b.config.SRACH_WARNING_PROMPT // Загружаем промпт из конфига
-	if prompt == "" {
-		prompt = "Внимание, зафиксирован срач!"
+	warning, err := b.gemini.GenerateArbitraryResponse(b.config.SRACH_WARNING_PROMPT, "")
+	if err != nil {
+		log.Printf("Ошибка генерации предупреждения о сраче для чата %d: %v", chatID, err)
+		// Отправляем статичное сообщение в случае ошибки
+		b.sendReply(chatID, "🚨 Внимание! Обнаружен потенциальный срач! 🚨")
+		return
 	}
-	// Пока просто отправляем текст из промпта
-	b.sendReply(chatID, prompt)
+	b.sendReply(chatID, warning)
 }
 
-// analyseSrach запускает анализ завершенного срача
+// confirmSrachWithLLM проверяет сообщение через LLM на принадлежность к срачу
+func (b *Bot) confirmSrachWithLLM(chatID int64, messageText string) bool {
+	log.Printf("[DEBUG] Чат %d: Запуск LLM для подтверждения срача. Сообщение: \"%s...\"", chatID, truncateString(messageText, 20))
+	prompt := b.config.SRACH_CONFIRM_PROMPT + " " + messageText // Добавляем само сообщение к промпту
+
+	response, err := b.gemini.GenerateArbitraryResponse(prompt, "") // Используем Arbitrary без доп. контекста
+	if err != nil {
+		log.Printf("[LLM Srach Confirm ERROR] Чат %d: Ошибка генерации ответа LLM: %v", chatID, err)
+		return false // Считаем, что не срач, если ошибка
+	}
+
+	// Очищаем ответ и проверяем на "true"
+	cleanResponse := strings.TrimSpace(strings.ToLower(response))
+	isConfirmed := cleanResponse == "true"
+	log.Printf("[DEBUG] Чат %d: Результат LLM подтверждения срача: %t (ответ LLM: \"%s\")", chatID, isConfirmed, strings.TrimSpace(response))
+	return isConfirmed
+}
+
+// analyseSrach анализирует собранные сообщения срача
 func (b *Bot) analyseSrach(chatID int64) {
 	b.settingsMutex.Lock()
 	settings, exists := b.chatSettings[chatID]
-	if !exists || settings.SrachState != "detected" || len(settings.SrachMessages) == 0 {
+	if !exists || settings.SrachState != "detected" {
+		// Срач уже анализируется или был сброшен
 		b.settingsMutex.Unlock()
-		return // Нечего анализировать
+		return
 	}
-
-	log.Printf("Чат %d: Срач завершен. Начинаю анализ %d сообщений.", chatID, len(settings.SrachMessages))
-	settings.SrachState = "analyzing" // Меняем состояние
-	srachHistory := strings.Join(settings.SrachMessages, "\n")
-	settings.SrachMessages = make([]string, 0)       // Очищаем собранные сообщения
-	analysisPrompt := b.config.SRACH_ANALYSIS_PROMPT // Получаем промпт для анализа
+	// Копируем сообщения и меняем статус перед разблокировкой
+	messagesToAnalyse := make([]string, len(settings.SrachMessages))
+	copy(messagesToAnalyse, settings.SrachMessages)
+	settings.SrachState = "analyzing" // Меняем статус
 	b.settingsMutex.Unlock()
 
-	// --- Вызов LLM для анализа --- (Используем новую функцию)
-	var analysisResult string
-	var err error
-
-	if analysisPrompt == "" {
-		log.Printf("Чат %d: Промпт SRACH_ANALYSIS_PROMPT пуст в конфиге!", chatID)
-		analysisResult = "[Ошибка: Промпт для анализа не задан в конфигурации]"
-		err = fmt.Errorf("SRACH_ANALYSIS_PROMPT is empty")
-	} else {
-		// Вызываем новую функцию Gemini клиента
-		analysisResult, err = b.gemini.GenerateArbitraryResponse(analysisPrompt, srachHistory)
-	}
-	// --------------------------
-
+	// Уведомляем чат о начале анализа
+	analysisNotification, err := b.gemini.GenerateArbitraryResponse(b.config.SRACH_ANALYSIS_PROMPT, "")
 	if err != nil {
-		log.Printf("Чат %d: Ошибка анализа срача: %v", chatID, err)
-		b.sendReply(chatID, "😵‍💫 Не удалось проанализировать срач. Возможно, сервер ИИ перегружен или произошла внутренняя ошибка.")
+		log.Printf("[Srach Analysis Start ERROR] Чат %d: Ошибка генерации уведомления об анализе: %v", chatID, err)
+		b.sendReply(chatID, "🔍 Начинаю анализ прошедшего срача...")
 	} else {
-		b.sendReply(chatID, analysisResult) // Отправляем результат
+		b.sendReply(chatID, analysisNotification)
 	}
 
-	// Сбрасываем состояние после анализа
+	// Готовим контекст для LLM
+	contextText := "История сообщений конфликта:\n" + strings.Join(messagesToAnalyse, "\n")
+
+	// Запускаем LLM для анализа
+	analysisResult, err := b.gemini.GenerateArbitraryResponse(b.config.SRACH_ANALYSIS_PROMPT, contextText)
+	if err != nil {
+		log.Printf("[Srach Analysis ERROR] Чат %d: Ошибка генерации результата анализа: %v", chatID, err)
+		b.sendReply(chatID, "Не удалось проанализировать срач. Слишком сложно.")
+	} else {
+		b.sendReply(chatID, "📜 Результаты анализа срача 📜\n\n"+analysisResult)
+		log.Printf("[Srach Analysis OK] Чат %d: Анализ завершен и отправлен.", chatID)
+	}
+
+	// Сбрасываем состояние срача после анализа
 	b.settingsMutex.Lock()
-	if settings, exists := b.chatSettings[chatID]; exists {
-		// Убедимся, что состояние все еще 'analyzing', прежде чем сбрасывать
-		if settings.SrachState == "analyzing" {
-			settings.SrachState = "none"
-			settings.LastSrachTriggerTime = time.Time{} // Сбрасываем и время триггера
-		}
+	if settings, ok := b.chatSettings[chatID]; ok {
+		settings.SrachState = "none"
+		settings.SrachMessages = nil
+		settings.SrachStartTime = time.Time{}
+		settings.LastSrachTriggerTime = time.Time{}
+		settings.SrachLlmCheckCounter = 0
 	}
 	b.settingsMutex.Unlock()
 }
 
-// Вспомогательная функция для обрезки строки (ИСПРАВЛЕНА)
+// --- Вспомогательные функции ---
+
+// truncateString обрезает строку до указанной длины
 func truncateString(s string, maxLen int) string {
-	runes := []rune(s) // Сразу работаем с рунами
+	if len(s) <= maxLen {
+		return s
+	}
+	// Обрезаем по рунам, чтобы не повредить многобайтовые символы
+	runes := []rune(s)
 	if len(runes) <= maxLen {
-		return s // Если рун меньше или равно maxLen, возвращаем как есть
+		return s
 	}
-	if maxLen < 3 { // Минимальная длина для добавления "..."
-		// Если maxLen слишком мало, просто обрезаем до maxLen рун
-		return string(runes[:maxLen])
-	}
-	// Обрезаем до maxLen-3 рун и добавляем "..."
-	return string(runes[:maxLen-3]) + "..."
-}
-
-// --- Восстановленные функции для сохранения/загрузки истории ---
-
-// loadChatHistory загружает историю сообщений для указанного чата
-func (b *Bot) loadChatHistory(chatID int64) {
-	if b.config.Debug {
-		log.Printf("[DEBUG][Load History] Чат %d: Начинаю загрузку истории.", chatID)
-	}
-
-	b.sendReply(chatID, "⏳ Загружаю историю чата для лучшего понимания контекста...")
-
-	// Загружаем историю из файла
-	history, err := b.storage.LoadChatHistory(chatID)
-	if err != nil {
-		// Логируем ошибку, но не останавливаемся, просто начинаем без истории
-		log.Printf("[ERROR][Load History] Чат %d: Ошибка загрузки истории: %v", chatID, err)
-		b.sendReply(chatID, "⚠️ Не удалось загрузить историю чата. Начинаю работу с чистого листа.")
-		// Убедимся, что старая история в памяти очищена, если была ошибка загрузки
-		b.storage.ClearChatHistory(chatID) // Используем существующий метод
-		return
-	}
-
-	if history == nil { // LoadChatHistory теперь возвращает nil, nil если файла нет
-		if b.config.Debug {
-			log.Printf("[DEBUG][Load History] Чат %d: История не найдена или файл не существует.", chatID)
-		}
-		b.sendReply(chatID, "✅ История чата не найдена. Начинаю работу с чистого листа!")
-		return
-	}
-
-	if len(history) == 0 {
-		if b.config.Debug {
-			log.Printf("[DEBUG][Load History] Чат %d: Загружена пустая история (файл был пуст или содержал []).", chatID)
-		}
-		b.sendReply(chatID, "✅ История чата пуста. Начинаю работу с чистого листа!")
-		return
-	}
-
-	// Определяем, сколько сообщений загружать (берем последние N)
-	loadCount := len(history)
-	if loadCount > b.config.ContextWindow {
-		log.Printf("[DEBUG][Load History] Чат %d: История (%d) длиннее окна (%d), обрезаю.", chatID, loadCount, b.config.ContextWindow)
-		history = history[loadCount-b.config.ContextWindow:]
-		loadCount = len(history) // Обновляем количество после обрезки
-	}
-
-	// Добавляем сообщения в хранилище (в память)
-	log.Printf("[DEBUG][Load History] Чат %d: Добавляю %d загруженных сообщений в контекст.", chatID, loadCount)
-	b.storage.AddMessagesToContext(chatID, history) // Этот метод не должен вызывать автосохранение
-
-	if b.config.Debug {
-		log.Printf("[DEBUG][Load History] Чат %d: Загружено и добавлено в контекст %d сообщений.", chatID, loadCount)
-	}
-
-	b.sendReply(chatID, fmt.Sprintf("✅ Контекст загружен: %d сообщений. Я готов к работе!", loadCount))
-}
-
-// scheduleHistorySaving запускает периодическое сохранение истории
-func (b *Bot) scheduleHistorySaving() {
-	if b.config.HistorySaveInterval <= 0 {
-		log.Println("[HistorySave Scheduler] Интервал сохранения истории не задан или <= 0. Периодическое сохранение отключено.")
-		return
-	}
-
-	log.Printf("[HistorySave Scheduler] Запуск планировщика сохранения истории с интервалом: %v", b.config.HistorySaveInterval)
-	ticker := time.NewTicker(b.config.HistorySaveInterval)
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				log.Printf("[HistorySave Scheduler] Тикер сработал. Вызов saveAllChatHistories...")
-				b.saveAllChatHistories()
-			case <-b.stop:
-				ticker.Stop()
-				log.Println("[HistorySave Scheduler] Планировщик сохранения истории остановлен.")
-				return
-			}
-		}
-	}()
-}
-
-// saveAllChatHistories сохраняет историю всех чатов
-func (b *Bot) saveAllChatHistories() {
-	log.Println("[Bot SaveAll] Начало сохранения всех историй чатов...")
-	if err := b.storage.SaveAllChatHistories(); err != nil {
-		log.Printf("[Bot SaveAll ERROR] Ошибка при сохранении всех историй: %v", err)
-	} else {
-		log.Println("[Bot SaveAll] Сохранение всех историй чатов завершено успешно.")
-	}
-}
-
-// --- Конец восстановленных функций ---
-
-// confirmSrachWithLLM проверяет конфликтность сообщения с помощью LLM
-func (b *Bot) confirmSrachWithLLM(chatID int64, messageText string) bool {
-	prompt := b.config.SRACH_CONFIRM_PROMPT
-	if prompt == "" {
-		log.Printf("[WARN] Чат %d: Промпт SRACH_CONFIRM_PROMPT пуст, LLM проверка отключена.", chatID)
-		return false // Не можем проверить без промпта
-	}
-
-	fullPrompt := prompt + "\n" + messageText // Добавляем текст сообщения к промпту
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Чат %d: Запуск LLM для подтверждения срача. Сообщение: \"%s...\"", chatID, truncateString(messageText, 50))
-	}
-
-	// Используем GenerateArbitraryResponse без истории, только промпт + текст сообщения
-	response, err := b.gemini.GenerateArbitraryResponse(fullPrompt, "") // Передаем пустой контекст, т.к. он уже в промпте
-	if err != nil {
-		log.Printf("[ERROR] Чат %d: Ошибка LLM при подтверждении срача: %v", chatID, err)
-		return false // В случае ошибки считаем, что не срач
-	}
-
-	// Парсим ответ (ожидаем "true" или "false")
-	responseLower := strings.ToLower(strings.TrimSpace(response))
-	isSrach := responseLower == "true"
-
-	if b.config.Debug {
-		log.Printf("[DEBUG] Чат %d: Результат LLM подтверждения срача: %s (ответ LLM: \"%s\")", chatID, strconv.FormatBool(isSrach), response)
-	}
-
-	return isSrach
-}
-
-// Вспомогательная функция для max
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	return string(runes[:maxLen])
 }
