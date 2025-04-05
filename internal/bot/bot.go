@@ -1454,19 +1454,35 @@ func (b *Bot) sendReplyWithKeyboard(chatID int64, text string, keyboard tgbotapi
 func (b *Bot) importOldData(dataDir string) {
 	log.Printf("[Import] Начало сканирования директории '%s' для импорта старых данных...", dataDir)
 
+	// Проверяем наличие директории
+	_, err := os.Stat(dataDir)
+	if os.IsNotExist(err) {
+		log.Printf("[Import ERROR] Директория '%s' не существует", dataDir)
+		return
+	} else if err != nil {
+		log.Printf("[Import ERROR] Ошибка при проверке директории '%s': %v", dataDir, err)
+		return
+	}
+
+	// Проверяем доступность директории
 	files, err := ioutil.ReadDir(dataDir)
 	if err != nil {
 		log.Printf("[Import ERROR] Не удалось прочитать директорию '%s': %v", dataDir, err)
 		return
 	}
 
+	log.Printf("[Import] Успешно прочитана директория '%s', найдено %d файлов/папок", dataDir, len(files))
+
 	var wg sync.WaitGroup
 	importedFiles := 0
+	jsonFiles := 0
 
 	for _, file := range files {
 		if !file.IsDir() && filepath.Ext(file.Name()) == ".json" {
+			jsonFiles++
 			fileName := file.Name()
 			filePath := filepath.Join(dataDir, fileName)
+			fileSize := file.Size() / (1024 * 1024) // размер в МБ
 
 			// Извлекаем chatID из имени файла
 			baseName := strings.TrimSuffix(fileName, ".json")
@@ -1476,27 +1492,44 @@ func (b *Bot) importOldData(dataDir string) {
 				continue
 			}
 
-			log.Printf("[Import] Найден файл '%s' для импорта в чат %d", filePath, chatID)
+			log.Printf("[Import] Найден JSON файл '%s' (размер: %d МБ) для импорта в чат %d", fileName, fileSize, chatID)
 			importedFiles++
 			wg.Add(1)
 
+			// Проверяем, какой тип хранилища используется
+			qdrantStorage, isQdrant := b.storage.(*storage.QdrantStorage)
+			if !isQdrant {
+				log.Printf("[Import ERROR] Импорт возможен только при использовании QdrantStorage. Текущее хранилище: %T", b.storage)
+				wg.Done()
+				continue
+			}
+
 			// Запускаем импорт для каждого файла в отдельной горутине, чтобы не блокировать друг друга
-			go func(fp string, cid int64) {
+			go func(fp string, cid int64, fName string, fSize int64) {
 				defer wg.Done()
-				imported, skipped, importErr := b.storage.ImportMessagesFromJSONFile(cid, fp) // <--- Исправляем порядок аргументов
+				log.Printf("[Import] Начало импорта файла '%s' (размер: %d МБ) для чата %d...", fName, fSize, cid)
+
+				startTime := time.Now()
+				imported, skipped, importErr := qdrantStorage.ImportMessagesFromJSONFile(cid, fp)
+				duration := time.Since(startTime)
+
 				if importErr != nil {
-					log.Printf("[Import ERROR] Ошибка импорта файла %s для чата %d: %v", fp, cid, importErr)
+					log.Printf("[Import ERROR] Ошибка импорта файла %s для чата %d: %v. Затрачено времени: %v", fName, cid, importErr, duration)
 				} else {
-					log.Printf("[Import OK] Файл '%s' для чата %d: импортировано %d, пропущено %d сообщений.", fp, cid, imported, skipped)
+					log.Printf("[Import OK] Файл '%s' для чата %d: импортировано %d, пропущено %d сообщений. Затрачено времени: %v",
+						fName, cid, imported, skipped, duration)
 				}
-			}(filePath, chatID)
+			}(filePath, chatID, fileName, fileSize)
 		}
 	}
 
-	if importedFiles == 0 {
+	if jsonFiles == 0 {
 		log.Printf("[Import] В директории '%s' не найдено файлов .json для импорта.", dataDir)
+	} else {
+		log.Printf("[Import] Всего найдено %d JSON файлов, запущена обработка %d файлов.", jsonFiles, importedFiles)
 	}
 
+	log.Printf("[Import] Ожидание завершения всех задач импорта...")
 	wg.Wait() // Ждем завершения всех горутин импорта
 	log.Printf("[Import] Завершено сканирование и попытки импорта из директории '%s'. Обработано файлов: %d.", dataDir, importedFiles)
 }

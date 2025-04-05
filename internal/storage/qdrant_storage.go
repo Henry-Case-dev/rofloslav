@@ -224,126 +224,93 @@ func NewQdrantStorage(cfg *config.Config, geminiClient *gemini.Client) (*QdrantS
 
 // --- Реализация интерфейса HistoryStorage (частичная/адаптированная) ---
 
-// AddMessage получает эмбеддинг сообщения и добавляет/обновляет его в Qdrant.
-// Использует уникальный ID (chat_id + message_id) для идемпотентности.
+// AddMessage добавляет одно сообщение в хранилище Qdrant.
 func (qs *QdrantStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
-	if message == nil || (message.Text == "" && message.Caption == "") {
-		return // Не сохраняем пустые сообщения или сообщения без текста/подписи
-	}
+	log.Printf("[Qdrant DEBUG] Попытка добавить сообщение ID %d в чат %d", message.MessageID, chatID)
 
-	// Используем текст или подпись
-	text := message.Text
-	if text == "" {
-		text = message.Caption
-	}
-
-	// Определяем роль
-	role := "user"
-	if message.From != nil && message.From.IsBot {
-		// TODO: Проверить ID бота, если это важно
-		// Пока считаем всех остальных ботов как "user"
-	}
-
-	// Генерируем уникальный строковый идентификатор для генерации UUID
-	uniqueIDStr := fmt.Sprintf("%d_%d", chatID, message.MessageID)
-	// Генерируем UUID v5 (детерминированный на основе строки)
-	// Используем предопределенный Namespace UUID (например, DNS namespace)
-	// или можно создать свой собственный.
-	pointUUID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(uniqueIDStr))
-	pointIDStrForUUID := pointUUID.String() // Строковое представление UUID
-
-	// Создаем MessagePayload напрямую из tgbotapi.Message
-	msgPayload := &MessagePayload{
-		ChatID:       chatID,
-		MessageID:    message.MessageID,
-		Text:         text,
-		Date:         message.Date,
-		ImportSource: "live",
-		UniqueID:     pointIDStrForUUID, // Сохраняем настоящий UUID в payload
-		Role:         role,
-	}
-
-	if message.From != nil {
-		msgPayload.UserID = message.From.ID
-		msgPayload.UserName = message.From.UserName
-		msgPayload.FirstName = message.From.FirstName
-		msgPayload.IsBot = message.From.IsBot
-	}
-	if message.ReplyToMessage != nil {
-		msgPayload.ReplyToMsgID = message.ReplyToMessage.MessageID
-	}
-
-	// Конвертируем и сериализуем Entities
-	if len(message.Entities) > 0 {
-		typeEntities := convertTgEntitiesToTypesEntities(message.Entities)
-		entitiesBytes, err := json.Marshal(typeEntities)
-		if err == nil {
-			msgPayload.Entities = entitiesBytes
-		} else {
-			log.Printf("[QdrantStorage AddMsg Chat %d Msg %d] Ошибка сериализации Entities: %v", chatID, message.MessageID, err)
-		}
-	}
-	// Также обрабатываем CaptionEntities
-	if len(message.CaptionEntities) > 0 {
-		typeCaptionEntities := convertTgEntitiesToTypesEntities(message.CaptionEntities)
-		// Если Entities уже были, добавляем к ним, иначе создаем
-		var existingEntities []types.MessageEntity
-		if len(msgPayload.Entities) > 0 {
-			_ = json.Unmarshal(msgPayload.Entities, &existingEntities) // Игнорируем ошибку, если она есть
-		}
-		allEntities := append(existingEntities, typeCaptionEntities...)
-		entitiesBytes, err := json.Marshal(allEntities)
-		if err == nil {
-			msgPayload.Entities = entitiesBytes
-		} else {
-			log.Printf("[QdrantStorage AddMsg Chat %d Msg %d] Ошибка сериализации CaptionEntities: %v", chatID, message.MessageID, err)
-		}
-	}
-
-	// 1. Получаем эмбеддинг
-	embedding, err := qs.geminiClient.GetEmbedding(text) // Используем извлеченный текст
-	if err != nil {
-		log.Printf("[QdrantStorage ERROR AddMsg Chat %d Msg %d] Ошибка получения эмбеддинга: %v", chatID, msgPayload.MessageID, err)
+	// Игнорируем сообщения без текста
+	if message.Text == "" && message.Caption == "" {
+		log.Printf("[Qdrant DEBUG] Сообщение ID %d в чате %d не содержит текста, пропускаем", message.MessageID, chatID)
 		return
+	}
+
+	// Получаем текст сообщения (текст или подпись, если текст пуст)
+	messageText := message.Text
+	if messageText == "" {
+		messageText = message.Caption
+		log.Printf("[Qdrant DEBUG] Используем Caption вместо Text для сообщения ID %d", message.MessageID)
+	}
+
+	// 1. Получаем эмбеддинг текста
+	log.Printf("[Qdrant DEBUG] Запрос эмбеддинга для сообщения ID %d, текст: %s...", message.MessageID, truncateString(messageText, 20))
+	embedding, err := qs.geminiClient.GetEmbedding(messageText)
+	if err != nil {
+		log.Printf("[Qdrant ERROR] Ошибка получения эмбеддинга для сообщения ID %d: %v", message.MessageID, err)
+		return // Прерываем, если не удалось получить эмбеддинг
 	}
 	if len(embedding) == 0 {
-		log.Printf("[QdrantStorage WARN AddMsg Chat %d Msg %d] Получен пустой эмбеддинг для текста: %s", chatID, msgPayload.MessageID, truncateString(text, 50))
+		log.Printf("[Qdrant ERROR] Получен пустой эмбеддинг для сообщения ID %d", message.MessageID)
 		return
 	}
+	log.Printf("[Qdrant DEBUG] Получен эмбеддинг размером %d для сообщения ID %d", len(embedding), message.MessageID)
 
-	// 2. Конвертируем MessagePayload в Qdrant Map
-	payloadMap := qs.messagePayloadToQdrantMap(msgPayload)
-	// uniqueID := msgPayload.UniqueID // Уже есть в msgPayload - И больше не нужен здесь
+	// 2. Создаем payload и ID для сообщения
+	payloadMap, pointIDStr := qs.createPayload(chatID, message, "live")
+	if payloadMap == nil {
+		log.Printf("[Qdrant ERROR] Не удалось создать payload для сообщения ID %d", message.MessageID)
+		return
+	}
+	log.Printf("[Qdrant DEBUG] Создан payload и ID (%s) для сообщения ID %d", pointIDStr, message.MessageID)
 
-	// 3. Создаем Qdrant Point, используя сгенерированный UUID
+	// 3. Создаем точку Qdrant
+	pointID := &qdrant.PointId{
+		PointIdOptions: &qdrant.PointId_Uuid{
+			Uuid: pointIDStr,
+		},
+	}
+
 	point := &qdrant.PointStruct{
-		Id:      &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: pointIDStrForUUID}}, // Используем настоящий UUID
-		Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: embedding}}},
+		Id: pointID,
+		Vectors: &qdrant.Vectors{
+			VectorsOptions: &qdrant.Vectors_Vector{
+				Vector: &qdrant.Vector{
+					Data: embedding,
+				},
+			},
+		},
 		Payload: payloadMap,
 	}
 
-	// 4. Добавляем/Обновляем точку (Upsert)
+	// 4. Добавляем точку в Qdrant
 	ctx, cancel := context.WithTimeout(context.Background(), qs.timeout)
 	defer cancel()
-	upsertCtx := ctx // Контекст для запроса Upsert
+
+	upsertCtx := ctx
 	if apiKey := qs.getApiKeyFromConfig(); apiKey != "" {
 		md := metadata.New(map[string]string{"api-key": apiKey})
 		upsertCtx = metadata.NewOutgoingContext(ctx, md)
+		log.Printf("[Qdrant DEBUG] Используем API ключ для аутентификации запроса")
 	}
 
-	waitUpsert := true
-	_, err = qs.client.Upsert(upsertCtx, &qdrant.UpsertPoints{ // Используем upsertCtx
+	log.Printf("[Qdrant DEBUG] Отправка запроса Upsert для сообщения ID %d", message.MessageID)
+	waitUpsert := true // Синхронный Upsert для индивидуальных сообщений
+	resp, err := qs.client.Upsert(upsertCtx, &qdrant.UpsertPoints{
 		CollectionName: qs.collectionName,
 		Points:         []*qdrant.PointStruct{point},
 		Wait:           &waitUpsert,
 	})
 
 	if err != nil {
-		// Ошибка теперь не должна быть InvalidArgument из-за UUID
-		log.Printf("[QdrantStorage ERROR AddMsg Chat %d Msg %d PointID %s] Ошибка Upsert точки: %v", chatID, msgPayload.MessageID, pointIDStrForUUID, err)
-	} else if qs.debug {
-		log.Printf("[QdrantStorage DEBUG AddMsg Chat %d Msg %d PointID %s] Точка успешно добавлена/обновлена.", chatID, msgPayload.MessageID, pointIDStrForUUID)
+		log.Printf("[Qdrant ERROR] Ошибка при Upsert сообщения ID %d: %v", message.MessageID, err)
+		return
 	}
+
+	if resp == nil {
+		log.Printf("[Qdrant ERROR] Странный ответ: resp == nil без ошибки для сообщения ID %d", message.MessageID)
+		return
+	}
+
+	log.Printf("[Qdrant OK] Сообщение ID %d успешно добавлено в коллекцию %s", message.MessageID, qs.collectionName)
 }
 
 // createPayload конвертирует сообщение и метаданные в map[string]*qdrant.Value для Qdrant.
@@ -1084,8 +1051,6 @@ func convertTgUserToTypesUser(tgUser *tgbotapi.User) *types.User {
 // --- Конец добавленных функций ---
 
 // --- Функции заглушки для методов, не используемых Qdrant ---
-
-// AddMessage - Сохраняет сообщение в Qdrant (адаптировано)
 
 // getApiKeyFromConfig пытается получить API ключ из конфигурации Gemini клиента.
 // Это временное решение, в идеале API ключ Qdrant должен храниться отдельно.
