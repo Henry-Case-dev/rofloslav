@@ -1084,40 +1084,55 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 
 // scheduleDailyTake запускает ежедневную отправку "темы дня"
 func (b *Bot) scheduleDailyTake(hour int, timeZone string) {
-	loc, err := time.LoadLocation(timeZone)
-	if err != nil {
-		log.Printf("Ошибка загрузки временной зоны '%s': %v, использую UTC", timeZone, err)
-		loc = time.UTC
-	}
-
-	now := time.Now().In(loc)
-	nextTake := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, loc)
-	if now.After(nextTake) {
-		nextTake = nextTake.Add(24 * time.Hour) // Если время уже прошло, планируем на завтра
-	}
-
-	duration := nextTake.Sub(now)
-	log.Printf("Запланирован тейк через %v (в %d:00 по %s)", duration, hour, loc.String())
-
-	timer := time.NewTimer(duration)
-
-	for {
-		select {
-		case <-timer.C:
-			log.Println("Время ежедневного тейка!")
-			b.sendDailyTakeToAllActiveChats()
-			// Перепланируем на следующий день
-			now = time.Now().In(loc)
-			nextTake = time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, loc).Add(24 * time.Hour)
-			duration = nextTake.Sub(now)
-			timer.Reset(duration)
-			log.Printf("Следующий тейк запланирован через %v", duration)
-		case <-b.stop:
-			log.Println("Остановка планировщика тейков.")
-			timer.Stop()
-			return
+	// Запускаем в горутине, чтобы не блокировать основной поток
+	go func() {
+		log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: Запуск для %d:00 TZ: %s", hour, timeZone)
+		loc, err := time.LoadLocation(timeZone)
+		if err != nil {
+			log.Printf("Ошибка загрузки таймзоны '%s': %v. Используется UTC.", timeZone, err)
+			loc = time.UTC
 		}
-	}
+
+		now := time.Now().In(loc)
+		// Рассчитываем время следующего запуска
+		log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: Now in %s: %s", loc.String(), now.Format(time.RFC3339)) // Доп. лог 2
+		nextTakeTime := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, loc)
+		if now.After(nextTakeTime) {
+			log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: %d:00 сегодня уже прошло, планируем на завтра.", hour) // Доп. лог 3
+			nextTakeTime = nextTakeTime.AddDate(0, 0, 1)                                                           // Если время сегодня уже прошло, планируем на завтра
+		}
+		log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: Next take time: %s", nextTakeTime.Format(time.RFC3339)) // Доп. лог 4
+
+		durationUntilFirstRun := time.Until(nextTakeTime)
+
+		log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: Рассчитанная длительность: %v", durationUntilFirstRun) // Доп. лог 5
+		log.Printf("Запланирован тейк через %v (в %d:00 по %s)", durationUntilFirstRun, hour, loc.String())
+
+		// Запускаем таймер для первого запуска
+		log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: Запуск time.NewTimer(%v)...", durationUntilFirstRun) // Доп. лог 6
+		timer := time.NewTimer(durationUntilFirstRun)
+		log.Printf("[ [34mDEBUG [0m] scheduleDailyTake: time.NewTimer запущен. Запуск горутины таймера...") // Доп. лог 7
+
+		for {
+			select {
+			case <-timer.C:
+				b.sendDailyTakeToAllActiveChats()
+
+				// Перепланируем на следующий день
+				now = time.Now().In(loc)
+				nextTakeTime = time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, loc).Add(24 * time.Hour)
+				durationUntilFirstRun = nextTakeTime.Sub(now)
+				timer.Reset(durationUntilFirstRun)
+				log.Printf("Следующий тейк запланирован через %v", durationUntilFirstRun)
+			case <-b.stop:
+				log.Println("Остановка планировщика тейков.")
+				timer.Stop()
+				return
+			}
+		}
+	}()
+
+	log.Println("[ [34mDEBUG [0m] scheduleDailyTake: Горутина планировщика запущена.")
 }
 
 // sendDailyTakeToAllActiveChats отправляет "тему дня" во все активные чаты
@@ -1155,22 +1170,27 @@ func (b *Bot) sendDailyTakeToAllActiveChats() {
 
 // schedulePeriodicSummary запускает периодическую генерацию саммари
 func (b *Bot) schedulePeriodicSummary() {
-	// Используем общий ticker, проверяем интервал для каждого чата индивидуально
-	// Частота тикера может быть, например, раз в час или чаще
-	tickerInterval := 1 * time.Hour // Проверяем каждый час
-	log.Printf("Запуск планировщика автоматического саммари с интервалом проверки %v...", tickerInterval)
-	ticker := time.NewTicker(tickerInterval)
-	defer ticker.Stop()
+	// Запускаем в горутине, чтобы не блокировать основной поток
+	go func() {
+		// Используем общий ticker, проверяем интервал для каждого чата индивидуально
+		// Частота тикера может быть, например, раз в час или чаще
+		tickerInterval := 1 * time.Hour // Проверяем каждый час
+		log.Printf("Запуск планировщика автоматического саммари с интервалом проверки %v...", tickerInterval)
+		ticker := time.NewTicker(tickerInterval)
+		defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			b.checkAndSendAutoSummaries()
-		case <-b.stop:
-			log.Println("Остановка планировщика авто-саммари.")
-			return
+		for {
+			select {
+			case <-ticker.C:
+				b.checkAndSendAutoSummaries()
+			case <-b.stop:
+				log.Println("Остановка планировщика авто-саммари.")
+				return
+			}
 		}
-	}
+	}()
+
+	log.Println("[ [34mDEBUG [0m] schedulePeriodicSummary: Горутина планировщика запущена.")
 }
 
 // checkAndSendAutoSummaries проверяет и отправляет авто-саммари для чатов
