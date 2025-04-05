@@ -143,13 +143,18 @@ func (b *Bot) Start() error {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
+	log.Println("[[34mDEBUG[0m] bot.Start: Вызов GetUpdatesChan...") // Лог 1
 	updates := b.api.GetUpdatesChan(u)
+	log.Println("[[34mDEBUG[0m] bot.Start: GetUpdatesChan вернул канал. Вход в цикл обработки...") // Лог 2
 
 	for {
+		log.Println("[[34mDEBUG[0m] bot.Start: Ожидание в select{}...") // Лог 3
 		select {
 		case update := <-updates:
+			log.Printf("[[34mDEBUG[0m] bot.Start: Получено обновление UpdateID: %d", update.UpdateID) // Лог 4
 			b.handleUpdate(update)
 		case <-b.stop:
+			log.Println("[[34mDEBUG[0m] bot.Start: Получен сигнал остановки.")
 			return nil
 		}
 	}
