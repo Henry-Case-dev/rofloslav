@@ -65,15 +65,26 @@ type Config struct {
 	QdrantEndpoint   string `env:"QDRANT_ENDPOINT"`
 	QdrantAPIKey     string `env:"QDRANT_API_KEY"` // Опционально, если используется
 	QdrantCollection string `env:"QDRANT_COLLECTION"`
-	QdrantTimeoutSec int    `env:"QDRANT_TIMEOUT_SEC"` // Таймаут для операций Qdrant
+	QdrantTimeoutSec int    `env:"QDRANT_TIMEOUT_SEC" envDefault:"30"` // Таймаут для операций Qdrant
+	// --- НОВЫЕ Параметры оптимизации Qdrant ---
+	QdrantOnDisk          bool `env:"QDRANT_ON_DISK" envDefault:"false"`          // Хранить ли основные векторы на диске
+	QdrantQuantizationOn  bool `env:"QDRANT_QUANTIZATION_ON" envDefault:"false"`  // Включить ли скалярное квантование int8
+	QdrantQuantizationRam bool `env:"QDRANT_QUANTIZATION_RAM" envDefault:"false"` // Держать ли квантованные векторы в RAM
 
 	// --- Настройки импорта старых данных ---
 	OldDataDir           string `env:"OLD_DATA_DIR" envDefault:"data/old"`          // Директория со старыми JSON-логами для импорта
 	ImportOldDataOnStart bool   `env:"IMPORT_OLD_DATA_ON_START" envDefault:"false"` // Импортировать ли старые данные при старте
+	ImportChunkSize      int    `env:"IMPORT_CHUNK_SIZE" envDefault:"256"`          // Размер чанка для обработки при импорте
 
 	// --- Хранилище --- // NEW:
 	StorageType string `env:"STORAGE_TYPE" envDefault:"qdrant"` // Тип хранилища: "qdrant" или "local"
 	// ContextWindow        int    `env:"CONTEXT_WINDOW" envDefault:"500"`       // Максимальное количество сообщений в истории для LocalStorage - УДАЛЕНО ДУБЛИРОВАНИЕ
+
+	// НОВОЕ ПОЛЕ: Директория для данных
+	DataDir string `env:"DATA_DIR" envDefault:"data"`
+
+	// --- Настройки Gemini API ---
+	// GeminiAPIKey string `env:"GEMINI_API_KEY,required"` // <-- УДАЛЯЕМ ДУБЛИКАТ
 }
 
 // Load загружает конфигурацию из .env файла
@@ -139,14 +150,25 @@ func Load() (*Config, error) {
 		QdrantAPIKey:     "",                      // API ключ не используется по умолчанию
 		QdrantCollection: "chat_history",          // Имя коллекции по умолчанию
 		QdrantTimeoutSec: 15,                      // Таймаут по умолчанию
+		// --- НОВЫЕ Настройки оптимизации Qdrant по умолчанию ---
+		QdrantOnDisk:          false, // По умолчанию векторы в RAM
+		QdrantQuantizationOn:  false, // Квантование выключено по умолчанию
+		QdrantQuantizationRam: true,  // Если квантование включено, держать в RAM
 
 		// Настройки импорта по умолчанию
 		ImportOldDataOnStart: false,       // Импорт выключен по умолчанию
 		OldDataDir:           "/data/old", // Папка для старых данных по умолчанию
+		ImportChunkSize:      256,         // Размер чанка для импорта
 
 		// --- Хранилище --- // NEW:
 		StorageType: "qdrant", // Тип хранилища: "qdrant" или "local"
 		// ContextWindow: 500,      // Максимальное количество сообщений в истории для LocalStorage - УДАЛЕНО ДУБЛИРОВАНИЕ
+
+		// НОВОЕ ПОЛЕ: Директория для данных
+		DataDir: "data",
+
+		// --- Настройки Gemini API ---
+		// GeminiAPIKey: "", // <-- УДАЛЯЕМ ДУБЛИКАТ
 	}
 
 	// Загрузка строковых значений
@@ -287,9 +309,25 @@ func Load() (*Config, error) {
 			cfg.QdrantTimeoutSec = val
 		}
 	}
-	// --- НОВЫЕ --- Загрузка флага импорта
+	// --- НОВЫЕ --- Загрузка флагов оптимизации Qdrant
+	if onDiskStr := os.Getenv("QDRANT_ON_DISK"); onDiskStr != "" {
+		cfg.QdrantOnDisk, _ = strconv.ParseBool(onDiskStr)
+	}
+	if quantOnStr := os.Getenv("QDRANT_QUANTIZATION_ON"); quantOnStr != "" {
+		cfg.QdrantQuantizationOn, _ = strconv.ParseBool(quantOnStr)
+	}
+	if quantRamStr := os.Getenv("QDRANT_QUANTIZATION_RAM"); quantRamStr != "" {
+		cfg.QdrantQuantizationRam, _ = strconv.ParseBool(quantRamStr)
+	}
+
+	// --- НОВЫЕ --- Загрузка флага импорта и размера чанка
 	if importOldStr := os.Getenv("IMPORT_OLD_DATA_ON_START"); importOldStr != "" {
 		cfg.ImportOldDataOnStart, _ = strconv.ParseBool(importOldStr)
+	}
+	if importChunkSizeStr := os.Getenv("IMPORT_CHUNK_SIZE"); importChunkSizeStr != "" {
+		if val, err := strconv.Atoi(importChunkSizeStr); err == nil && val > 0 {
+			cfg.ImportChunkSize = val
+		}
 	}
 
 	// Проверка обязательных полей

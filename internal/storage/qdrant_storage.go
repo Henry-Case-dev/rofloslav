@@ -31,6 +31,8 @@ type QdrantStorage struct {
 	timeout        time.Duration
 	geminiClient   *gemini.Client // Клиент Gemini для получения эмбеддингов
 	debug          bool
+	// НОВЫЙ ПОЛЕ: Размер чанка для импорта
+	importChunkSize int
 	// Мьютекс не нужен для операций с Qdrant, но может понадобиться для внутренних кешей, если они будут
 	// mutex          sync.RWMutex
 }
@@ -157,6 +159,33 @@ func NewQdrantStorage(cfg *config.Config, geminiClient *gemini.Client) (*QdrantS
 		vectorSize := uint64(len(testEmbedding))
 		log.Printf("[QdrantStorage] Определена размерность векторов: %d", vectorSize)
 
+		// --- НОВЫЙ КОД: Добавляем параметры оптимизации из конфига ---
+		vectorsConfig := &qdrant.VectorsConfig{
+			Config: &qdrant.VectorsConfig_Params{
+				Params: &qdrant.VectorParams{
+					Size:     vectorSize,
+					Distance: qdrant.Distance_Cosine,
+					OnDisk:   &cfg.QdrantOnDisk, // Используем флаг из конфига
+				},
+			},
+		}
+
+		var quantizationConfig *qdrant.QuantizationConfig
+		if cfg.QdrantQuantizationOn {
+			log.Printf("[QdrantStorage] Включаем скалярное квантование (int8). Quantized vectors in RAM: %t", cfg.QdrantQuantizationRam)
+			quantizationConfig = &qdrant.QuantizationConfig{
+				Quantization: &qdrant.QuantizationConfig_Scalar{
+					Scalar: &qdrant.ScalarQuantization{
+						Type:     qdrant.QuantizationType_Int8,
+						Quantile: nil, // Используем nil для автоматического определения (0.99 по умолчанию в Qdrant)
+						// Quantile: &defaultQuantile, // Можно задать, если нужно (например, 0.99)
+						AlwaysRam: &cfg.QdrantQuantizationRam, // Используем флаг из конфига
+					},
+				},
+			}
+		}
+		// --- КОНЕЦ НОВОГО КОДА ---
+
 		// Добавляем API ключ в контекст для запроса Create, если он используется
 		createCtx, createCancel := context.WithTimeout(context.Background(), timeout)
 		defer createCancel()
@@ -168,15 +197,10 @@ func NewQdrantStorage(cfg *config.Config, geminiClient *gemini.Client) (*QdrantS
 
 		_, err = collectionsClient.Create(createReqCtx, &qdrant.CreateCollection{ // Используем createReqCtx
 			CollectionName: cfg.QdrantCollection,
-			VectorsConfig: &qdrant.VectorsConfig{
-				Config: &qdrant.VectorsConfig_Params{
-					Params: &qdrant.VectorParams{
-						Size:     vectorSize,
-						Distance: qdrant.Distance_Cosine, // Косинусное расстояние обычно хорошо подходит для текстовых эмбеддингов
-					},
-				},
-			},
-			// Можно добавить другие параметры: hnsw_config, optimizers_config и т.д.
+			VectorsConfig:  vectorsConfig, // Используем созданный vectorsConfig
+			// HnswConfig:       nil, // Можно настроить HNSW отдельно
+			// OptimizersConfig: nil, // Можно настроить оптимизаторы
+			QuantizationConfig: quantizationConfig, // Используем созданный quantizationConfig
 		})
 		if err != nil {
 			log.Printf("[QdrantStorage ERROR] Не удалось создать коллекцию '%s': %v", cfg.QdrantCollection, err)
@@ -193,6 +217,8 @@ func NewQdrantStorage(cfg *config.Config, geminiClient *gemini.Client) (*QdrantS
 		timeout:        timeout,
 		geminiClient:   geminiClient,
 		debug:          cfg.Debug,
+		// НОВОЕ ПОЛЕ:
+		importChunkSize: cfg.ImportChunkSize, // Сохраняем размер чанка
 	}, nil
 }
 
@@ -637,203 +663,261 @@ func pointIDToString(id *qdrant.PointId) string {
 func (qs *QdrantStorage) ImportMessagesFromJSONFile(chatID int64, filePath string) (importedCount int, skippedCount int, err error) {
 	log.Printf("[Qdrant Import] Начинаю импорт из файла: %s для чата %d", filePath, chatID)
 
-	// 1. Читаем файл
-	data, err := os.ReadFile(filePath)
+	// 1. Открываем файл для потокового чтения
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Printf("[Qdrant Import ERROR] Чат %d: Ошибка чтения файла %s: %v", chatID, filePath, err)
-		return 0, 0, fmt.Errorf("ошибка чтения файла импорта '%s': %w", filePath, err)
+		log.Printf("[Qdrant Import ERROR] Чат %d: Ошибка открытия файла %s: %v", chatID, filePath, err)
+		return 0, 0, fmt.Errorf("ошибка открытия файла импорта '%s': %w", filePath, err)
+	}
+	defer file.Close()
+
+	// 2. Создаем json.Decoder для потокового чтения
+	decoder := json.NewDecoder(file)
+
+	// Ожидаем массив JSON объектов '['
+	t, err := decoder.Token()
+	if err != nil || t != json.Delim('[') {
+		log.Printf("[Qdrant Import ERROR] Чат %d: Ошибка чтения начала JSON массива в %s: %v (токен: %v)", chatID, filePath, err, t)
+		return 0, 0, fmt.Errorf("ожидался JSON массив в файле '%s'", filePath)
 	}
 
-	if len(data) == 0 {
-		log.Printf("[Qdrant Import WARN] Чат %d: Файл %s пуст.", chatID, filePath)
-		return 0, 0, nil
+	// 3. Обрабатываем и добавляем сообщения чанками
+	chunkSize := qs.importChunkSize // Используем размер чанка из QdrantStorage
+	if chunkSize <= 0 {
+		chunkSize = 256 // Устанавливаем значение по умолчанию, если не задано или некорректно
+		log.Printf("[Qdrant Import WARN] Чат %d: Некорректный importChunkSize, использую %d", chatID, chunkSize)
 	}
-
-	// 2. Десериализуем JSON в []types.Message
-	var messages []types.Message
-	if err := json.Unmarshal(data, &messages); err != nil {
-		log.Printf("[Qdrant Import ERROR] Чат %d: Ошибка десериализации JSON из файла %s: %v", chatID, filePath, err)
-		// Попытаемся переименовать поврежденный файл
-		backupPath := filePath + ".corrupted_import." + time.Now().Format("20060102150405")
-		if renameErr := os.Rename(filePath, backupPath); renameErr == nil {
-			log.Printf("[Qdrant Import INFO] Поврежденный файл импорта %s переименован в %s", filePath, backupPath)
-		} else {
-			log.Printf("[Qdrant Import ERROR] Не удалось переименовать поврежденный файл импорта %s: %v", filePath, renameErr)
-		}
-		return 0, 0, fmt.Errorf("ошибка десериализации JSON из файла импорта '%s': %w", filePath, err)
-	}
-
-	totalMessages := len(messages)
-	log.Printf("[Qdrant Import] Чат %d: Найдено %d сообщений в файле %s для импорта.", chatID, totalMessages, filePath)
-
-	// 3. Обрабатываем и добавляем сообщения батчами
-	batchSize := 100 // Размер батча для Qdrant Upsert
-	pointsBatch := make([]*qdrant.PointStruct, 0, batchSize)
+	messageChunk := make([]types.Message, 0, chunkSize)
 	existingPoints := make(map[string]bool) // Кеш для проверки дубликатов в рамках одного файла
 
 	// Используем WaitGroup для ожидания завершения всех горутин получения эмбеддингов
 	var wg sync.WaitGroup
 	// Канал для передачи готовых точек в основной поток
-	pointsChan := make(chan *qdrant.PointStruct, totalMessages)
+	// Буфер равен chunkSize, т.к. мы обрабатываем один чанк за раз
+	pointsChan := make(chan *qdrant.PointStruct, chunkSize)
 	// Канал для отслеживания ошибок получения эмбеддингов
-	errorChan := make(chan error, totalMessages)
+	errorChan := make(chan error, chunkSize)
 	// Мьютекс для безопасного доступа к счетчикам
 	var countMutex sync.Mutex
 
-	// Ограничение количества одновременных горутин (например, 10)
-	semaphore := make(chan struct{}, 10)
+	// Ограничение количества одновременных горутин для получения эмбеддингов (например, 10)
+	embeddingSemaphore := make(chan struct{}, 10)
 
-	for i, msg := range messages {
-		// Пропускаем сообщения без текста или ID
-		if msg.Text == "" || msg.ID == 0 {
+	totalProcessed := 0 // Общий счетчик обработанных сообщений из файла
+
+	// Читаем сообщения из массива JSON
+	for decoder.More() {
+		var msg types.Message
+		if err := decoder.Decode(&msg); err != nil {
+			log.Printf("[Qdrant Import ERROR] Чат %d: Ошибка декодирования JSON сообщения в %s: %v", chatID, filePath, err)
+			// Пропускаем ошибочное сообщение, но продолжаем импорт
 			countMutex.Lock()
 			skippedCount++
 			countMutex.Unlock()
-			if qs.debug {
-				log.Printf("[Qdrant Import DEBUG] Чат %d: Пропуск сообщения %d/%d (пустой текст или ID=0).", chatID, i+1, totalMessages)
-			}
-			continue
+			continue // Пропускаем это сообщение
 		}
 
-		// Генерируем уникальный строковый идентификатор для генерации UUID
-		uniqueIDStr := fmt.Sprintf("%d_%d", chatID, msg.ID)
-		// Генерируем UUID v5
-		pointUUID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(uniqueIDStr))
-		pointIDStrForUUID := pointUUID.String() // Строковое представление UUID
+		totalProcessed++
+		messageChunk = append(messageChunk, msg)
 
-		// Проверка на дубликат в текущем файле (чтобы не делать лишние запросы к Gemini)
-		if existingPoints[pointIDStrForUUID] { // Проверяем по сгенерированному UUID
+		// Если чанк наполнен, обрабатываем его
+		if len(messageChunk) >= chunkSize {
+			log.Printf("[Qdrant Import] Чат %d: Обработка чанка %d сообщений (всего обработано: %d)...", chatID, len(messageChunk), totalProcessed)
+			pointsBatch, skippedInBatch, embErr := qs.processMessageChunk(chatID, messageChunk, existingPoints, &wg, pointsChan, errorChan, embeddingSemaphore)
 			countMutex.Lock()
-			skippedCount++
+			skippedCount += skippedInBatch
 			countMutex.Unlock()
-			if qs.debug {
-				log.Printf("[Qdrant Import DEBUG] Чат %d: Пропуск дубликата сообщения %d/%d (UUID: %s) в файле.", chatID, i+1, totalMessages, pointIDStrForUUID)
-			}
-			continue
-		}
-		existingPoints[pointIDStrForUUID] = true // Запоминаем UUID
-
-		wg.Add(1)
-		go func(m types.Message, uID string, index int) {
-			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			// 1. Получаем эмбеддинг
-			embedding, err := qs.geminiClient.GetEmbedding(m.Text)
-			if err != nil {
-				log.Printf("[Qdrant Import ERROR Emb] Чат %d: Сообщение %d/%d (UUID: %s): Ошибка получения эмбеддинга: %v", chatID, index+1, totalMessages, uID, err)
-				errorChan <- err
-				return
-			}
-			if len(embedding) == 0 {
-				log.Printf("[Qdrant Import WARN Emb] Чат %d: Сообщение %d/%d (UUID: %s): Получен пустой эмбеддинг.", chatID, index+1, totalMessages, uID)
-				pointsChan <- nil
-				return
+			if embErr != nil && err == nil { // Сохраняем первую ошибку эмбеддинга
+				err = embErr
 			}
 
-			// 2. Создаем Payload (используем MessagePayload)
-			msgPayload := &MessagePayload{
-				ChatID:       chatID,
-				MessageID:    int(m.ID),
-				Text:         m.Text,
-				Date:         m.Timestamp,
-				ImportSource: "batch_old",
-				UniqueID:     uID, // Сохраняем сгенерированный UUID в payload
-				Role:         m.Role,
-			}
-			if len(m.Entities) > 0 {
-				entitiesBytes, err := json.Marshal(m.Entities)
-				if err == nil {
-					msgPayload.Entities = entitiesBytes
-				} else {
-					log.Printf("[Qdrant Import WARN] Чат %d, Msg %d: Не удалось сериализовать Entities при импорте: %v", chatID, m.ID, err)
-				}
-			}
-			payloadMap := qs.messagePayloadToQdrantMap(msgPayload)
-
-			// 3. Создаем Qdrant Point (используем UUID)
-			point := &qdrant.PointStruct{
-				Id:      &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: uID}}, // Используем переданный UUID
-				Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: embedding}}},
-				Payload: payloadMap,
-			}
-			pointsChan <- point
-
-		}(msg, pointIDStrForUUID, i) // Передаем сгенерированный UUID в горутину
-	}
-
-	// Горутина для закрытия каналов после завершения всех воркеров
-	go func() {
-		wg.Wait()
-		close(pointsChan)
-		close(errorChan)
-	}()
-
-	// Собираем результаты из канала
-	processedCount := 0
-	var firstEmbError error
-	for point := range pointsChan {
-		processedCount++
-		if point != nil {
-			pointsBatch = append(pointsBatch, point)
-			if len(pointsBatch) >= batchSize {
-				// Отправляем батч в Qdrant
+			if len(pointsBatch) > 0 {
 				batchImported, batchSkipped, batchErr := qs.upsertPointsBatch(pointsBatch)
 				countMutex.Lock()
 				importedCount += batchImported
 				skippedCount += batchSkipped
 				countMutex.Unlock()
 				if batchErr != nil {
-					log.Printf("[Qdrant Import ERROR Batch] Чат %d: Ошибка при отправке батча: %v", chatID, batchErr)
-					// Можно решить, прерывать ли импорт при ошибке батча
-					// err = batchErr // Сохраняем ошибку, но продолжаем
+					log.Printf("[Qdrant Import ERROR Batch] Чат %d: Ошибка при отправке батча из чанка: %v", chatID, batchErr)
+					if err == nil {
+						err = batchErr // Сохраняем первую ошибку
+					}
 				}
-				pointsBatch = pointsBatch[:0] // Очищаем батч
 			}
-		} else {
-			// Сообщение было пропущено из-за ошибки эмбеддинга или пустого эмбеддинга
-			countMutex.Lock()
-			skippedCount++
-			countMutex.Unlock()
-		}
-		// Прогресс-лог
-		if processedCount%100 == 0 || processedCount == totalMessages {
-			log.Printf("[Qdrant Import Progress] Чат %d: Обработано %d/%d сообщений...", chatID, processedCount, totalMessages)
+			messageChunk = messageChunk[:0] // Очищаем чанк сообщений
+			// Восстанавливаем очистку батча
+			pointsBatch = pointsBatch[:0]
 		}
 	}
 
-	// Отправляем оставшийся батч, если он не пуст
-	if len(pointsBatch) > 0 {
-		batchImported, batchSkipped, batchErr := qs.upsertPointsBatch(pointsBatch)
+	// Обрабатываем последний неполный чанк, если он остался
+	if len(messageChunk) > 0 {
+		log.Printf("[Qdrant Import] Чат %d: Обработка последнего чанка из %d сообщений (всего обработано: %d)...", chatID, len(messageChunk), totalProcessed)
+		pointsBatch, skippedInBatch, embErr := qs.processMessageChunk(chatID, messageChunk, existingPoints, &wg, pointsChan, errorChan, embeddingSemaphore)
 		countMutex.Lock()
-		importedCount += batchImported
-		skippedCount += batchSkipped
+		skippedCount += skippedInBatch
 		countMutex.Unlock()
-		if batchErr != nil {
-			log.Printf("[Qdrant Import ERROR Batch] Чат %d: Ошибка при отправке последнего батча: %v", chatID, batchErr)
-			// err = batchErr
+		if embErr != nil && err == nil {
+			err = embErr
+		}
+
+		if len(pointsBatch) > 0 {
+			batchImported, batchSkipped, batchErr := qs.upsertPointsBatch(pointsBatch)
+			countMutex.Lock()
+			importedCount += batchImported
+			skippedCount += batchSkipped
+			countMutex.Unlock()
+			if batchErr != nil {
+				log.Printf("[Qdrant Import ERROR Batch] Чат %d: Ошибка при отправке последнего батча: %v", chatID, batchErr)
+				if err == nil {
+					err = batchErr
+				}
+			}
 		}
 	}
 
-	// Проверяем ошибки получения эмбеддингов
-	for embErr := range errorChan {
-		if firstEmbError == nil {
-			firstEmbError = embErr // Сохраняем первую ошибку эмбеддинга
-		}
+	// Ожидаем окончания декодирования массива ']'
+	t, errDecodeEnd := decoder.Token()
+	if errDecodeEnd != nil || t != json.Delim(']') {
+		log.Printf("[Qdrant Import WARN] Чат %d: Ошибка чтения конца JSON массива в %s: %v (токен: %v)", chatID, filePath, errDecodeEnd, t)
+		// Не фатально, но стоит залогировать
 	}
 
-	if firstEmbError != nil {
-		log.Printf("[Qdrant Import WARN] Чат %d: Были ошибки при получении эмбеддингов. Первая ошибка: %v", chatID, firstEmbError)
-		// Можно вернуть эту ошибку, если она критична
-		// if err == nil { err = firstEmbError }
-	}
+	log.Printf("[Qdrant Import OK] Чат %d: Импорт из файла %s завершен. Всего прочитано: %d, Импортировано/Обновлено: %d, Пропущено (дубликаты/ошибки): %d.",
+		chatID, filePath, totalProcessed, importedCount, skippedCount)
 
-	log.Printf("[Qdrant Import OK] Чат %d: Импорт из файла %s завершен. Импортировано: %d, Пропущено (дубликаты/ошибки): %d.",
-		chatID, filePath, importedCount, skippedCount)
-
-	return importedCount, skippedCount, err
+	return importedCount, skippedCount, err // Возвращаем первую возникшую ошибку
 }
+
+// --- НОВЫЙ МЕТОД: processMessageChunk ---
+// processMessageChunk обрабатывает чанк сообщений: получает эмбеддинги и формирует батч Qdrant точек.
+func (qs *QdrantStorage) processMessageChunk(
+	chatID int64,
+	messages []types.Message,
+	existingPoints map[string]bool, // Кеш для проверки дубликатов UUID
+	wg *sync.WaitGroup,
+	pointsChan chan<- *qdrant.PointStruct,
+	errorChan chan<- error,
+	semaphore chan struct{},
+) (pointsBatch []*qdrant.PointStruct, skippedInChunk int, firstEmbError error) {
+
+	pointsResultChan := make(chan *qdrant.PointStruct, len(messages)) // Канал для результатов этого чанка
+	var chunkWg sync.WaitGroup
+	var chunkMutex sync.Mutex // Мьютекс для skippedInChunk и firstEmbError
+
+	for i, msg := range messages {
+		// Пропускаем сообщения без текста или ID
+		if msg.Text == "" || msg.ID == 0 {
+			chunkMutex.Lock()
+			skippedInChunk++
+			chunkMutex.Unlock()
+			if qs.debug {
+				log.Printf("[Qdrant Import DEBUG Chunk] Чат %d: Пропуск сообщения %d/%d (пустой текст или ID=0).", chatID, i+1, len(messages))
+			}
+			continue
+		}
+
+		// Генерируем UUID v5
+		uniqueIDStr := fmt.Sprintf("%d_%d", chatID, msg.ID)
+		pointUUID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(uniqueIDStr))
+		pointIDStrForUUID := pointUUID.String()
+
+		// Проверка на дубликат в общем кеше
+		if existingPoints[pointIDStrForUUID] {
+			chunkMutex.Lock()
+			skippedInChunk++
+			chunkMutex.Unlock()
+			if qs.debug {
+				log.Printf("[Qdrant Import DEBUG Chunk] Чат %d: Пропуск дубликата сообщения %d/%d (UUID: %s) в файле.", chatID, i+1, len(messages), pointIDStrForUUID)
+			}
+			continue
+		}
+		existingPoints[pointIDStrForUUID] = true // Запоминаем UUID
+
+		chunkWg.Add(1)
+		go func(m types.Message, uID string, index int) {
+			defer chunkWg.Done()
+			semaphore <- struct{}{}        // Захватываем слот семафора
+			defer func() { <-semaphore }() // Освобождаем слот
+
+			// 1. Получаем эмбеддинг
+			embedding, err := qs.geminiClient.GetEmbedding(m.Text)
+			if err != nil {
+				log.Printf("[Qdrant Import ERROR Emb Chunk] Чат %d: Сообщение %d/%d (UUID: %s): Ошибка эмбеддинга: %v", chatID, index+1, len(messages), uID, err)
+				errorChan <- err // Отправляем ошибку в общий канал ошибок
+				chunkMutex.Lock()
+				if firstEmbError == nil { // Запоминаем первую ошибку в чанке
+					firstEmbError = err
+				}
+				chunkMutex.Unlock()
+				pointsResultChan <- nil // Отправляем nil в канал результатов чанка
+				return
+			}
+			if len(embedding) == 0 {
+				log.Printf("[Qdrant Import WARN Emb Chunk] Чат %d: Сообщение %d/%d (UUID: %s): Пустой эмбеддинг.", chatID, index+1, len(messages), uID)
+				pointsResultChan <- nil // Отправляем nil в канал результатов чанка
+				return
+			}
+
+			// 2. Создаем Payload
+			msgPayload := &MessagePayload{
+				ChatID:       chatID,
+				MessageID:    int(m.ID),
+				Text:         m.Text,
+				Date:         m.Timestamp,
+				ImportSource: "batch_old",
+				UniqueID:     uID,
+				Role:         m.Role,
+				// UserID, UserName, FirstName, IsBot, ReplyToMsgID берутся из m
+				UserID:       m.UserID,
+				UserName:     m.UserName,
+				FirstName:    m.FirstName,
+				IsBot:        m.IsBot,
+				ReplyToMsgID: m.ReplyToMsgID,
+			}
+			if len(m.Entities) > 0 {
+				entitiesBytes, err := json.Marshal(m.Entities)
+				if err == nil {
+					msgPayload.Entities = entitiesBytes
+				} else {
+					log.Printf("[Qdrant Import WARN Chunk] Чат %d, Msg %d: Не удалось сериализовать Entities: %v", chatID, m.ID, err)
+				}
+			}
+			payloadMap := qs.messagePayloadToQdrantMap(msgPayload)
+
+			// 3. Создаем Qdrant Point
+			point := &qdrant.PointStruct{
+				Id:      &qdrant.PointId{PointIdOptions: &qdrant.PointId_Uuid{Uuid: uID}},
+				Vectors: &qdrant.Vectors{VectorsOptions: &qdrant.Vectors_Vector{Vector: &qdrant.Vector{Data: embedding}}},
+				Payload: payloadMap,
+			}
+			pointsResultChan <- point // Отправляем готовую точку в канал результатов чанка
+
+		}(msg, pointIDStrForUUID, i)
+	}
+
+	// Ждем завершения всех горутин для этого чанка
+	chunkWg.Wait()
+	close(pointsResultChan) // Закрываем канал результатов чанка
+
+	// Собираем результаты из канала результатов чанка
+	for point := range pointsResultChan {
+		if point != nil {
+			pointsBatch = append(pointsBatch, point)
+		} else {
+			// Сообщение было пропущено из-за ошибки/пустого эмбеддинга
+			chunkMutex.Lock()
+			skippedInChunk++
+			chunkMutex.Unlock()
+		}
+	}
+
+	// Закрывать pointsChan и errorChan не нужно здесь, они общие для всего импорта
+
+	return pointsBatch, skippedInChunk, firstEmbError
+}
+
+// --- КОНЕЦ НОВОГО МЕТОДА ---
 
 // upsertPointsBatch отправляет батч точек в Qdrant.
 // Возвращает количество успешно добавленных/обновленных и пропущенных (уже существующих) точек.
@@ -856,12 +940,14 @@ func (qs *QdrantStorage) upsertPointsBatch(points []*qdrant.PointStruct) (int, i
 		upsertCtx = metadata.NewOutgoingContext(ctx, md)
 	}
 
-	waitUpsert := true                                             // Ждать подтверждения операции
+	// --- ИЗМЕНЕНИЕ: Устанавливаем wait = false для импорта ---
+	waitUpsert := false                                            // Не ждем подтверждения для ускорения импорта
 	resp, err := qs.client.Upsert(upsertCtx, &qdrant.UpsertPoints{ // Используем upsertCtx
 		CollectionName: qs.collectionName,
 		Points:         points,
 		Wait:           &waitUpsert,
 	})
+	// --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 	if err != nil {
 		log.Printf("[Qdrant UpsertBatch ERROR] Ошибка при Upsert батча (%d точек): %v", len(points), err)

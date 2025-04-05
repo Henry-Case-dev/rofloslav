@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -762,8 +763,12 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 /settings - Открыть меню настроек
 /summary - Запросить саммари последних сообщений
 /ping - Проверить доступность бота
+/import_history - Импортировать историю сообщений из файла (только Qdrant)
 /help - Показать это сообщение`
 		b.sendReply(chatID, helpText)
+
+	case "import_history": // Новая команда
+		b.handleImportHistoryCommand(chatID)
 
 	default:
 		b.sendReply(chatID, "Неизвестная команда.")
@@ -1524,3 +1529,50 @@ func convertTgBotMessagesToTypesMessages(tgMessages []*tgbotapi.Message) []types
 }
 
 // --- КОНЕЦ ВСПОМОГАТЕЛЬНЫХ ФУНКЦИЙ --- //
+
+// --- НОВАЯ ФУНКЦИЯ: Обработчик команды /import_history ---
+func (b *Bot) handleImportHistoryCommand(chatID int64) {
+	// Проверяем, используется ли Qdrant
+	qStorage, ok := b.storage.(*storage.QdrantStorage)
+	if !ok {
+		b.sendReply(chatID, "Команда импорта доступна только при использовании хранилища Qdrant.")
+		return
+	}
+
+	// Формируем путь к файлу
+	// Ожидаем файл в <DataDir>/old/<chatID>.json
+	fileName := fmt.Sprintf("%d.json", chatID)
+	filePath := filepath.Join(b.config.DataDir, "old", fileName)
+
+	log.Printf("[ImportCmd] Чат %d: Попытка импорта из файла: %s", chatID, filePath)
+
+	// Проверяем, существует ли файл
+	_, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		log.Printf("[ImportCmd WARN] Чат %d: Файл для импорта не найден: %s", chatID, filePath)
+		b.sendReply(chatID, fmt.Sprintf("Файл истории '%s' не найден. Убедитесь, что он находится в папке '%s/old/'", fileName, b.config.DataDir))
+		return
+	} else if err != nil {
+		log.Printf("[ImportCmd ERROR] Чат %d: Ошибка проверки файла %s: %v", chatID, filePath, err)
+		b.sendReply(chatID, "Произошла ошибка при доступе к файлу истории.")
+		return
+	}
+
+	// Запускаем импорт в горутине
+	b.sendReply(chatID, fmt.Sprintf("Начинаю импорт истории из файла '%s'. Это может занять некоторое время...", fileName))
+	go func() {
+		startTime := time.Now()
+		importedCount, skippedCount, importErr := qStorage.ImportMessagesFromJSONFile(chatID, filePath)
+		duration := time.Since(startTime)
+
+		if importErr != nil {
+			log.Printf("[ImportCmd ERROR Result] Чат %d: Ошибка импорта из %s: %v", chatID, filePath, importErr)
+			b.sendReply(chatID, fmt.Sprintf("Ошибка во время импорта из '%s': %v", fileName, importErr))
+		} else {
+			log.Printf("[ImportCmd OK Result] Чат %d: Импорт из %s завершен за %v. Импортировано: %d, Пропущено: %d", chatID, filePath, duration, importedCount, skippedCount)
+			b.sendReply(chatID, fmt.Sprintf("Импорт из '%s' завершен за %s.\nИмпортировано/Обновлено: %d\nПропущено (дубликаты/ошибки): %d", fileName, duration.Round(time.Second), importedCount, skippedCount))
+		}
+	}()
+}
+
+// --- Конец новой функции ---
