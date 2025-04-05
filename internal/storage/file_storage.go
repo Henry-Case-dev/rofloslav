@@ -13,6 +13,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	// Добавляем импорт types
+	"github.com/Henry-Case-dev/rofloslav/internal/types"
 	// config не нужен здесь, т.к. contextWindow передается при создании
 )
 
@@ -331,4 +333,18 @@ func (ls *LocalStorage) loadAllChatHistories() error {
 
 // --- Конец файла ---
 
-// Добавляем пустую строку для исправления возможной ошибки парсинга
+// ImportMessagesFromJSONFile - Заглушка для LocalStorage.
+func (ls *LocalStorage) ImportMessagesFromJSONFile(chatID int64, filePath string) (int, int, error) {
+	log.Printf("[LocalStorage WARN] ImportMessagesFromJSONFile не поддерживается для LocalStorage. Файл '%s' для чата %d проигнорирован.", filePath, chatID)
+	return 0, 0, nil // Возвращаем 0 импортированных, 0 пропущенных
+}
+
+// FindRelevantMessages - Заглушка для LocalStorage.
+// Всегда возвращает пустой срез и nil ошибку.
+// Используем types.Message
+func (ls *LocalStorage) FindRelevantMessages(chatID int64, queryText string, limit int) ([]types.Message, error) {
+	log.Printf("[LocalStorage WARN] FindRelevantMessages не реализован для LocalStorage (чат %d). Всегда возвращает пустой результат.", chatID)
+	return nil, nil // Возвращаем пустой срез и nil ошибку
+}
+
+// EOF

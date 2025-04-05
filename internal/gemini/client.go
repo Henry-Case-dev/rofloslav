@@ -6,7 +6,8 @@ import (
 	"log"
 	"strings"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	// "github.com/Henry-Case-dev/rofloslav/internal/storage" // Удаляем импорт storage
+	"github.com/Henry-Case-dev/rofloslav/internal/types" // Добавляем импорт types
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 )
@@ -43,14 +44,13 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// GenerateResponse генерирует ответ с использованием Gemini API
-func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Message) (string, error) {
+// GenerateResponse генерирует ответ с использованием Gemini API, используя types.Message
+func (c *Client) GenerateResponse(systemPrompt string, messages []types.Message) (string, error) {
 	ctx := context.Background()
 	model := c.genaiClient.GenerativeModel(c.modelName)
 
 	// Настройки модели (можно вынести в конфиг при необходимости)
 	model.SetTemperature(1)
-	model.SetTopK(40) // Gemini 1.5 не рекомендует использовать TopK одновременно с Temperature > 0
 	model.SetTopP(0.95)
 	model.SetMaxOutputTokens(8192)
 	// model.ResponseMIMEType = "text/plain" // Можно установить, если нужен только текст
@@ -58,15 +58,11 @@ func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Mess
 	// Начинаем чат сессию
 	session := model.StartChat()
 
-	// Формируем историю для API
+	// Формируем историю для API из types.Message
 	history, lastMessageText := c.prepareChatHistory(messages)
 	session.History = history
 
 	// Формируем текст запроса: системный промпт + последнее сообщение
-	// Важно: Системный промпт лучше передавать через API, если он это поддерживает,
-	// но в простом чате его можно добавить к первому сообщению пользователя.
-	// Здесь мы добавляем его к *последнему* сообщению для простоты.
-	// Можно экспериментировать с добавлением его в начало session.History
 	fullPrompt := systemPrompt
 	if lastMessageText != "" {
 		fullPrompt += "\n\n" + lastMessageText
@@ -110,9 +106,8 @@ func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Mess
 	return finalResponse, nil
 }
 
-// prepareChatHistory преобразует сообщения Telegram в историю для Gemini API
-// Возвращает историю и текст последнего сообщения (если есть)
-func (c *Client) prepareChatHistory(messages []*tgbotapi.Message) ([]*genai.Content, string) {
+// prepareChatHistory преобразует []types.Message в историю для Gemini API
+func (c *Client) prepareChatHistory(messages []types.Message) ([]*genai.Content, string) {
 	history := []*genai.Content{}
 	var lastMessageText string
 
@@ -124,7 +119,7 @@ func (c *Client) prepareChatHistory(messages []*tgbotapi.Message) ([]*genai.Cont
 	processUpToIndex := len(messages) - 1
 	for i := 0; i < processUpToIndex; i++ {
 		msg := messages[i]
-		content := c.convertMessageToGenaiContent(msg)
+		content := c.convertStorageMessageToGenaiContent(msg)
 		if content != nil {
 			history = append(history, content)
 		}
@@ -133,19 +128,17 @@ func (c *Client) prepareChatHistory(messages []*tgbotapi.Message) ([]*genai.Cont
 	// Сохраняем текст последнего сообщения отдельно
 	lastMsg := messages[len(messages)-1]
 	if lastMsg.Text != "" {
-		// Определяем роль последнего сообщения
-		role := "user"
-		if lastMsg.From != nil && lastMsg.From.IsBot { // Простая проверка, возможно, нужна ID бота
-			role = "model"
+		role := lastMsg.Role
+		if role == "" {
+			role = "user"
 		}
-		// Если последнее сообщение от бота, добавляем его в историю как "model"
+
 		if role == "model" {
-			content := c.convertMessageToGenaiContent(lastMsg)
+			content := c.convertStorageMessageToGenaiContent(lastMsg)
 			if content != nil {
 				history = append(history, content)
 			}
 		} else {
-			// Если последнее сообщение от пользователя, сохраняем текст для отправки
 			lastMessageText = lastMsg.Text
 		}
 
@@ -177,18 +170,19 @@ func (c *Client) prepareChatHistory(messages []*tgbotapi.Message) ([]*genai.Cont
 	return history, lastMessageText
 }
 
-// convertMessageToGenaiContent преобразует одно сообщение Telegram
-func (c *Client) convertMessageToGenaiContent(msg *tgbotapi.Message) *genai.Content {
-	if msg == nil || msg.Text == "" {
+// convertStorageMessageToGenaiContent преобразует одно types.Message
+func (c *Client) convertStorageMessageToGenaiContent(msg types.Message) *genai.Content {
+	if msg.Text == "" {
 		return nil
 	}
 
-	role := "user"
-	// Примечание: Проверка на IsBot может быть недостаточной.
-	// В идеале, нужно знать ID вашего бота и сравнивать msg.From.ID с ним.
-	// Пока используем простую проверку.
-	if msg.From != nil && msg.From.IsBot {
-		role = "model"
+	role := msg.Role
+	if role == "" {
+		role = "user"
+	}
+	if role != "user" && role != "model" {
+		log.Printf("[WARN] Недопустимая роль '%s' в types.Message ID %d. Использую 'user'.", role, msg.ID)
+		role = "user"
 	}
 
 	return &genai.Content{
@@ -204,7 +198,6 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 
 	// Используем те же настройки модели, что и в GenerateResponse
 	model.SetTemperature(1)
-	// model.SetTopK(40) // Не используется с Temp > 0
 	model.SetTopP(0.95)
 	model.SetMaxOutputTokens(8192)
 
@@ -248,6 +241,47 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 
 	return finalResponse, nil
 }
+
+// --- НОВАЯ ФУНКЦИЯ для Эмбеддингов ---
+
+// GetEmbedding получает векторное представление (эмбеддинг) для заданного текста.
+func (c *Client) GetEmbedding(text string) ([]float32, error) {
+	ctx := context.Background()
+	// Используем модель, специально предназначенную для эмбеддингов.
+	// "embedding-001" - стандартная модель Google для этого.
+	// Можно сделать имя модели для эмбеддингов настраиваемым в config, если потребуется.
+	embeddingModelName := "embedding-001"
+	em := c.genaiClient.EmbeddingModel(embeddingModelName)
+
+	if c.debug {
+		log.Printf("[DEBUG] Gemini GetEmbedding: Используется модель '%s' для текста: %s...", embeddingModelName, truncateString(text, 50))
+	}
+
+	// Используем EmbeddingModel
+	res, err := em.EmbedContent(ctx, genai.Text(text))
+	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Ошибка получения эмбеддинга: %v, Текст: %s...", err, truncateString(text, 50))
+		}
+		return nil, fmt.Errorf("ошибка получения эмбеддинга от Gemini (%s): %w", embeddingModelName, err)
+	}
+
+	if res == nil || res.Embedding == nil || len(res.Embedding.Values) == 0 {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Пустой эмбеддинг для текста: %s...", truncateString(text, 50))
+		}
+		// Возвращаем ошибку, чтобы не передавать пустой вектор в Qdrant
+		return nil, fmt.Errorf("получен пустой эмбеддинг от Gemini (%s)", embeddingModelName)
+	}
+
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Эмбеддинг получен. Размерность: %d, Текст: %s...", len(res.Embedding.Values), truncateString(text, 50))
+	}
+
+	return res.Embedding.Values, nil
+}
+
+// --- Конец новой функции ---
 
 // Вспомогательная функция для обрезки строки
 func truncateString(s string, maxLen int) string {

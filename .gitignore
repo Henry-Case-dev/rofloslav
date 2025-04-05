@@ -65,4 +65,7 @@ Thumbs.db
 .env.secrets 
 
 # Конфигурационный файл Amvera (не нужен при использовании Dockerfile)
-amvera.yaml 
+amvera.yaml
+
+# Папка с данными (может содержать большие файлы истории)
+data/ 

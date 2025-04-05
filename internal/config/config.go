@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -10,274 +11,294 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// Config содержит все параметры конфигурации бота
+// Config содержит все конфигурационные параметры приложения
 type Config struct {
 	TelegramToken   string
 	GeminiAPIKey    string
 	GeminiModelName string
-	DefaultPrompt   string
-	DirectPrompt    string
+	Debug           bool
+
+	ContextWindow                int
+	ContextRelevantMessagesCount int
+	MinMessages                  int
+	MaxMessages                  int
+
 	DailyTakePrompt string
-	SummaryPrompt   string
-	// RateLimitErrorMessage string // УДАЛЕНО
-	// Новые компоненты сообщения о лимите /summary
+	DailyTakeTime   int
+	TimeZone        string
+
+	DefaultPrompt string
+	DirectPrompt  string
+
+	SummaryPrompt string
+	// Старые поля для лимита саммари - УДАЛЕНЫ
+	// RateLimitErrorMessage string
+	// Добавляем новые поля для составного сообщения
 	SummaryRateLimitStaticPrefix string
 	SummaryRateLimitInsultPrompt string
 	SummaryRateLimitStaticSuffix string
-	// Новые промпты для ввода
-	PromptEnterMinMessages     string
-	PromptEnterMaxMessages     string
-	PromptEnterDailyTime       string
-	PromptEnterSummaryInterval string
-	// Новые промпты для анализа срачей
-	SRACH_WARNING_PROMPT  string
-	SRACH_ANALYSIS_PROMPT string
-	SRACH_CONFIRM_PROMPT  string
-	SrachKeywords         []string
-	// Настройки времени и интервалов
-	DailyTakeTime        int
-	TimeZone             string
-	SummaryIntervalHours int
-	MinMessages          int
-	MaxMessages          int
-	ContextWindow        int
-	Debug                bool
-	// Новые поля для S3
-	UseS3Storage      bool
-	S3Endpoint        string
-	S3Region          string
-	S3AccessKeyID     string
-	S3SecretAccessKey string
-	S3BucketName      string
-	S3UseSSL          bool
-	// Интервал сохранения истории
-	HistorySaveInterval time.Duration
-	// Новые поля для лимита прямых ответов
+
+	SummaryIntervalHours int // Интервал автоматического саммари в часах (0 - выключено)
+
+	// Настройки анализа срачей
+	SrachKeywords         []string `env:"SRACH_KEYWORDS" envSeparator:","`
+	SRACH_WARNING_PROMPT  string   `env:"SRACH_WARNING_PROMPT"`
+	SRACH_CONFIRM_PROMPT  string   `env:"SRACH_CONFIRM_PROMPT"`
+	SRACH_ANALYSIS_PROMPT string   `env:"SRACH_ANALYSIS_PROMPT"`
+
+	// Настройки лимита прямых ответов
 	RateLimitDirectReplyPrompt string
 	DirectReplyRateLimitCount  int
 	DirectReplyRateLimitWindow time.Duration
+
+	// Настройки промптов для ввода настроек
+	PromptEnterMinMessages     string `env:"PROMPT_ENTER_MIN_MESSAGES"`
+	PromptEnterMaxMessages     string `env:"PROMPT_ENTER_MAX_MESSAGES"`
+	PromptEnterDailyTime       string `env:"PROMPT_ENTER_DAILY_TIME"`
+	PromptEnterSummaryInterval string `env:"PROMPT_ENTER_SUMMARY_INTERVAL"`
+
+	// --- Настройки хранилища ---
+	UseS3Storage bool `env:"USE_S3_STORAGE"`
+	// --- S3 поля удалены ---
+
+	// --- НОВЫЕ Настройки Qdrant ---
+	QdrantEndpoint   string `env:"QDRANT_ENDPOINT"`
+	QdrantAPIKey     string `env:"QDRANT_API_KEY"` // Опционально, если используется
+	QdrantCollection string `env:"QDRANT_COLLECTION"`
+	QdrantTimeoutSec int    `env:"QDRANT_TIMEOUT_SEC"` // Таймаут для операций Qdrant
+
+	// --- Настройки импорта старых данных ---
+	OldDataDir           string `env:"OLD_DATA_DIR" envDefault:"data/old"`          // Директория со старыми JSON-логами для импорта
+	ImportOldDataOnStart bool   `env:"IMPORT_OLD_DATA_ON_START" envDefault:"false"` // Импортировать ли старые данные при старте
+
+	// --- Хранилище --- // NEW:
+	StorageType string `env:"STORAGE_TYPE" envDefault:"qdrant"` // Тип хранилища: "qdrant" или "local"
+	// ContextWindow        int    `env:"CONTEXT_WINDOW" envDefault:"500"`       // Максимальное количество сообщений в истории для LocalStorage - УДАЛЕНО ДУБЛИРОВАНИЕ
 }
 
-// Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
+// Load загружает конфигурацию из .env файла
 func Load() (*Config, error) {
-	// Сначала загружаем секреты, если файл существует
-	if errSecrets := godotenv.Load(".env.secrets"); errSecrets != nil {
+	// Загружаем основной .env файл
+	if err := godotenv.Load(); err != nil {
+		log.Println("Предупреждение: Не удалось загрузить .env файл:", err)
+	} else {
+		log.Println(".env файл успешно загружен.") // Добавим лог успеха
+	}
+
+	// Загружаем секретный .env.secrets файл (перезапишет основной, если есть совпадения)
+	// Ошибку здесь игнорируем, так как файл может отсутствовать
+	if err := godotenv.Load(".env.secrets"); err != nil {
 		log.Println("Файл .env.secrets не найден, секреты будут загружены из системных переменных или .env")
+	} else {
+		log.Println(".env.secrets файл успешно загружен.")
 	}
 
-	// Затем загружаем основной .env файл, если он существует
-	// Переменные из .env НЕ перезапишут уже загруженные из .env.secrets или системных переменных
-	if errEnv := godotenv.Load(); errEnv != nil {
-		log.Println("Файл .env не найден, используются системные переменные окружения")
+	cfg := &Config{
+		// Значения по умолчанию
+		GeminiModelName:              "gemini-1.5-flash-latest", // Используем Flash по умолчанию
+		Debug:                        false,
+		ContextWindow:                1000, // Увеличено окно для LocalStorage по умолчанию
+		ContextRelevantMessagesCount: 10,   // Искать 10 релевантных сообщений по умолчанию
+		MinMessages:                  15,   // Значения Min/Max из вашего .env
+		MaxMessages:                  30,
+		DailyTakeTime:                19,                   // 9 утра по умолчанию // ИСПРАВЛЕНО: 19 из вашего .env
+		TimeZone:                     "Asia/Yekaterinburg", // Ваш TimeZone
+		SummaryIntervalHours:         0,                    // Авто-саммари выключено по умолчанию
+		DefaultPrompt:                "Ты простой русскоязычный собеседник в чате.",
+		DirectPrompt:                 "Тебя упомянули или ответили на твое сообщение. Ответь коротко и саркастично.",
+		DailyTakePrompt:              "Придумай короткую тему дня для обсуждения в чате.",
+		SummaryPrompt:                "Сделай краткое саммари последних сообщений в чате:",
+		// Старые RateLimitErrorMessage - УДАЛЕНЫ
+		SummaryRateLimitStaticPrefix: "Слишком часто запрашиваешь саммари.",
+		SummaryRateLimitInsultPrompt: "Придумай короткое безобидное оскорбление для нетерпеливого пользователя.",
+		SummaryRateLimitStaticSuffix: "Подожди еще %s.",
+
+		// Настройки анализа срачей по умолчанию
+		SrachKeywords:         []string{"ты кто", "бот тупой", "иди нахуй", "заткнись", "слово1", "слово2"}, // Пример ключевых слов
+		SRACH_WARNING_PROMPT:  "🚨 Внимание! Обнаружен потенциальный срач!",
+		SRACH_CONFIRM_PROMPT:  "Ответь 'true' если следующее сообщение похоже на начало или продолжение конфликта/срача, иначе ответь 'false'. Сообщение:",
+		SRACH_ANALYSIS_PROMPT: "Проанализируй следующий диалог на предмет конфликта. Кратко опиши суть конфликта, основных участников и возможные причины. Дай рекомендации по деэскалации.",
+
+		// Настройки лимита прямых ответов по умолчанию
+		RateLimitDirectReplyPrompt: "Хватит мне писать так часто. Отдохни.",
+		DirectReplyRateLimitCount:  3,
+		DirectReplyRateLimitWindow: 10 * time.Minute,
+
+		// Настройки промптов для ввода настроек
+		PromptEnterMinMessages:     "Введите новое минимальное количество сообщений для ответа (число > 0):",
+		PromptEnterMaxMessages:     "Введите новое максимальное количество сообщений для ответа (число >= минимального):",
+		PromptEnterDailyTime:       "Введите новый час для ежедневного тейка (0-23) по времени %s:",
+		PromptEnterSummaryInterval: "Введите новый интервал для авто-саммари в часах (0 - выключить):",
+
+		// Настройки хранилища по умолчанию
+		UseS3Storage: false, // S3 выключен по умолчанию
+		// --- S3 значения по умолчанию удалены ---
+
+		// Настройки Qdrant по умолчанию
+		QdrantEndpoint:   "http://localhost:6333", // Стандартный эндпоинт Qdrant
+		QdrantAPIKey:     "",                      // API ключ не используется по умолчанию
+		QdrantCollection: "chat_history",          // Имя коллекции по умолчанию
+		QdrantTimeoutSec: 15,                      // Таймаут по умолчанию
+
+		// Настройки импорта по умолчанию
+		ImportOldDataOnStart: false,       // Импорт выключен по умолчанию
+		OldDataDir:           "/data/old", // Папка для старых данных по умолчанию
+
+		// --- Хранилище --- // NEW:
+		StorageType: "qdrant", // Тип хранилища: "qdrant" или "local"
+		// ContextWindow: 500,      // Максимальное количество сообщений в истории для LocalStorage - УДАЛЕНО ДУБЛИРОВАНИЕ
 	}
 
-	// --- Загрузка существующих переменных ---
-	telegramToken := getEnvOrDefault("TELEGRAM_TOKEN", "")
-	geminiAPIKey := getEnvOrDefault("GEMINI_API_KEY", "")
-	geminiModelName := getEnvOrDefault("GEMINI_MODEL_NAME", "gemini-1.5-flash-latest")
-	defaultPrompt := getEnvOrDefault("DEFAULT_PROMPT", "Ты простой бот.")
-	directPrompt := getEnvOrDefault("DIRECT_PROMPT", "Ответь кратко.")
-	dailyTakePrompt := getEnvOrDefault("DAILY_TAKE_PROMPT", "Какая тема дня?")
-	summaryPrompt := getEnvOrDefault("SUMMARY_PROMPT", "Сделай саммари.")
-	// rateLimitErrorMsg := getEnvOrDefault("RATE_LIMIT_ERROR_MESSAGE", "Слишком часто! Попробуйте позже.") // УДАЛЕНО
-	timeZone := getEnvOrDefault("TIME_ZONE", "UTC")
-	dailyTakeTimeStr := getEnvOrDefault("DAILY_TAKE_TIME", "19")
-	minMsgStr := getEnvOrDefault("MIN_MESSAGES", "10")
-	maxMsgStr := getEnvOrDefault("MAX_MESSAGES", "30")
-	contextWindowStr := getEnvOrDefault("CONTEXT_WINDOW", "1000")
-	debugStr := getEnvOrDefault("DEBUG", "false")
-
-	// --- Загрузка НОВЫХ переменных ---
-	summaryIntervalStr := getEnvOrDefault("SUMMARY_INTERVAL_HOURS", "2") // По умолчанию 2 часа
-	promptEnterMin := getEnvOrDefault("PROMPT_ENTER_MIN_MESSAGES", "Введите минимальный интервал:")
-	promptEnterMax := getEnvOrDefault("PROMPT_ENTER_MAX_MESSAGES", "Введите максимальный интервал:")
-	promptEnterDailyTime := getEnvOrDefault("PROMPT_ENTER_DAILY_TIME", "Введите час для темы дня (0-23):")
-	promptEnterSummaryInterval := getEnvOrDefault("PROMPT_ENTER_SUMMARY_INTERVAL", "Введите интервал авто-саммари (в часах, 0=выкл):")
-	srachWarningPrompt := getEnvOrDefault("SRACH_WARNING_PROMPT", "Внимание, срач!")
-	srachAnalysisPrompt := getEnvOrDefault("SRACH_ANALYSIS_PROMPT", "Анализирую срач...")
-	srachConfirmPrompt := getEnvOrDefault("SRACH_CONFIRM_PROMPT", "Это сообщение - часть срача? Ответь true или false:")
-	srachKeywordsRaw := getEnvOrDefault("SRACH_KEYWORDS", "")
-
-	// --- Загрузка НОВЫХ переменных (компоненты лимита саммари) ---
-	summaryLimitPrefix := getEnvOrDefault("SUMMARY_RATE_LIMIT_STATIC_PREFIX", "Саммари можно запрашивать не чаще, чем раз в 10 минут.")
-	summaryLimitPrompt := getEnvOrDefault("SUMMARY_RATE_LIMIT_INSULT_PROMPT", "Сгенерируй короткое, грубое оскорбление в одно предложение.")
-	summaryLimitSuffix := getEnvOrDefault("SUMMARY_RATE_LIMIT_STATIC_SUFFIX", "Осталось подождать: %s.")
-
-	// --- Загрузка переменных S3 ---
-	s3Endpoint := getEnvOrDefault("S3_ENDPOINT", "")
-	s3Region := getEnvOrDefault("S3_REGION", "us-east-1") // Стандартный регион как fallback
-	s3AccessKeyID := getEnvOrDefault("S3_ACCESS_KEY_ID", "")
-	s3SecretAccessKey := getEnvOrDefault("S3_SECRET_ACCESS_KEY", "")
-	s3BucketName := getEnvOrDefault("S3_BUCKET_NAME", "")
-	s3UseSSLStr := getEnvOrDefault("S3_USE_SSL", "true")
-	s3UseSSL := s3UseSSLStr == "true"
-	useS3StorageStr := getEnvOrDefault("USE_S3_STORAGE", "false")
-	useS3Storage := useS3StorageStr == "true"
-	historySaveIntervalStr := getEnvOrDefault("HISTORY_SAVE_INTERVAL", "5m")
-	// --- Загрузка переменных лимита прямых ответов ---
-	rateLimitPrompt := getEnvOrDefault("RATE_LIMIT_DIRECT_REPLY_PROMPT", "Я устал, отдохни.") // Простое значение по умолчанию
-	rateLimitCountStr := getEnvOrDefault("DIRECT_REPLY_RATE_LIMIT_COUNT", "3")
-	rateLimitWindowStr := getEnvOrDefault("DIRECT_REPLY_RATE_LIMIT_WINDOW", "10m")
-	// --- Конец загрузки S3 ---
-
-	// --- Логирование загруженных значений (до парсинга чисел) ---
-	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
-	log.Printf("[Config Load] GEMINI_API_KEY: ...%s (len %d)", truncateStringEnd(geminiAPIKey, 5), len(geminiAPIKey))
-	log.Printf("[Config Load] GEMINI_MODEL_NAME: %s", geminiModelName)
-	log.Printf("[Config Load] DEFAULT_PROMPT: %s...", truncateString(defaultPrompt, 50))
-	log.Printf("[Config Load] DIRECT_PROMPT: %s...", truncateString(directPrompt, 50))
-	log.Printf("[Config Load] DAILY_TAKE_PROMPT: %s...", truncateString(dailyTakePrompt, 50))
-	log.Printf("[Config Load] SUMMARY_PROMPT: %s...", truncateString(summaryPrompt, 50))
-	// log.Printf("[Config Load] RATE_LIMIT_ERROR_MESSAGE: %s...", truncateString(rateLimitErrorMsg, 50)) // УДАЛЕНО
-	log.Printf("[Config Load] SUMMARY_RATE_LIMIT_STATIC_PREFIX: %s...", truncateString(summaryLimitPrefix, 50))
-	log.Printf("[Config Load] SUMMARY_RATE_LIMIT_INSULT_PROMPT: %s...", truncateString(summaryLimitPrompt, 50))
-	log.Printf("[Config Load] SUMMARY_RATE_LIMIT_STATIC_SUFFIX: %s...", truncateString(summaryLimitSuffix, 50))
-	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
-	log.Printf("[Config Load] SRACH_WARNING_PROMPT: %s...", truncateString(srachWarningPrompt, 50))
-	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
-	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", truncateString(srachConfirmPrompt, 50))
-	log.Printf("[Config Load] DEBUG: %s", debugStr)
-	log.Printf("[Config Load] S3_ENDPOINT: %s", s3Endpoint)
-	log.Printf("[Config Load] S3_REGION: %s", s3Region)
-	log.Printf("[Config Load] S3_ACCESS_KEY_ID: %s...", truncateString(s3AccessKeyID, 5))
-	log.Printf("[Config Load] S3_SECRET_ACCESS_KEY: *** (set)")
-	log.Printf("[Config Load] S3_BUCKET_NAME: %s", s3BucketName)
-	log.Printf("[Config Load] S3_USE_SSL: %t", s3UseSSL)
-	log.Printf("[Config Load] USE_S3_STORAGE: %t", useS3Storage)
-	log.Printf("[Config Load] HISTORY_SAVE_INTERVAL: %s", historySaveIntervalStr)
-	log.Printf("[Config Load] RATE_LIMIT_DIRECT_REPLY_PROMPT: %s...", truncateString(rateLimitPrompt, 50))
-	log.Printf("[Config Load] DIRECT_REPLY_RATE_LIMIT_COUNT: %s", rateLimitCountStr)
-	log.Printf("[Config Load] DIRECT_REPLY_RATE_LIMIT_WINDOW: %s", rateLimitWindowStr)
-	// --- Конец логирования ---
-
-	// --- Парсинг ключевых слов ---
-	var srachKeywordsList []string
-	if srachKeywordsRaw != "" {
-		keywords := strings.Split(srachKeywordsRaw, ",")
-		for _, kw := range keywords {
-			trimmedKw := strings.TrimSpace(kw)
-			if trimmedKw != "" {
-				srachKeywordsList = append(srachKeywordsList, strings.ToLower(trimmedKw))
-			}
+	// Загрузка строковых значений
+	cfg.TelegramToken = os.Getenv("TELEGRAM_TOKEN")
+	cfg.GeminiAPIKey = os.Getenv("GEMINI_API_KEY")
+	if geminiModel := os.Getenv("GEMINI_MODEL_NAME"); geminiModel != "" {
+		cfg.GeminiModelName = geminiModel
+	}
+	if defaultPrompt := os.Getenv("DEFAULT_PROMPT"); defaultPrompt != "" {
+		cfg.DefaultPrompt = defaultPrompt
+	}
+	if directPrompt := os.Getenv("DIRECT_PROMPT"); directPrompt != "" {
+		cfg.DirectPrompt = directPrompt
+	}
+	if dailyTakePrompt := os.Getenv("DAILY_TAKE_PROMPT"); dailyTakePrompt != "" {
+		cfg.DailyTakePrompt = dailyTakePrompt
+	}
+	if tz := os.Getenv("TIME_ZONE"); tz != "" {
+		cfg.TimeZone = tz
+	}
+	if summaryPrompt := os.Getenv("SUMMARY_PROMPT"); summaryPrompt != "" {
+		cfg.SummaryPrompt = summaryPrompt
+	}
+	// --- Загрузка новых полей для RateLimitErrorMessage ---
+	if prefix := os.Getenv("SUMMARY_RATE_LIMIT_STATIC_PREFIX"); prefix != "" {
+		cfg.SummaryRateLimitStaticPrefix = prefix
+	}
+	if insult := os.Getenv("SUMMARY_RATE_LIMIT_INSULT_PROMPT"); insult != "" {
+		cfg.SummaryRateLimitInsultPrompt = insult
+	}
+	if suffix := os.Getenv("SUMMARY_RATE_LIMIT_STATIC_SUFFIX"); suffix != "" {
+		cfg.SummaryRateLimitStaticSuffix = suffix
+	}
+	// --- Конец загрузки ---
+	if srachWarn := os.Getenv("SRACH_WARNING_PROMPT"); srachWarn != "" {
+		cfg.SRACH_WARNING_PROMPT = srachWarn
+	}
+	if srachConfirm := os.Getenv("SRACH_CONFIRM_PROMPT"); srachConfirm != "" {
+		cfg.SRACH_CONFIRM_PROMPT = srachConfirm
+	}
+	if srachAnalysis := os.Getenv("SRACH_ANALYSIS_PROMPT"); srachAnalysis != "" {
+		cfg.SRACH_ANALYSIS_PROMPT = srachAnalysis
+	}
+	if keywords := os.Getenv("SRACH_KEYWORDS"); keywords != "" {
+		cfg.SrachKeywords = strings.Split(keywords, ",")
+		// Очищаем пробелы по краям у каждого слова
+		for i, w := range cfg.SrachKeywords {
+			cfg.SrachKeywords[i] = strings.TrimSpace(w)
 		}
 	}
-	log.Printf("Загружено %d ключевых слов для детекции срачей.", len(srachKeywordsList))
+	if rateLimitPrompt := os.Getenv("RATE_LIMIT_DIRECT_REPLY_PROMPT"); rateLimitPrompt != "" {
+		cfg.RateLimitDirectReplyPrompt = rateLimitPrompt
+	}
+	// --- Загрузка промптов для настроек ---
+	if prompt := os.Getenv("PROMPT_ENTER_MIN_MESSAGES"); prompt != "" {
+		cfg.PromptEnterMinMessages = prompt
+	}
+	if prompt := os.Getenv("PROMPT_ENTER_MAX_MESSAGES"); prompt != "" {
+		cfg.PromptEnterMaxMessages = prompt
+	}
+	if prompt := os.Getenv("PROMPT_ENTER_DAILY_TIME"); prompt != "" {
+		cfg.PromptEnterDailyTime = prompt
+	}
+	if prompt := os.Getenv("PROMPT_ENTER_SUMMARY_INTERVAL"); prompt != "" {
+		cfg.PromptEnterSummaryInterval = prompt
+	}
+	// --- Конец загрузки промптов ---
+	// --- Загрузка настроек хранилища ---
+	if useS3Str := os.Getenv("USE_S3_STORAGE"); useS3Str != "" {
+		cfg.UseS3Storage, _ = strconv.ParseBool(useS3Str) // Игнорируем ошибку, останется false
+	}
+	// --- Загрузка S3 настроек удалена ---
 
-	// --- Парсинг числовых значений ---
-	dailyTakeTime, err := strconv.Atoi(dailyTakeTimeStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга DAILY_TAKE_TIME: %v, используем 19", err)
-		dailyTakeTime = 19
+	// --- Загрузка НОВЫХ настроек Qdrant ---
+	if qdrantEndpoint := os.Getenv("QDRANT_ENDPOINT"); qdrantEndpoint != "" {
+		cfg.QdrantEndpoint = qdrantEndpoint
 	}
-	minMsg, err := strconv.Atoi(minMsgStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга MIN_MESSAGES: %v, используем 10", err)
-		minMsg = 10
+	cfg.QdrantAPIKey = os.Getenv("QDRANT_API_KEY") // Может быть пустым
+	if qdrantCollection := os.Getenv("QDRANT_COLLECTION"); qdrantCollection != "" {
+		cfg.QdrantCollection = qdrantCollection
 	}
-	maxMsg, err := strconv.Atoi(maxMsgStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга MAX_MESSAGES: %v, используем 30", err)
-		maxMsg = 30
+	// --- Конец загрузки ---
+
+	// --- НОВЫЕ --- Загрузка настроек импорта
+	if oldDataDir := os.Getenv("OLD_DATA_DIR"); oldDataDir != "" {
+		cfg.OldDataDir = oldDataDir
 	}
-	contextWindow, err := strconv.Atoi(contextWindowStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга CONTEXT_WINDOW: %v, используем 1000", err)
-		contextWindow = 1000
+	// --- Конец загрузки ---
+
+	// Загрузка числовых значений
+	if contextWindowStr := os.Getenv("CONTEXT_WINDOW"); contextWindowStr != "" {
+		if val, err := strconv.Atoi(contextWindowStr); err == nil && val > 0 {
+			cfg.ContextWindow = val
+		}
 	}
-	summaryIntervalHours, err := strconv.Atoi(summaryIntervalStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга SUMMARY_INTERVAL_HOURS: %v, используем 2", err)
-		summaryIntervalHours = 2
+	if relevantCountStr := os.Getenv("CONTEXT_RELEVANT_MESSAGES_COUNT"); relevantCountStr != "" {
+		if val, err := strconv.Atoi(relevantCountStr); err == nil && val > 0 {
+			cfg.ContextRelevantMessagesCount = val
+		}
 	}
-	if summaryIntervalHours < 0 {
-		log.Printf("Интервал саммари не может быть отрицательным, используем 2")
-		summaryIntervalHours = 2
+	if minMsgStr := os.Getenv("MIN_MESSAGES"); minMsgStr != "" {
+		if val, err := strconv.Atoi(minMsgStr); err == nil && val > 0 {
+			cfg.MinMessages = val
+		}
+	}
+	if maxMsgStr := os.Getenv("MAX_MESSAGES"); maxMsgStr != "" {
+		if val, err := strconv.Atoi(maxMsgStr); err == nil && val >= cfg.MinMessages {
+			cfg.MaxMessages = val
+		}
+	}
+	if dailyTimeStr := os.Getenv("DAILY_TAKE_TIME"); dailyTimeStr != "" {
+		if val, err := strconv.Atoi(dailyTimeStr); err == nil && val >= 0 && val <= 23 {
+			cfg.DailyTakeTime = val
+		}
+	}
+	if debugStr := os.Getenv("DEBUG"); debugStr != "" {
+		cfg.Debug, _ = strconv.ParseBool(debugStr) // Игнорируем ошибку, останется false
+	}
+	if summaryIntervalStr := os.Getenv("SUMMARY_INTERVAL_HOURS"); summaryIntervalStr != "" {
+		if val, err := strconv.Atoi(summaryIntervalStr); err == nil && val >= 0 {
+			cfg.SummaryIntervalHours = val
+		}
+	}
+	if rateLimitCountStr := os.Getenv("DIRECT_REPLY_RATE_LIMIT_COUNT"); rateLimitCountStr != "" {
+		if val, err := strconv.Atoi(rateLimitCountStr); err == nil && val >= 0 {
+			cfg.DirectReplyRateLimitCount = val
+		}
+	}
+	if rateLimitWindowStr := os.Getenv("DIRECT_REPLY_RATE_LIMIT_WINDOW"); rateLimitWindowStr != "" {
+		if duration, err := time.ParseDuration(rateLimitWindowStr); err == nil {
+			cfg.DirectReplyRateLimitWindow = duration
+		} else {
+			log.Printf("Предупреждение: Неверный формат DIRECT_REPLY_RATE_LIMIT_WINDOW: %v. Используется значение по умолчанию.", err)
+		}
+	}
+	if qdrantTimeoutStr := os.Getenv("QDRANT_TIMEOUT_SEC"); qdrantTimeoutStr != "" {
+		if val, err := strconv.Atoi(qdrantTimeoutStr); err == nil && val > 0 {
+			cfg.QdrantTimeoutSec = val
+		}
+	}
+	// --- НОВЫЕ --- Загрузка флага импорта
+	if importOldStr := os.Getenv("IMPORT_OLD_DATA_ON_START"); importOldStr != "" {
+		cfg.ImportOldDataOnStart, _ = strconv.ParseBool(importOldStr)
 	}
 
-	debug := debugStr == "true" || debugStr == "1" || debugStr == "yes"
-
-	// Парсинг интервала сохранения истории
-	historySaveInterval, err := time.ParseDuration(historySaveIntervalStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга HISTORY_SAVE_INTERVAL: %v, используем 5m", err)
-		historySaveInterval = 5 * time.Minute
+	// Проверка обязательных полей
+	if cfg.TelegramToken == "" {
+		return nil, fmt.Errorf("переменная окружения TELEGRAM_TOKEN не установлена")
+	}
+	if cfg.GeminiAPIKey == "" {
+		return nil, fmt.Errorf("переменная окружения GEMINI_API_KEY не установлена")
 	}
 
-	// --- Парсинг значений лимита прямых ответов ---
-	rateLimitCount, err := strconv.Atoi(rateLimitCountStr)
-	if err != nil || rateLimitCount < 1 {
-		log.Printf("Ошибка парсинга DIRECT_REPLY_RATE_LIMIT_COUNT ('%s'): %v, используем 3", rateLimitCountStr, err)
-		rateLimitCount = 3
-	}
-	rateLimitWindow, err := time.ParseDuration(rateLimitWindowStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга DIRECT_REPLY_RATE_LIMIT_WINDOW ('%s'): %v, используем 10m", rateLimitWindowStr, err)
-		rateLimitWindow = 10 * time.Minute
-	}
-
-	return &Config{
-		TelegramToken:   telegramToken,
-		GeminiAPIKey:    geminiAPIKey,
-		GeminiModelName: geminiModelName,
-		DefaultPrompt:   defaultPrompt,
-		DirectPrompt:    directPrompt,
-		DailyTakePrompt: dailyTakePrompt,
-		SummaryPrompt:   summaryPrompt,
-		// RateLimitErrorMessage:      rateLimitErrorMsg, // УДАЛЕНО
-		SummaryRateLimitStaticPrefix: summaryLimitPrefix,
-		SummaryRateLimitInsultPrompt: summaryLimitPrompt,
-		SummaryRateLimitStaticSuffix: summaryLimitSuffix,
-		PromptEnterMinMessages:       promptEnterMin,
-		PromptEnterMaxMessages:       promptEnterMax,
-		PromptEnterDailyTime:         promptEnterDailyTime,
-		PromptEnterSummaryInterval:   promptEnterSummaryInterval,
-		SRACH_WARNING_PROMPT:         srachWarningPrompt,
-		SRACH_ANALYSIS_PROMPT:        srachAnalysisPrompt,
-		SRACH_CONFIRM_PROMPT:         srachConfirmPrompt,
-		SrachKeywords:                srachKeywordsList,
-		DailyTakeTime:                dailyTakeTime,
-		TimeZone:                     timeZone,
-		SummaryIntervalHours:         summaryIntervalHours,
-		MinMessages:                  minMsg,
-		MaxMessages:                  maxMsg,
-		ContextWindow:                contextWindow,
-		Debug:                        debug,
-		UseS3Storage:                 useS3Storage,
-		S3Endpoint:                   s3Endpoint,
-		S3Region:                     s3Region,
-		S3AccessKeyID:                s3AccessKeyID,
-		S3SecretAccessKey:            s3SecretAccessKey,
-		S3BucketName:                 s3BucketName,
-		S3UseSSL:                     s3UseSSL,
-		HistorySaveInterval:          historySaveInterval,
-		RateLimitDirectReplyPrompt:   rateLimitPrompt,
-		DirectReplyRateLimitCount:    rateLimitCount,
-		DirectReplyRateLimitWindow:   rateLimitWindow,
-	}, nil
-}
-
-// getEnvOrDefault возвращает значение переменной окружения или значение по умолчанию
-func getEnvOrDefault(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	if defaultValue != "" { // Логируем только если значение не пустое
-		log.Printf("Переменная окружения %s не установлена, используется значение по умолчанию: %s", key, defaultValue)
-	}
-	return defaultValue
-}
-
-// Вспомогательные функции для логирования
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen]
-}
-
-func truncateStringEnd(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[len(s)-maxLen:]
+	return cfg, nil
 }

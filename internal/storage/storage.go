@@ -8,6 +8,8 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
+	"github.com/Henry-Case-dev/rofloslav/internal/types"
 )
 
 // --- Интерфейс Хранилища ---
@@ -43,6 +45,15 @@ type HistoryStorage interface {
 	// LoadAllChatHistories (Опционально, может понадобиться для S3)
 	// Загружает историю для всех известных чатов (например, при старте).
 	// LoadAllChatHistories() error
+
+	// ImportMessagesFromJSONFile импортирует сообщения из JSON-файла в хранилище.
+	// Должен быть идемпотентным (пропускать уже существующие сообщения).
+	// Возвращает количество импортированных и пропущенных сообщений.
+	ImportMessagesFromJSONFile(chatID int64, filePath string) (importedCount int, skippedCount int, err error)
+
+	// FindRelevantMessages ищет сообщения в истории чата, релевантные заданному тексту.
+	// Возвращает до `limit` наиболее релевантных сообщений.
+	FindRelevantMessages(chatID int64, queryText string, limit int) ([]types.Message, error)
 }
 
 // --- Конец Интерфейса ---
@@ -132,50 +143,25 @@ func ConvertToAPIMessage(stored *StoredMessage) *tgbotapi.Message {
 
 // NewHistoryStorage создает и возвращает подходящую реализацию HistoryStorage
 // на основе конфигурации.
-func NewHistoryStorage(cfg *config.Config) (HistoryStorage, error) {
-	log.Printf("[Storage Factory] Проверка конфигурации: UseS3Storage=%t", cfg.UseS3Storage)
-	if cfg.UseS3Storage {
-		log.Println("[Storage Factory] Попытка инициализации S3 хранилища.")
-		// Проверяем наличие обязательных S3 параметров
-		if cfg.S3Endpoint == "" || cfg.S3BucketName == "" || cfg.S3AccessKeyID == "" || cfg.S3SecretAccessKey == "" {
-			log.Printf("[Storage Factory WARN] Не заданы все необходимые параметры S3. Endpoint: '%s', Bucket: '%s', AccessKeyID set: %t, SecretKey set: %t. Откат на LocalStorage.",
-				cfg.S3Endpoint, cfg.S3BucketName, cfg.S3AccessKeyID != "", cfg.S3SecretAccessKey != "")
-			// Возвращаем LocalStorage как запасной вариант
-			localStorage, err := NewLocalStorage(cfg.ContextWindow)
-			if err != nil {
-				log.Printf("[Storage Factory ERROR] Ошибка инициализации ЗАПАСНОГО LocalStorage: %v", err)
-				return nil, fmt.Errorf("ошибка инициализации запасного LocalStorage: %w", err)
-			}
-			log.Println("[Storage Factory] Успешно создан ЗАПАСНОЙ LocalStorage.")
-			return localStorage, nil
+func NewHistoryStorage(cfg *config.Config, geminiClient *gemini.Client) (HistoryStorage, error) {
+	// Пока что принудительно используем QdrantStorage
+	// В будущем можно добавить флаг в конфиг для выбора
+	log.Println("[Storage Factory] Попытка инициализации Qdrant хранилища.")
+	qdrantStorage, err := NewQdrantStorage(cfg, geminiClient)
+	if err != nil {
+		log.Printf("[Storage Factory ERROR] Ошибка инициализации QdrantStorage: %v", err)
+		// Можно добавить откат на LocalStorage, если Qdrant недоступен
+		log.Printf("[Storage Factory WARN] Ошибка Qdrant, откат на LocalStorage (ДЛЯ ОТЛАДКИ).")
+		localStorage, localErr := NewLocalStorage(cfg.ContextWindow)
+		if localErr != nil {
+			log.Printf("[Storage Factory ERROR] Ошибка инициализации ЗАПАСНОГО LocalStorage: %v", localErr)
+			return nil, fmt.Errorf("ошибка инициализации Qdrant (%v) и запасного LocalStorage (%w)", err, localErr)
 		}
-
-		log.Println("[Storage Factory] Все параметры S3 заданы, вызываю NewS3Storage...")
-		s3Store, err := NewS3Storage(cfg, cfg.ContextWindow)
-		if err != nil {
-			log.Printf("[Storage Factory ERROR] Ошибка инициализации S3 хранилища: %v. Используется LocalStorage.", err)
-			// Возвращаем LocalStorage как запасной вариант
-			// ИСПРАВЛЕНО: Обрабатываем ошибку от NewLocalStorage
-			localStorage, localErr := NewLocalStorage(cfg.ContextWindow)
-			if localErr != nil {
-				log.Printf("[Storage Factory ERROR] Ошибка инициализации запасного LocalStorage после ошибки S3: %v", localErr)
-				// Возвращаем исходную ошибку S3 + ошибку запасного варианта
-				return nil, fmt.Errorf("ошибка инициализации S3 (%v) и запасного LocalStorage (%w)", err, localErr)
-			}
-			log.Println("[Storage Factory] Успешно создан ЗАПАСНОЙ LocalStorage.")
-			return localStorage, nil // Возвращаем созданный LocalStorage
-		}
-		log.Println("[Storage Factory] S3 хранилище успешно инициализировано.")
-		return s3Store, nil
-	} else {
-		log.Println("[Storage Factory] Используется конфигурация LocalStorage.")
-		// Возвращаем LocalStorage
-		// ИСПРАВЛЕНО: Обрабатываем ошибку от NewLocalStorage
-		localStorage, err := NewLocalStorage(cfg.ContextWindow)
-		if err != nil {
-			log.Printf("[Storage Factory ERROR] Ошибка инициализации LocalStorage: %v", err)
-			return nil, fmt.Errorf("ошибка инициализации LocalStorage: %w", err)
-		}
+		log.Println("[Storage Factory] Успешно создан ЗАПАСНОЙ LocalStorage.")
 		return localStorage, nil
+		// В продакшене, возможно, стоит возвращать ошибку Qdrant:
+		// return nil, fmt.Errorf("ошибка инициализации QdrantStorage: %w", err)
 	}
+	log.Println("[Storage Factory] Qdrant хранилище успешно инициализировано.")
+	return qdrantStorage, nil
 }
