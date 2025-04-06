@@ -148,14 +148,18 @@ func NewQdrantStorage(cfg *config.Config, geminiClient *gemini.Client) (*QdrantS
 
 	if !collectionExists {
 		log.Printf("[QdrantStorage] Коллекция '%s' не найдена. Попытка создания...", cfg.QdrantCollection)
-		// Определяем размерность векторов. Зависит от модели Gemini!
 		// Получим размерность, сгенерировав эмбеддинг для тестовой строки.
 		// Важно: Убедитесь, что Gemini клиент уже инициализирован и работает.
-		testEmbedding, err := geminiClient.GetEmbedding("test")
-		if err != nil || len(testEmbedding) == 0 {
+		testEmbeddings, err := geminiClient.GetEmbeddingsBatch(ctx, []string{"test"})
+		if err != nil {
 			log.Printf("[QdrantStorage ERROR] Не удалось получить тестовый эмбеддинг для определения размерности: %v", err)
 			return nil, fmt.Errorf("не удалось определить размерность вектора для коллекции Qdrant: %w", err)
 		}
+		if len(testEmbeddings) != 1 || len(testEmbeddings[0]) == 0 {
+			log.Printf("[QdrantStorage ERROR] Получен некорректный результат эмбеддинга для теста (ожидался 1 непустой вектор): %d векторов", len(testEmbeddings))
+			return nil, fmt.Errorf("не удалось определить размерность вектора: неожиданный результат от GetEmbeddingsBatch")
+		}
+		testEmbedding := testEmbeddings[0] // Берем первый (и единственный) эмбеддинг
 		vectorSize := uint64(len(testEmbedding))
 		log.Printf("[QdrantStorage] Определена размерность векторов: %d", vectorSize)
 
@@ -243,15 +247,18 @@ func (qs *QdrantStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
 
 	// 1. Получаем эмбеддинг текста
 	log.Printf("[Qdrant DEBUG] Запрос эмбеддинга для сообщения ID %d, текст: %s...", message.MessageID, truncateString(messageText, 20))
-	embedding, err := qs.geminiClient.GetEmbedding(messageText)
+	ctxEmb, cancelEmb := context.WithTimeout(context.Background(), qs.timeout)
+	defer cancelEmb()
+	embeddings, err := qs.geminiClient.GetEmbeddingsBatch(ctxEmb, []string{messageText})
 	if err != nil {
 		log.Printf("[Qdrant ERROR] Ошибка получения эмбеддинга для сообщения ID %d: %v", message.MessageID, err)
 		return // Прерываем, если не удалось получить эмбеддинг
 	}
-	if len(embedding) == 0 {
-		log.Printf("[Qdrant ERROR] Получен пустой эмбеддинг для сообщения ID %d", message.MessageID)
+	if len(embeddings) != 1 || len(embeddings[0]) == 0 {
+		log.Printf("[Qdrant ERROR] Получен некорректный результат эмбеддинга для сообщения ID %d (ожидался 1 непустой вектор): %d векторов", message.MessageID, len(embeddings))
 		return
 	}
+	embedding := embeddings[0] // Берем первый (и единственный) эмбеддинг
 	log.Printf("[Qdrant DEBUG] Получен эмбеддинг размером %d для сообщения ID %d", len(embedding), message.MessageID)
 
 	// 2. Создаем payload и ID для сообщения
@@ -469,15 +476,19 @@ func (qs *QdrantStorage) FindRelevantMessages(chatID int64, queryText string, li
 	}
 
 	// 1. Получаем эмбеддинг для текста запроса
-	queryEmbedding, err := qs.geminiClient.GetEmbedding(queryText)
+	ctxEmb, cancelEmb := context.WithTimeout(context.Background(), qs.timeout)
+	defer cancelEmb()
+	queryEmbeddings, err := qs.geminiClient.GetEmbeddingsBatch(ctxEmb, []string{queryText})
 	if err != nil {
 		log.Printf("[QdrantStorage ERROR FindRelevant Chat %d] Ошибка получения эмбеддинга для запроса '%s': %v", chatID, truncateString(queryText, 50), err)
 		return nil, fmt.Errorf("ошибка получения эмбеддинга для поиска: %w", err)
 	}
-	if len(queryEmbedding) == 0 {
-		log.Printf("[QdrantStorage WARN FindRelevant Chat %d] Получен пустой эмбеддинг для запроса: %s", chatID, truncateString(queryText, 50))
-		return []types.Message{}, nil // Возвращаем пустой срез Message
+	if len(queryEmbeddings) != 1 || len(queryEmbeddings[0]) == 0 {
+		log.Printf("[QdrantStorage WARN FindRelevant Chat %d] Получен некорректный результат эмбеддинга для запроса '%s' (ожидался 1 непустой вектор): %d векторов", chatID, truncateString(queryText, 50), len(queryEmbeddings))
+		// Не возвращаем ошибку, но и результатов не будет
+		return []types.Message{}, nil
 	}
+	queryEmbedding := queryEmbeddings[0] // Берем первый (и единственный) эмбеддинг
 
 	// 2. Формируем запрос на поиск в Qdrant
 	ctx, cancel := context.WithTimeout(context.Background(), qs.timeout)
@@ -808,7 +819,9 @@ func (qs *QdrantStorage) processMessageChunk(
 			defer func() { <-semaphore }() // Освобождаем слот
 
 			// 1. Получаем эмбеддинг
-			embedding, err := qs.geminiClient.GetEmbedding(m.Text)
+			ctxEmb, cancelEmb := context.WithTimeout(context.Background(), qs.timeout)
+			defer cancelEmb()
+			embeddings, err := qs.geminiClient.GetEmbeddingsBatch(ctxEmb, []string{m.Text})
 			if err != nil {
 				log.Printf("[Qdrant Import ERROR Emb Chunk] Чат %d: Сообщение %d/%d (UUID: %s): Ошибка эмбеддинга: %v", chatID, index+1, len(messages), uID, err)
 				errorChan <- err // Отправляем ошибку в общий канал ошибок
@@ -820,11 +833,12 @@ func (qs *QdrantStorage) processMessageChunk(
 				pointsResultChan <- nil // Отправляем nil в канал результатов чанка
 				return
 			}
-			if len(embedding) == 0 {
-				log.Printf("[Qdrant Import WARN Emb Chunk] Чат %d: Сообщение %d/%d (UUID: %s): Пустой эмбеддинг.", chatID, index+1, len(messages), uID)
+			if len(embeddings) != 1 || len(embeddings[0]) == 0 {
+				log.Printf("[Qdrant Import WARN Emb Chunk] Чат %d: Сообщение %d/%d (UUID: %s): Пустой/некорректный эмбеддинг (кол-во: %d).", chatID, index+1, len(messages), uID, len(embeddings))
 				pointsResultChan <- nil // Отправляем nil в канал результатов чанка
 				return
 			}
+			embedding := embeddings[0] // Берем первый (и единственный) эмбеддинг
 
 			// 2. Создаем Payload
 			msgPayload := &MessagePayload{

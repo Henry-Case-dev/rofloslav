@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/Henry-Case-dev/rofloslav/internal/bot"
 	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
+	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 )
 
 // handleRoot - простой обработчик HTTP запросов
@@ -20,7 +23,7 @@ func main() {
 	log.Println("=== Application Starting ===")
 	log.Printf("Timestamp: %s", time.Now().UTC().Format(time.RFC3339))
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Printf("!!! FATAL: Ошибка загрузки конфигурации: %v", err)
 		time.Sleep(15 * time.Second)
@@ -28,7 +31,40 @@ func main() {
 	}
 	log.Println("--- Configuration Loaded ---")
 
-	botInstance, err := bot.New(cfg)
+	// --- Инициализация клиентов и хранилищ ---
+	ctx := context.Background()
+
+	// Инициализация клиента Gemini
+	geminiClient, err := gemini.NewClient(ctx, cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.GeminiEmbeddingModelName)
+	if err != nil {
+		log.Printf("!!! FATAL: Ошибка инициализации клиента Gemini: %v", err)
+		time.Sleep(15 * time.Second)
+		panic(fmt.Sprintf("Gemini client initialization error: %v", err))
+	}
+	defer geminiClient.Close() // Закрываем клиент при завершении main
+	log.Println("--- Gemini Client Initialized ---")
+
+	// Инициализация основного хранилища
+	primaryStorage, err := storage.NewHistoryStorage(cfg, geminiClient)
+	if err != nil {
+		log.Printf("!!! FATAL: Ошибка инициализации основного хранилища: %v", err)
+		time.Sleep(15 * time.Second)
+		panic(fmt.Sprintf("Primary storage initialization error: %v", err))
+	}
+	log.Println("--- Primary Storage Initialized ---")
+
+	// Инициализация локального хранилища для саммари
+	localHistoryStorage, err := storage.NewLocalStorage(cfg.ContextWindow)
+	if err != nil {
+		// Ошибка локального хранилища не фатальна, но логируем
+		log.Printf("!!! WARNING: Ошибка инициализации локального хранилища: %v", err)
+		// Можно продолжить без локального хранилища, установив его в nil
+		localHistoryStorage = nil
+	}
+	log.Println("--- Local Summary Storage Initialized ---")
+
+	// Инициализация бота
+	botInstance, err := bot.NewBot(cfg, geminiClient, primaryStorage, localHistoryStorage)
 	if err != nil {
 		log.Printf("!!! FATAL: Ошибка создания бота: %v", err)
 		time.Sleep(15 * time.Second)
@@ -38,11 +74,9 @@ func main() {
 
 	// Запускаем бота в отдельной горутине
 	go func() {
-		if startErr := botInstance.Start(); startErr != nil {
-			log.Printf("!!! CRITICAL: Критическая ошибка запуска бота: %v", startErr)
-		}
+		botInstance.Run()
 	}()
-	log.Println("--- Bot Start Goroutine Launched ---")
+	log.Println("--- Bot Run Goroutine Launched ---")
 	log.Println("Бот запущен.")
 
 	// --- Запуск Dummy HTTP сервера ---

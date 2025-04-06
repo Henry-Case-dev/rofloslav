@@ -6,287 +6,298 @@ import (
 	"log"
 	"strings"
 
-	// "github.com/Henry-Case-dev/rofloslav/internal/storage" // Удаляем импорт storage
-	"github.com/Henry-Case-dev/rofloslav/internal/types" // Добавляем импорт types
-	"github.com/google/generative-ai-go/genai"
+	"github.com/Henry-Case-dev/rofloslav/internal/config" // Импорт для config.GenerationSettings и др.
+	genai "github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
+	// Убираем неиспользуемый импорт types, если он есть
 )
 
-// Client для взаимодействия с Gemini API
+// Client представляет собой клиент для взаимодействия с Gemini API.
 type Client struct {
-	genaiClient *genai.Client
-	modelName   string
-	debug       bool
+	generativeClient   *genai.Client
+	modelName          string
+	embeddingModelName string // Добавлено поле для имени модели эмбеддингов
 }
 
-// New создает нового клиента Gemini
-func New(apiKey, modelName string, debug bool) (*Client, error) {
-	ctx := context.Background()
-	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+// NewClient создает и инициализирует нового клиента Gemini.
+// Используем modelName для генерации контента и embeddingModelName для эмбеддингов.
+func NewClient(ctx context.Context, apiKey, modelName, embeddingModelName string) (*Client, error) {
+	log.Printf("Инициализация клиента Gemini для модели генерации: %s и модели эмбеддингов: %s", modelName, embeddingModelName)
+	generativeClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		return nil, fmt.Errorf("ошибка создания клиента genai: %w", err)
+		log.Printf("Ошибка создания клиента Gemini: %v", err)
+		return nil, fmt.Errorf("ошибка создания клиента Gemini: %w", err)
 	}
-
-	log.Printf("Клиент Gemini инициализирован для модели: %s", modelName)
-
+	log.Printf("Клиент Gemini успешно создан.")
 	return &Client{
-		genaiClient: genaiClient,
-		modelName:   modelName,
-		debug:       debug,
+		generativeClient:   generativeClient,
+		modelName:          modelName,
+		embeddingModelName: embeddingModelName, // Сохраняем имя модели эмбеддингов
 	}, nil
 }
 
-// Close закрывает клиент Gemini
-func (c *Client) Close() error {
-	if c.genaiClient != nil {
-		return c.genaiClient.Close()
+// GetEmbedding получает векторное представление (эмбеддинг) для одного текста.
+func (c *Client) GetEmbedding(ctx context.Context, text string) ([]float32, error) {
+	if text == "" {
+		log.Println("[Gemini WARN] GetEmbedding: Получена пустая строка для эмбеддинга.")
+		// Возвращаем ошибку, чтобы вызывающий код знал о проблеме
+		return nil, fmt.Errorf("нельзя получить эмбеддинг для пустой строки")
 	}
-	return nil
-}
+	log.Printf("[Gemini DEBUG] GetEmbedding: Запрос на получение эмбеддинга для текста: \"%s...\"", truncateString(text, 100))
 
-// GenerateResponse генерирует ответ с использованием Gemini API, используя types.Message
-func (c *Client) GenerateResponse(systemPrompt string, messages []types.Message) (string, error) {
-	ctx := context.Background()
-	model := c.genaiClient.GenerativeModel(c.modelName)
-
-	// Настройки модели (можно вынести в конфиг при необходимости)
-	model.SetTemperature(1)
-	model.SetTopP(0.95)
-	model.SetMaxOutputTokens(8192)
-	// model.ResponseMIMEType = "text/plain" // Можно установить, если нужен только текст
-
-	// Начинаем чат сессию
-	session := model.StartChat()
-
-	// Формируем историю для API из types.Message
-	history, lastMessageText := c.prepareChatHistory(messages)
-	session.History = history
-
-	// Формируем текст запроса: системный промпт + последнее сообщение
-	fullPrompt := systemPrompt
-	if lastMessageText != "" {
-		fullPrompt += "\n\n" + lastMessageText
-	}
-
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос: Полный промпт (system + last message) = %s...", truncateString(fullPrompt, 100))
-		log.Printf("[DEBUG] Gemini Запрос: История содержит %d сообщений.", len(session.History))
-		log.Printf("[DEBUG] Gemini Запрос: Модель %s, Temp: %v, TopP: %v, MaxTokens: %v",
-			c.modelName, model.Temperature, model.TopP, model.MaxOutputTokens)
-	}
-
-	// Отправляем сообщение
-	resp, err := session.SendMessage(ctx, genai.Text(fullPrompt))
+	// Используем GetEmbeddingsBatch для одного элемента
+	embeddings, err := c.GetEmbeddingsBatch(ctx, []string{text})
 	if err != nil {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ошибка отправки: %v", err)
-		}
-		return "", fmt.Errorf("ошибка отправки сообщения в Gemini: %w", err)
+		log.Printf("[Gemini ERROR] GetEmbedding: Ошибка при получении эмбеддинга через батч: %v", err)
+		return nil, fmt.Errorf("ошибка получения эмбеддинга: %w", err) // Передаем ошибку дальше
 	}
 
-	// Извлекаем ответ
-	var responseText strings.Builder
-	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
-		for _, part := range resp.Candidates[0].Content.Parts {
-			responseText.WriteString(fmt.Sprintf("%s", part)) // Преобразуем part в строку
-		}
-	} else {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ответ: Получен пустой ответ или нет кандидатов.")
-		}
-		// Можно вернуть пустую строку или ошибку в зависимости от логики
-		return "", fmt.Errorf("Gemini не вернул валидный ответ")
+	// Проверяем, что вернулся ровно один эмбеддинг
+	if len(embeddings) != 1 {
+		log.Printf("[Gemini ERROR] GetEmbedding: Ожидался 1 эмбеддинг, получено %d.", len(embeddings))
+		return nil, fmt.Errorf("получено неожиданное количество эмбеддингов (%d) для одного текста", len(embeddings))
+	}
+	if len(embeddings[0]) == 0 {
+		log.Printf("[Gemini ERROR] GetEmbedding: Получен пустой эмбеддинг (вектор нулевой длины).")
+		return nil, fmt.Errorf("получен пустой эмбеддинг")
 	}
 
-	finalResponse := responseText.String()
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Ответ: %s...", truncateString(finalResponse, 100))
-	}
-
-	return finalResponse, nil
+	log.Printf("[Gemini DEBUG] GetEmbedding: Успешно получен эмбеддинг размером %d.", len(embeddings[0]))
+	return embeddings[0], nil
 }
 
-// prepareChatHistory преобразует []types.Message в историю для Gemini API
-func (c *Client) prepareChatHistory(messages []types.Message) ([]*genai.Content, string) {
-	history := []*genai.Content{}
-	var lastMessageText string
-
-	if len(messages) == 0 {
-		return history, ""
+// GetEmbeddingsBatch получает векторные представления (эмбеддинги) для батча текстов.
+// Переименовано из GetEmbeddings.
+func (c *Client) GetEmbeddingsBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	log.Printf("[Gemini DEBUG] GetEmbeddingsBatch: Запрос на получение эмбеддингов для %d текстов.", len(texts))
+	if len(texts) == 0 {
+		log.Println("[Gemini WARN] GetEmbeddingsBatch: Получен пустой батч текстов.")
+		return [][]float32{}, nil
 	}
 
-	// Обрабатываем все сообщения, кроме последнего
-	processUpToIndex := len(messages) - 1
-	for i := 0; i < processUpToIndex; i++ {
-		msg := messages[i]
-		content := c.convertStorageMessageToGenaiContent(msg)
-		if content != nil {
-			history = append(history, content)
+	// Проверка на пустые строки внутри батча
+	for i, text := range texts {
+		if text == "" {
+			log.Printf("[Gemini WARN] GetEmbeddingsBatch: Обнаружена пустая строка в батче по индексу %d.", i)
+			// Можно вернуть ошибку или пропустить, но лучше вернуть ошибку, т.к. результат будет неполным/неожиданным.
+			return nil, fmt.Errorf("батч содержит пустую строку по индексу %d", i)
 		}
 	}
 
-	// Сохраняем текст последнего сообщения отдельно
-	lastMsg := messages[len(messages)-1]
-	if lastMsg.Text != "" {
-		role := lastMsg.Role
-		if role == "" {
-			role = "user"
-		}
+	// Используем EmbeddingModel из клиента genai
+	em := c.generativeClient.EmbeddingModel(c.embeddingModelName) // Используем правильное имя модели
+	batch := em.NewBatch()
+	for _, text := range texts {
+		batch.AddContent(genai.Text(text))
+	}
 
-		if role == "model" {
-			content := c.convertStorageMessageToGenaiContent(lastMsg)
-			if content != nil {
-				history = append(history, content)
-			}
+	// Логируем первый текст для примера (если батч не пустой)
+	log.Printf("[Gemini DEBUG] GetEmbeddingsBatch: Пример текста для эмбеддинга: \"%s...\"", truncateString(texts[0], 100))
+
+	res, err := em.BatchEmbedContents(ctx, batch)
+	if err != nil {
+		// Проверяем на специфичную ошибку квоты
+		if strings.Contains(err.Error(), "429") {
+			log.Printf("[Gemini ERROR QUOTA] GetEmbeddingsBatch: Достигнута квота API Gemini при получении эмбеддингов: %v", err)
 		} else {
-			lastMessageText = lastMsg.Text
+			log.Printf("[Gemini ERROR] GetEmbeddingsBatch: Ошибка при получении эмбеддингов: %v", err)
 		}
-
+		return nil, fmt.Errorf("ошибка получения эмбеддингов от Gemini: %w", err)
 	}
 
-	// Очистка истории от последовательных сообщений с одинаковой ролью (рекомендация Gemini)
-	if len(history) > 1 {
-		cleanedHistory := []*genai.Content{history[0]}
-		for i := 1; i < len(history); i++ {
-			if history[i].Role != cleanedHistory[len(cleanedHistory)-1].Role {
-				cleanedHistory = append(cleanedHistory, history[i])
-			} else {
-				// Объединяем текст, если роли совпадают
-				lastContent := cleanedHistory[len(cleanedHistory)-1]
-				var combinedText strings.Builder
-				for _, p := range lastContent.Parts {
-					combinedText.WriteString(fmt.Sprintf("%s", p))
-				}
-				combinedText.WriteString("\n") // Добавляем разделитель
-				for _, p := range history[i].Parts {
-					combinedText.WriteString(fmt.Sprintf("%s", p))
-				}
-				lastContent.Parts = []genai.Part{genai.Text(combinedText.String())}
-			}
-		}
-		history = cleanedHistory
+	if res == nil || len(res.Embeddings) != len(texts) {
+		log.Printf("[Gemini ERROR] GetEmbeddingsBatch: Получено неожиданное количество эмбеддингов. Ожидалось %d, получено %d.", len(texts), len(res.Embeddings))
+		return nil, fmt.Errorf("получено неожиданное количество эмбеддингов (%d) для %d текстов", len(res.Embeddings), len(texts))
 	}
 
-	return history, lastMessageText
+	embeddings := make([][]float32, len(texts))
+	for i, emb := range res.Embeddings {
+		if emb == nil {
+			log.Printf("[Gemini ERROR] GetEmbeddingsBatch: Получен nil эмбеддинг для текста %d.", i)
+			return nil, fmt.Errorf("получен nil эмбеддинг для текста %d", i)
+		}
+		if len(emb.Values) == 0 {
+			log.Printf("[Gemini ERROR] GetEmbeddingsBatch: Получен пустой эмбеддинг (вектор нулевой длины) для текста %d.", i)
+			return nil, fmt.Errorf("получен пустой эмбеддинг для текста %d", i)
+		}
+		embeddings[i] = emb.Values
+	}
+
+	log.Printf("[Gemini DEBUG] GetEmbeddingsBatch: Успешно получено %d эмбеддингов.", len(embeddings))
+	return embeddings, nil
 }
 
-// convertStorageMessageToGenaiContent преобразует одно types.Message
-func (c *Client) convertStorageMessageToGenaiContent(msg types.Message) *genai.Content {
-	if msg.Text == "" {
-		return nil
+// GenerateContent генерирует текст на основе промпта и истории сообщений.
+// Используем *config.GenerationSettings
+func (c *Client) GenerateContent(ctx context.Context, systemPrompt string, history []*genai.Content, lastMessage string, settings *config.GenerationSettings) (string, error) {
+	log.Printf("[Gemini DEBUG] GenerateContent: Запрос на генерацию контента. SystemPrompt: \"%s...\", History len: %d, LastMessage: \"%s...\"", truncateString(systemPrompt, 50), len(history), truncateString(lastMessage, 50))
+
+	genaiModel := c.generativeClient.GenerativeModel(c.modelName)
+
+	// Настройки через GenerationConfig
+	genaiModel.GenerationConfig = genai.GenerationConfig{}
+	if settings != nil {
+		if settings.Temperature != nil {
+			genaiModel.GenerationConfig.SetTemperature(*settings.Temperature)
+		}
+		if settings.TopP != nil {
+			genaiModel.GenerationConfig.SetTopP(*settings.TopP)
+		}
+		if settings.TopK != nil {
+			genaiModel.GenerationConfig.SetTopK(int32(*settings.TopK))
+		}
+		if settings.MaxOutputTokens != nil {
+			genaiModel.GenerationConfig.SetMaxOutputTokens(int32(*settings.MaxOutputTokens))
+		}
+		if len(settings.StopSequences) > 0 {
+			genaiModel.GenerationConfig.StopSequences = settings.StopSequences
+		}
 	}
 
-	role := msg.Role
-	if role == "" {
-		role = "user"
-	}
-	if role != "user" && role != "model" {
-		log.Printf("[WARN] Недопустимая роль '%s' в types.Message ID %d. Использую 'user'.", role, msg.ID)
-		role = "user"
+	// Формируем историю для запроса
+	var contents []*genai.Content // Используем слайс *genai.Content
+	// Если systemPrompt используется, его нужно задать отдельно:
+	if systemPrompt != "" {
+		genaiModel.SystemInstruction = &genai.Content{Parts: []genai.Part{genai.Text(systemPrompt)}}
 	}
 
-	return &genai.Content{
-		Parts: []genai.Part{genai.Text(msg.Text)},
-		Role:  role,
-	}
-}
+	// Добавляем history (предполагаем, что она уже содержит чередование user/model)
+	contents = append(contents, history...)
 
-// GenerateArbitraryResponse генерирует ответ на основе системного промпта и произвольного текстового контекста
-func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText string) (string, error) {
-	ctx := context.Background()
-	model := c.genaiClient.GenerativeModel(c.modelName)
-
-	// Используем те же настройки модели, что и в GenerateResponse
-	model.SetTemperature(1)
-	model.SetTopP(0.95)
-	model.SetMaxOutputTokens(8192)
-
-	// Формируем полный промпт
-	// В этом случае мы не используем историю чата, а передаем всё как один большой промпт.
-	// Системный промпт идет первым, затем контекст.
-	fullPrompt := systemPrompt + "\n\nКонтекст для анализа:\n" + contextText
-
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Полный промпт = %s...", truncateString(fullPrompt, 150))
-		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Модель %s, Temp: %v, TopP: %v, MaxTokens: %v",
-			c.modelName, model.Temperature, model.TopP, model.MaxOutputTokens)
+	// Добавляем последнее сообщение пользователя как отдельный Content
+	if lastMessage != "" {
+		contents = append(contents, &genai.Content{
+			Parts: []genai.Part{genai.Text(lastMessage)},
+			Role:  "user", // Явно указываем роль
+		})
 	}
 
-	// Отправляем сообщение (без истории чата)
-	resp, err := model.GenerateContent(ctx, genai.Text(fullPrompt))
+	// Начинаем сессию чата с переданной историей
+	cs := genaiModel.StartChat()
+	cs.History = contents // Устанавливаем историю сессии
+
+	// Отправляем пустой запрос, чтобы получить ответ модели на основе истории
+	resp, err := cs.SendMessage(ctx /* Пустая часть */)
+
 	if err != nil {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ошибка генерации (Arbitrary): %v", err)
+		if strings.Contains(err.Error(), "429") {
+			log.Printf("[Gemini ERROR QUOTA] GenerateContent: Достигнута квота API Gemini: %v", err)
+		} else {
+			log.Printf("[Gemini ERROR] GenerateContent: Ошибка генерации контента: %v", err)
 		}
 		return "", fmt.Errorf("ошибка генерации контента в Gemini: %w", err)
 	}
 
-	// Извлекаем ответ (аналогично GenerateResponse)
-	var responseText strings.Builder
-	if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
-		for _, part := range resp.Candidates[0].Content.Parts {
-			responseText.WriteString(fmt.Sprintf("%s", part))
-		}
-	} else {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ответ (Arbitrary): Получен пустой ответ или нет кандидатов.")
-		}
-		return "", fmt.Errorf("Gemini не вернул валидный ответ")
-	}
+	generatedText := extractTextFromResponse(resp)
+	log.Printf("[Gemini DEBUG] GenerateContent: Успешно сгенерирован ответ: \"%s...\"", truncateString(generatedText, 100))
 
-	finalResponse := responseText.String()
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Ответ (Arbitrary): %s...", truncateString(finalResponse, 100))
-	}
-
-	return finalResponse, nil
+	return generatedText, nil
 }
 
-// --- НОВАЯ ФУНКЦИЯ для Эмбеддингов ---
+// GenerateArbitraryContent генерирует текст на основе произвольного промпта (без истории).
+// Используем *config.ArbitraryGenerationSettings
+func (c *Client) GenerateArbitraryContent(ctx context.Context, prompt string, settings *config.ArbitraryGenerationSettings) (string, error) {
+	log.Printf("[Gemini DEBUG] GenerateArbitraryContent: Запрос на генерацию. Prompt: \"%s...\"", truncateString(prompt, 100))
+	genaiModel := c.generativeClient.GenerativeModel(c.modelName)
 
-// GetEmbedding получает векторное представление (эмбеддинг) для заданного текста.
-func (c *Client) GetEmbedding(text string) ([]float32, error) {
-	ctx := context.Background()
-	// Используем модель, специально предназначенную для эмбеддингов.
-	// "embedding-001" - стандартная модель Google для этого.
-	// Можно сделать имя модели для эмбеддингов настраиваемым в config, если потребуется.
-	embeddingModelName := "embedding-001"
-	em := c.genaiClient.EmbeddingModel(embeddingModelName)
-
-	if c.debug {
-		log.Printf("[DEBUG] Gemini GetEmbedding: Используется модель '%s' для текста: %s...", embeddingModelName, truncateString(text, 50))
+	// Настройки через GenerationConfig
+	genaiModel.GenerationConfig = genai.GenerationConfig{}
+	if settings != nil {
+		if settings.Temperature != nil {
+			genaiModel.GenerationConfig.SetTemperature(*settings.Temperature)
+		}
+		if settings.TopP != nil {
+			genaiModel.GenerationConfig.SetTopP(*settings.TopP)
+		}
+		if settings.TopK != nil {
+			genaiModel.GenerationConfig.SetTopK(int32(*settings.TopK))
+		}
+		if settings.MaxOutputTokens != nil {
+			genaiModel.GenerationConfig.SetMaxOutputTokens(int32(*settings.MaxOutputTokens))
+		}
+		if len(settings.StopSequences) > 0 {
+			genaiModel.GenerationConfig.StopSequences = settings.StopSequences
+		}
 	}
 
-	// Используем EmbeddingModel
-	res, err := em.EmbedContent(ctx, genai.Text(text))
+	resp, err := genaiModel.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ошибка получения эмбеддинга: %v, Текст: %s...", err, truncateString(text, 50))
+		if strings.Contains(err.Error(), "429") {
+			log.Printf("[Gemini ERROR QUOTA] GenerateArbitraryContent: Достигнута квота API Gemini: %v", err)
+		} else {
+			log.Printf("[Gemini ERROR] GenerateArbitraryContent: Ошибка генерации: %v", err)
 		}
-		return nil, fmt.Errorf("ошибка получения эмбеддинга от Gemini (%s): %w", embeddingModelName, err)
+		return "", fmt.Errorf("ошибка генерации произвольного контента в Gemini: %w", err)
 	}
 
-	if res == nil || res.Embedding == nil || len(res.Embedding.Values) == 0 {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Пустой эмбеддинг для текста: %s...", truncateString(text, 50))
-		}
-		// Возвращаем ошибку, чтобы не передавать пустой вектор в Qdrant
-		return nil, fmt.Errorf("получен пустой эмбеддинг от Gemini (%s)", embeddingModelName)
-	}
+	generatedText := extractTextFromResponse(resp)
+	log.Printf("[Gemini DEBUG] GenerateArbitraryContent: Успешно сгенерирован ответ: \"%s...\"", truncateString(generatedText, 100))
 
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Эмбеддинг получен. Размерность: %d, Текст: %s...", len(res.Embedding.Values), truncateString(text, 50))
-	}
-
-	return res.Embedding.Values, nil
+	return generatedText, nil
 }
 
-// --- Конец новой функции ---
+// --- Вспомогательные функции ---
 
-// Вспомогательная функция для обрезки строки
+// truncateString обрезает строку до maxLen, стараясь не рвать слова.
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen]
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	lastSpace := -1
+	// Ищем последний пробел, начиная с конца maxLen
+	limit := maxLen
+	if limit >= len(runes) {
+		limit = len(runes) - 1
+	}
+	for i := limit; i >= 0; i-- { // Итерация до 0
+		if runes[i] == ' ' {
+			lastSpace = i
+			break
+		}
+	}
+	// Обрезаем по последнему пробелу, если он найден и не в самом начале
+	if lastSpace > 0 {
+		return string(runes[:lastSpace]) + "..."
+	}
+	// Иначе обрезаем жестко по maxLen
+	return string(runes[:maxLen]) + "..."
+}
+
+// extractTextFromResponse извлекает текстовый контент из ответа Gemini API.
+func extractTextFromResponse(resp *genai.GenerateContentResponse) string {
+	var generatedText strings.Builder
+	if resp != nil && len(resp.Candidates) > 0 {
+		candidate := resp.Candidates[0] // Берем первого кандидата
+		if candidate.Content != nil && len(candidate.Content.Parts) > 0 {
+			for _, part := range candidate.Content.Parts {
+				if textPart, ok := part.(genai.Text); ok {
+					generatedText.WriteString(string(textPart))
+				} else {
+					log.Printf("[Gemini WARN] extractTextFromResponse: Обнаружена нетекстовая часть в ответе: %T", part)
+				}
+			}
+		} else {
+			// Логируем, если кандидат есть, но контент пуст
+			log.Printf("[Gemini WARN] extractTextFromResponse: Ответ кандидата не содержит контента или частей. FinishReason: %s", candidate.FinishReason)
+		}
+	} else {
+		log.Println("[Gemini WARN] extractTextFromResponse: Ответ пуст или не содержит кандидатов.")
+	}
+	return generatedText.String()
+}
+
+// Close закрывает клиент Gemini.
+func (c *Client) Close() error {
+	log.Println("[Gemini] Закрытие клиента...")
+	err := c.generativeClient.Close()
+	if err != nil {
+		log.Printf("[Gemini ERROR] Ошибка при закрытии клиента: %v", err)
+		return fmt.Errorf("ошибка закрытия клиента Gemini: %w", err)
+	}
+	log.Println("[Gemini] Клиент успешно закрыт.")
+	return nil
 }
