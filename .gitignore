@@ -66,3 +66,7 @@ Thumbs.db
 
 # Конфигурационный файл Amvera (не нужен при использовании Dockerfile)
 amvera.yaml 
+
+# Папка с данными истории и большие JSON файлы
+data/
+*.json 
