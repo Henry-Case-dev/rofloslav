@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/deepseek"
 	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
+	"github.com/Henry-Case-dev/rofloslav/internal/llm"
 	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -19,7 +21,7 @@ import (
 // Bot представляет Telegram бота
 type Bot struct {
 	api                *tgbotapi.BotAPI
-	gemini             *gemini.Client
+	llm                llm.LLMClient
 	storage            *storage.Storage
 	config             *config.Config
 	chatSettings       map[int64]*ChatSettings
@@ -74,17 +76,35 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil, fmt.Errorf("ошибка инициализации Telegram API: %w", err)
 	}
 
-	// Используем новый конструктор Gemini клиента
-	geminiClient, err := gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.Debug)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка инициализации Gemini Client: %w", err)
-	}
+	// --- Инициализация LLM клиента ---
+	var llmClient llm.LLMClient // Используем тип интерфейса
+	var llmErr error
 
-	storage := storage.New(cfg.ContextWindow, true) // Включаем автосохранение истории на диск
+	log.Printf("Выбранный LLM провайдер: %s", cfg.LLMProvider)
+
+	switch cfg.LLMProvider {
+	case config.ProviderGemini:
+		llmClient, llmErr = gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.Debug)
+		if llmErr != nil {
+			return nil, fmt.Errorf("ошибка инициализации Gemini Client: %w", llmErr)
+		}
+	case config.ProviderDeepSeek:
+		llmClient, llmErr = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekModelName, cfg.DeepSeekBaseURL, cfg.Debug)
+		if llmErr != nil {
+			return nil, fmt.Errorf("ошибка инициализации DeepSeek Client: %w", llmErr)
+		}
+	default:
+		// По идее, сюда не должны попасть из-за валидации в config.Load, но на всякий случай
+		return nil, fmt.Errorf("неизвестный LLM провайдер в конфигурации: %s", cfg.LLMProvider)
+	}
+	log.Println("--- LLM Client Initialized ---")
+	// --- Конец инициализации LLM клиента ---
+
+	storage := storage.New(cfg.ContextWindow, true) // Включаем автосохранение истории
 
 	bot := &Bot{
 		api:                api,
-		gemini:             geminiClient,
+		llm:                llmClient,
 		storage:            storage,
 		config:             cfg,
 		chatSettings:       make(map[int64]*ChatSettings),
@@ -131,9 +151,11 @@ func (b *Bot) Stop() {
 	log.Println("Остановка бота...")
 	close(b.stop) // Сигнал для остановки горутин
 
-	// Закрываем клиент Gemini
-	if err := b.gemini.Close(); err != nil {
-		log.Printf("Ошибка при закрытии клиента Gemini: %v", err)
+	// Закрываем LLM клиент
+	if b.llm != nil { // Проверяем, что клиент был инициализирован
+		if err := b.llm.Close(); err != nil {
+			log.Printf("Ошибка при закрытии LLM клиента: %v", err)
+		}
 	}
 
 	// Сохраняем все истории перед выходом (ВОССТАНОВЛЕНО)
@@ -587,11 +609,11 @@ func (b *Bot) sendAIResponse(chatID int64) {
 	}
 
 	// Отправляем запрос к Gemini
-	response, err := b.gemini.GenerateResponse(prompt, messages)
+	response, err := b.llm.GenerateResponse(prompt, messages)
 	if err != nil {
 		if b.config.Debug {
 			log.Printf("[DEBUG] Ошибка при генерации ответа: %v. Полный текст ошибки: %s", err, err.Error())
-			log.Printf("[DEBUG] API ключ: %s... (первые 5 символов)", b.config.GeminiAPIKey[:5])
+			log.Printf("[DEBUG] LLM Provider: %s", b.config.LLMProvider)
 		} else {
 			log.Printf("Ошибка при генерации ответа: %v", err)
 		}
@@ -635,7 +657,7 @@ func (b *Bot) generateSummary(chatID int64) {
 		}
 
 		// Отправляем запрос к Gemini с промптом для саммари
-		summary, err := b.gemini.GenerateResponse(summaryPrompt, messages)
+		summary, err := b.llm.GenerateResponse(summaryPrompt, messages)
 		if err != nil {
 			lastErr = err // Сохраняем последнюю ошибку
 			if b.config.Debug {
@@ -803,11 +825,11 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 	messages := b.storage.GetMessages(chatID)
 
 	// Для прямого ответа используем только DIRECT_PROMPT
-	response, err := b.gemini.GenerateResponse(b.config.DirectPrompt, messages)
+	response, err := b.llm.GenerateResponse(b.config.DirectPrompt, messages)
 	if err != nil {
 		if b.config.Debug {
 			log.Printf("[DEBUG] Ошибка при генерации прямого ответа: %v. Полный текст ошибки: %s", err, err.Error())
-			log.Printf("[DEBUG] API ключ: %s... (первые 5 символов)", b.config.GeminiAPIKey[:5])
+			log.Printf("[DEBUG] LLM Provider: %s", b.config.LLMProvider)
 			log.Printf("[DEBUG] Промпт для прямого ответа: %s", b.config.DirectPrompt)
 			log.Printf("[DEBUG] Количество сообщений в контексте: %d", len(messages))
 		} else {
@@ -878,11 +900,11 @@ func (b *Bot) sendDailyTakeToAllChats() {
 	dailyTakePrompt := b.config.DailyTakePrompt
 
 	// Генерируем тейк с промптом
-	take, err := b.gemini.GenerateResponse(dailyTakePrompt, nil)
+	take, err := b.llm.GenerateResponse(dailyTakePrompt, nil)
 	if err != nil {
 		if b.config.Debug {
 			log.Printf("[DEBUG] Ошибка при генерации ежедневного тейка: %v. Полный текст ошибки: %s", err, err.Error())
-			log.Printf("[DEBUG] API ключ: %s... (первые 5 символов)", b.config.GeminiAPIKey[:5])
+			log.Printf("[DEBUG] LLM Provider: %s", b.config.LLMProvider)
 			log.Printf("[DEBUG] Промпт для тейка: %s", dailyTakePrompt)
 		} else {
 			log.Printf("Ошибка при генерации ежедневного тейка: %v", err)
@@ -1209,7 +1231,7 @@ func (b *Bot) analyseSrach(chatID int64) {
 		err = fmt.Errorf("SRACH_ANALYSIS_PROMPT is empty")
 	} else {
 		// Вызываем новую функцию Gemini клиента
-		analysisResult, err = b.gemini.GenerateArbitraryResponse(analysisPrompt, srachHistory)
+		analysisResult, err = b.llm.GenerateArbitraryResponse(analysisPrompt, srachHistory)
 	}
 	// --------------------------
 
@@ -1360,7 +1382,7 @@ func (b *Bot) confirmSrachWithLLM(chatID int64, messageText string) bool {
 	}
 
 	// Используем GenerateArbitraryResponse без истории, только промпт + текст сообщения
-	response, err := b.gemini.GenerateArbitraryResponse(fullPrompt, "") // Передаем пустой контекст, т.к. он уже в промпте
+	response, err := b.llm.GenerateArbitraryResponse(fullPrompt, "") // Передаем пустой контекст, т.к. он уже в промпте
 	if err != nil {
 		log.Printf("[ERROR] Чат %d: Ошибка LLM при подтверждении срача: %v", chatID, err)
 		return false // В случае ошибки считаем, что не срач
