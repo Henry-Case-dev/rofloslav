@@ -61,11 +61,14 @@ func getSettingsKeyboard(settings *ChatSettings) tgbotapi.InlineKeyboardMarkup {
 	rows := [][]tgbotapi.InlineKeyboardButton{}
 
 	// 1. Статус бота (Вкл/Выкл) - Используем поле Active
-	statusText, statusCallback := formatEnabled("Бот", "Бот", settings.Active, "toggle_active", "toggle_active")
-	statusRow := []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData(statusText, statusCallback),
-	}
-	rows = append(rows, statusRow)
+	// УБИРАЕМ ЭТУ КНОПКУ ИЗ НАСТРОЕК
+	/*
+		statusText, statusCallback := formatEnabled("Бот", "Бот", settings.Active, "toggle_active", "toggle_active")
+		statusRow := []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData(statusText, statusCallback),
+		}
+		rows = append(rows, statusRow)
+	*/
 
 	// 2. Интервал сообщений - Используем MinMessages и MaxMessages
 	intervalText := fmt.Sprintf("Интервал: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)

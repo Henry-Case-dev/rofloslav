@@ -82,7 +82,9 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		b.sendSettingsKeyboard(chatID)
 
 	case "menu": // Добавляем обработку /menu
-		b.sendReplyWithKeyboard(chatID, "Главное меню:", getMainKeyboard())
+		// Добавляем информацию о модели
+		modelInfo := fmt.Sprintf("Текущая модель: %s (%s)", b.config.LLMProvider, b.getCurrentModelName())
+		b.sendReplyWithKeyboard(chatID, "Главное меню:\n"+modelInfo, getMainKeyboard())
 
 	case "srach": // Добавляем обработку /srach
 		b.toggleSrachAnalysis(chatID)

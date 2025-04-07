@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -41,8 +42,9 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		b.settingsMutex.Unlock()
 
-		// Отправляем основное меню
-		b.sendReplyWithKeyboard(chatID, "Бот готов к работе!", getMainKeyboard())
+		// Отправляем основное меню С ИНФОРМАЦИЕЙ О МОДЕЛИ
+		modelInfo := fmt.Sprintf("Текущая модель: %s (%s)", b.config.LLMProvider, b.getCurrentModelName())
+		b.sendReplyWithKeyboard(chatID, "Бот готов к работе!\n"+modelInfo, getMainKeyboard())
 		b.answerCallback(callback.ID, "") // Отвечаем на колбэк
 		return                            // Выходим, дальнейшая обработка не нужна
 
@@ -86,24 +88,65 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		return // Выходим
 
 	// Новые коллбэки для управления анализом срачей
-	case "toggle_srach_on":
-		b.setSrachAnalysis(chatID, true)
-		b.answerCallback(callback.ID, "🔥 Анализ срачей включен")
-		b.updateSettingsKeyboard(callback) // Обновляем сообщение с клавиатурой
-		return                             // Выходим, дальнейшая обработка не нужна
-	case "toggle_srach_off":
-		b.setSrachAnalysis(chatID, false)
-		b.answerCallback(callback.ID, "💀 Анализ срачей выключен")
-		b.updateSettingsKeyboard(callback) // Обновляем сообщение с клавиатурой
-		return                             // Выходим, дальнейшая обработка не нужна
+	case "toggle_srach_analysis": // Используем одно имя для переключения
+		b.settingsMutex.Lock()
+		if settings, exists := b.chatSettings[chatID]; exists {
+			settings.SrachAnalysisEnabled = !settings.SrachAnalysisEnabled
+			log.Printf("Чат %d: Анализ срачей переключен на %s", chatID, getEnabledStatusText(settings.SrachAnalysisEnabled))
+			// Сбрасываем состояние срача при переключении
+			settings.SrachState = "none"
+			settings.SrachMessages = nil
+			b.answerCallback(callback.ID, fmt.Sprintf("Анализ срачей: %s", getEnabledStatusText(settings.SrachAnalysisEnabled)))
+		} else {
+			b.answerCallback(callback.ID, "Ошибка: Настройки чата не найдены")
+		}
+		b.settingsMutex.Unlock()
+		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
+		return
+
+	// --- Восстановленные/Добавленные обработчики кнопок настроек ---
+	case "toggle_active": // Вкл/Выкл бота (оставляем логику на случай, если кнопка вернется, но из меню уберем)
+		b.settingsMutex.Lock()
+		if settings, exists := b.chatSettings[chatID]; exists {
+			settings.Active = !settings.Active
+			log.Printf("Чат %d: Активность бота переключена на %t", chatID, settings.Active)
+			b.answerCallback(callback.ID, fmt.Sprintf("Бот теперь %s", map[bool]string{true: "активен", false: "неактивен"}[settings.Active]))
+		} else {
+			b.answerCallback(callback.ID, "Ошибка: Настройки чата не найдены")
+		}
+		b.settingsMutex.Unlock()
+		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
+		return
+
+	case "change_interval":
+		settingToSet = "min_messages" // Начинаем с запроса минимального значения
+		promptText = b.config.PromptEnterMinMessages
+		// Удаляем старое меню перед запросом
+		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
+		b.api.Request(deleteMsg)
+
+	case "change_daily_time":
+		settingToSet = "daily_time"
+		promptText = fmt.Sprintf(b.config.PromptEnterDailyTime, b.config.TimeZone) // Подставляем часовой пояс
+		// Удаляем старое меню перед запросом
+		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
+		b.api.Request(deleteMsg)
+
+	case "change_summary_interval":
+		settingToSet = "summary_interval"
+		promptText = b.config.PromptEnterSummaryInterval
+		// Удаляем старое меню перед запросом
+		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
+		b.api.Request(deleteMsg)
 
 	default:
-		log.Printf("Неизвестный callback data: %s", callback.Data)
-		b.answerCallback(callback.ID, "Неизвестное действие")
+		log.Printf("Неизвестный callback data: %s от пользователя %d в чате %d", callback.Data, callback.From.ID, chatID)
+		b.answerCallback(callback.ID, "Неизвестное действие") // Сообщаем пользователю
+		// Не обновляем клавиатуру, так как действие неизвестно
 		return // Выходим
 	}
 
-	// Если мы дошли сюда, значит, была нажата кнопка "Установить..."
+	// Если мы дошли сюда, значит, была нажата кнопка "change_..." для установки значения
 	if settingToSet != "" {
 		b.settingsMutex.Lock()
 		if settings, exists := b.chatSettings[chatID]; exists {
@@ -118,5 +161,16 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		// Затем отправляем промпт
 		b.sendReply(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
 		b.answerCallback(callback.ID, "Ожидаю ввода...")
+	}
+}
+
+func (b *Bot) getCurrentModelName() string {
+	switch b.config.LLMProvider {
+	case config.ProviderGemini:
+		return b.config.GeminiModelName
+	case config.ProviderDeepSeek:
+		return b.config.DeepSeekModelName
+	default:
+		return "Неизвестная модель"
 	}
 }
