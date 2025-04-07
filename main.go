@@ -12,8 +12,11 @@ import (
 
 // handleRoot - простой обработчик HTTP запросов
 func handleRoot(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Received HTTP request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	// Логируем каждый входящий запрос к этому обработчику
+	log.Printf("--> HTTP Request Received: Method=%s, Path=%s, RemoteAddr=%s", r.Method, r.URL.Path, r.RemoteAddr)
 	fmt.Fprintf(w, "Hello from Rofloslav Bot server!")
+	// Логируем после отправки ответа
+	log.Printf("<-- HTTP Response Sent for: %s %s", r.Method, r.URL.Path)
 }
 
 func main() {
@@ -51,9 +54,14 @@ func main() {
 	log.Printf("--- Starting HTTP server on %s ---", serverAddr)
 
 	go func() {
+		// Логируем перед запуском сервера
+		log.Printf("[HTTP Goroutine] Attempting to start HTTP server on %s", serverAddr)
 		if httpErr := http.ListenAndServe(serverAddr, nil); httpErr != nil {
-			log.Printf("!!! HTTP Server Error: %v", httpErr)
+			// Логируем ошибку, если ListenAndServe вернул ее
+			log.Printf("!!! [HTTP Goroutine] HTTP Server Error: %v", httpErr)
 		}
+		// Логируем, если ListenAndServe завершился (даже без ошибки, хотя это маловероятно)
+		log.Printf("[HTTP Goroutine] ListenAndServe on %s finished.", serverAddr)
 	}()
 	// Добавляем лог сразу после запуска горутины
 	log.Printf("--- HTTP Server Goroutine Launched on %s ---", serverAddr)
