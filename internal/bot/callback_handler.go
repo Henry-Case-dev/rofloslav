@@ -35,18 +35,29 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	case "back_to_main":
 		b.settingsMutex.Lock()
 		// Сбрасываем ожидание ввода при выходе из настроек
+		// и получаем ID сообщения с настройками для удаления
+		var lastSettingsMsgID int
 		if settings, exists := b.chatSettings[chatID]; exists {
 			settings.PendingSetting = ""
-			deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID) // Удаляем само меню настроек
-			b.api.Request(deleteMsg)
+			lastSettingsMsgID = settings.LastSettingsMessageID // Используем сохраненный ID
+			settings.LastSettingsMessageID = 0                 // Сбрасываем ID после использования
+			// Удаляем само сообщение с настройками, если ID совпадает с callback.Message.MessageID
+			// (на случай, если lastSettingsMsgID не был сохранен правильно)
+			if lastSettingsMsgID == 0 || lastSettingsMsgID != callback.Message.MessageID {
+				log.Printf("[WARN] LastSettingsMessageID (%d) не совпадает с callback.Message.MessageID (%d) для чата %d. Удаляю callback.Message",
+					lastSettingsMsgID, callback.Message.MessageID, chatID)
+				lastSettingsMsgID = callback.Message.MessageID // Используем ID из колбэка как запасной вариант
+			}
+		} else {
+			// Если настроек нет, все равно пытаемся удалить сообщение из колбэка
+			lastSettingsMsgID = callback.Message.MessageID
 		}
 		b.settingsMutex.Unlock()
 
-		// Отправляем основное меню С ИНФОРМАЦИЕЙ О МОДЕЛИ
-		modelInfo := fmt.Sprintf("Текущая модель: %s (%s)", b.config.LLMProvider, b.getCurrentModelName())
-		b.sendReplyWithKeyboard(chatID, "Бот готов к работе!\n"+modelInfo, getMainKeyboard())
-		b.answerCallback(callback.ID, "") // Отвечаем на колбэк
-		return                            // Выходим, дальнейшая обработка не нужна
+		// Отправляем основное меню, передавая ID старого меню настроек для удаления
+		b.sendMainMenu(chatID, lastSettingsMsgID) // ID нового меню сохранится внутри sendMainMenu
+		b.answerCallback(callback.ID, "")         // Отвечаем на колбэк
+		return                                    // Выходим, дальнейшая обработка не нужна
 
 	case "summary": // Обработка кнопки саммари из основного меню
 		b.answerCallback(callback.ID, "Запрашиваю саммари...")
@@ -66,12 +77,12 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		return                       // Выходим
 
 	case "settings": // Обработка кнопки настроек из основного меню
-		// Удаляем сообщение с основным меню
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
-		b.sendSettingsKeyboard(chatID)
-		b.answerCallback(callback.ID, "") // Отвечаем на колбэк
-		return                            // Выходим
+		// Удаляем сообщение с основным меню (его ID берем из callback)
+		lastMainMenuMsgID := callback.Message.MessageID
+		// Отправляем клавиатуру настроек, передавая ID старого главного меню
+		b.sendSettingsKeyboard(chatID, lastMainMenuMsgID) // ID нового меню сохранится внутри sendSettingsKeyboard
+		b.answerCallback(callback.ID, "")                 // Отвечаем на колбэк
+		return                                            // Выходим
 
 	case "stop": // Обработка кнопки паузы из основного меню
 		b.settingsMutex.Lock()
@@ -85,7 +96,8 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		// Отправляем текстовое подтверждение
 		b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
 		b.answerCallback(callback.ID, "Бот остановлен")
-		return // Выходим
+		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
+		return                             // Выходим
 
 	// Новые коллбэки для управления анализом срачей
 	case "toggle_srach_analysis": // Используем одно имя для переключения
@@ -121,23 +133,20 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	case "change_interval":
 		settingToSet = "min_messages" // Начинаем с запроса минимального значения
 		promptText = b.config.PromptEnterMinMessages
-		// Удаляем старое меню перед запросом
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
+		// Удаляем старое меню настроек перед запросом
+		b.deleteMessage(chatID, callback.Message.MessageID)
 
 	case "change_daily_time":
 		settingToSet = "daily_time"
 		promptText = fmt.Sprintf(b.config.PromptEnterDailyTime, b.config.TimeZone) // Подставляем часовой пояс
-		// Удаляем старое меню перед запросом
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
+		// Удаляем старое меню настроек перед запросом
+		b.deleteMessage(chatID, callback.Message.MessageID)
 
 	case "change_summary_interval":
 		settingToSet = "summary_interval"
 		promptText = b.config.PromptEnterSummaryInterval
-		// Удаляем старое меню перед запросом
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
+		// Удаляем старое меню настроек перед запросом
+		b.deleteMessage(chatID, callback.Message.MessageID)
 
 	default:
 		log.Printf("Неизвестный callback data: %s от пользователя %d в чате %d", callback.Data, callback.From.ID, chatID)
@@ -151,16 +160,42 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		b.settingsMutex.Lock()
 		if settings, exists := b.chatSettings[chatID]; exists {
 			settings.PendingSetting = settingToSet // Устанавливаем ожидание
+		} else {
+			// Если настроек нет, то и сохранять PendingSetting некуда
+			log.Printf("[WARN] Настройки для чата %d не найдены при попытке установить PendingSetting.", chatID)
+			b.settingsMutex.Unlock()
+			b.answerCallback(callback.ID, "Ошибка: не удалось найти настройки чата.")
+			return // Прерываем, так как не можем продолжить
 		}
-		b.settingsMutex.Unlock()
+		b.settingsMutex.Unlock() // Разблокируем перед отправкой
 
 		// Отправляем сообщение с запросом ввода
-		// Сначала удаляем старое меню настроек
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
-		// Затем отправляем промпт
-		b.sendReply(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
-		b.answerCallback(callback.ID, "Ожидаю ввода...")
+		// Старое меню настроек уже удалено выше по коду для change_*
+		promptMsg := tgbotapi.NewMessage(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
+		sentMsg, err := b.api.Send(promptMsg)
+		if err != nil {
+			log.Printf("Ошибка отправки промпта для ввода настройки '%s' в чат %d: %v", settingToSet, chatID, err)
+			b.answerCallback(callback.ID, "Ошибка при запросе ввода.")
+			// Сбрасываем PendingSetting, так как не смогли запросить ввод
+			b.settingsMutex.Lock()
+			if settings, exists := b.chatSettings[chatID]; exists {
+				settings.PendingSetting = ""
+			}
+			b.settingsMutex.Unlock()
+		} else {
+			// Сохраняем ID отправленного информационного сообщения
+			b.settingsMutex.Lock()
+			if settings, exists := b.chatSettings[chatID]; exists {
+				settings.LastInfoMessageID = sentMsg.MessageID
+				if b.config.Debug {
+					log.Printf("[DEBUG] Сохранен LastInfoMessageID: %d для чата %d (запрос '%s')", sentMsg.MessageID, chatID, settingToSet)
+				}
+			} else {
+				log.Printf("[WARN] Настройки для чата %d не найдены при попытке сохранить LastInfoMessageID.", chatID)
+			}
+			b.settingsMutex.Unlock()
+			b.answerCallback(callback.ID, "Ожидаю ввода...")
+		}
 	}
 }
 

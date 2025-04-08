@@ -40,12 +40,27 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 	b.settingsMutex.RUnlock()
 	if text == "/cancel" && currentPendingSetting != "" {
 		log.Printf("[DEBUG][MH] Chat %d: Handling /cancel for pending setting '%s'.", chatID, currentPendingSetting)
+		// Получаем ID сообщения с промптом ДО сброса PendingSetting
+		var lastInfoMsgID int
 		b.settingsMutex.Lock()
-		settings.PendingSetting = "" // Сбрасываем ожидание
+		if settings, exists := b.chatSettings[chatID]; exists {
+			lastInfoMsgID = settings.LastInfoMessageID
+			settings.PendingSetting = ""   // Сбрасываем ожидание
+			settings.LastInfoMessageID = 0 // Сбрасываем ID промпта
+		}
 		b.settingsMutex.Unlock()
 		log.Printf("[DEBUG][MH] Chat %d: Pending setting reset.", chatID)
+
+		// Удаляем сообщение с промптом (если был ID)
+		if lastInfoMsgID != 0 {
+			b.deleteMessage(chatID, lastInfoMsgID)
+		}
+		// Удаляем сообщение пользователя с /cancel
+		b.deleteMessage(chatID, message.MessageID)
+
 		b.sendReply(chatID, "Ввод отменен.")
-		b.sendSettingsKeyboard(chatID) // Показываем меню настроек снова
+		// ID сообщения с настройками будет 0, т.к. мы удалили исходное сообщение и не можем передать его ID
+		b.sendSettingsKeyboard(chatID, 0) // Показываем меню настроек снова
 		log.Printf("[DEBUG][MH] Chat %d: Exiting handleMessage after /cancel.", chatID)
 		return
 	}
@@ -56,6 +71,7 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		log.Printf("[DEBUG][MH] Chat %d: Handling input for pending setting '%s'. Input: '%s'", chatID, currentPendingSetting, text)
 		isValidInput := false
 		parsedValue, err := strconv.Atoi(text)
+		var lastInfoMsgID int // Для удаления сообщения с промптом
 
 		if err != nil {
 			log.Printf("[DEBUG][MH] Chat %d: Input parsing error: %v", chatID, err)
@@ -76,7 +92,30 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 					log.Printf("[DEBUG][MH] Chat %d: MinMessages set to %d. Requesting MaxMessages.", chatID, parsedValue)
 					b.settingsMutex.Unlock() // Разблокируем перед отправкой ответа
 					log.Printf("[DEBUG][MH] Chat %d: Settings mutex unlocked before sending MaxMessages prompt.", chatID)
-					b.sendReply(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
+					// Удаляем сообщение с промптом MinMessages И сообщение пользователя с вводом
+					if lastInfoMsgID != 0 {
+						b.deleteMessage(chatID, lastInfoMsgID)
+					}
+					b.deleteMessage(chatID, message.MessageID)
+					// Отправляем новый промпт и сохраняем его ID
+					promptMsg := tgbotapi.NewMessage(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
+					sentMsg, sendErr := b.api.Send(promptMsg)
+					if sendErr != nil {
+						log.Printf("Ошибка отправки промпта MaxMessages: %v", sendErr)
+						// Пытаемся откатить PendingSetting
+						b.settingsMutex.Lock()
+						if settings, exists := b.chatSettings[chatID]; exists {
+							settings.PendingSetting = "" // Отменяем ожидание
+						}
+						b.settingsMutex.Unlock()
+					} else {
+						// Сохраняем ID нового промпта
+						b.settingsMutex.Lock()
+						if settings, exists := b.chatSettings[chatID]; exists {
+							settings.LastInfoMessageID = sentMsg.MessageID
+						}
+						b.settingsMutex.Unlock()
+					}
 					// Важно: Не показываем меню настроек здесь, так как ждем следующего ввода
 					log.Printf("[DEBUG][MH] Chat %d: Exiting handleMessage, waiting for MaxMessages input.", chatID)
 					return // Выходим, чтобы дождаться ввода максимального значения
@@ -124,10 +163,17 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			b.settingsMutex.Unlock() // Разблокируем после изменения
 			log.Printf("[DEBUG][MH] Chat %d: Settings mutex unlocked after update.", chatID)
 
+			// Удаляем сообщение с промптом и сообщение пользователя с вводом
+			if lastInfoMsgID != 0 {
+				b.deleteMessage(chatID, lastInfoMsgID)
+			}
+			b.deleteMessage(chatID, message.MessageID)
+
 			// Показываем обновленное меню только если настройка завершена (не после min_messages)
 			if isValidInput && currentPendingSetting != "min_messages" {
 				log.Printf("[DEBUG][MH] Chat %d: Showing updated settings keyboard.", chatID)
-				b.sendSettingsKeyboard(chatID) // Показываем обновленное меню
+				// ID предыдущего сообщения (промпта или ввода) уже удалено, передаем 0
+				b.sendSettingsKeyboard(chatID, 0) // Показываем обновленное меню
 			}
 		}
 		log.Printf("[DEBUG][MH] Chat %d: Exiting handleMessage after processing pending setting.", chatID)

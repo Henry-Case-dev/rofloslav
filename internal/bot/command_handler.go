@@ -1,97 +1,93 @@
 package bot
 
 import (
-	"fmt"
 	"log"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+const summaryRequestInterval = 10 * time.Minute // Ограничение на вызов /summary
+
 // handleCommand обрабатывает команды
 func (b *Bot) handleCommand(message *tgbotapi.Message) {
 	command := message.Command()
 	chatID := message.Chat.ID
 
+	// Get current settings for the chat
+	b.settingsMutex.RLock()
+	settings, exists := b.chatSettings[chatID]
+	if !exists {
+		// If settings don't exist, they should be created in handleUpdate before this
+		log.Printf("[ERROR][CmdHandler] Chat %d: Settings not found for command /%s", chatID, command)
+		b.settingsMutex.RUnlock()
+		return
+	}
+	lastMenuMsgID := settings.LastMenuMessageID
+	lastSettingsMsgID := settings.LastSettingsMessageID
+	lastInfoMsgID := settings.LastInfoMessageID
+	b.settingsMutex.RUnlock()
+
+	// Delete the command message itself to keep the chat clean
+	b.deleteMessage(chatID, message.MessageID)
+
 	switch command {
 	case "start":
-		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.Active = true
-		}
-		b.settingsMutex.Unlock()
-
-		b.sendReplyWithKeyboard(chatID, "Бот запущен и готов к работе!", getMainKeyboard())
-
-	case "stop":
-		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.Active = false
-		}
-		b.settingsMutex.Unlock()
-
-		b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
-
+		// Usually handled by ensureChatInitializedAndWelcome
+		// Send main menu anyway
+		b.sendMainMenu(chatID, lastMenuMsgID)
+	case "menu":
+		b.sendMainMenu(chatID, lastMenuMsgID)
+	case "settings":
+		b.sendSettingsKeyboard(chatID, lastSettingsMsgID)
 	case "summary":
-		// Проверяем ограничение по времени
-		b.summaryMutex.RLock()
-		lastRequestTime, ok := b.lastSummaryRequest[chatID]
-		b.summaryMutex.RUnlock()
-
-		// Ограничение в 10 минут
-		const rateLimitDuration = 10 * time.Minute
-		timeSinceLastRequest := time.Since(lastRequestTime)
-
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: /summary вызван. Последний запрос был: %v (ok=%t). Прошло: %s. Лимит: %s.",
-				chatID, lastRequestTime, ok, timeSinceLastRequest.Round(time.Second), rateLimitDuration)
-			log.Printf("[DEBUG] Чат %d: Сравниваем %s < %s ?", chatID, timeSinceLastRequest.Round(time.Second), rateLimitDuration)
-			log.Printf("[DEBUG] Чат %d: Сообщение об ошибке из конфига: '%s'", chatID, b.config.RateLimitErrorMessage)
-		}
-
-		if ok && timeSinceLastRequest < rateLimitDuration {
-			remainingTime := rateLimitDuration - timeSinceLastRequest
-			// Формируем сообщение
-			errorMsgText := b.config.RateLimitErrorMessage // Получаем текст из конфига
-			fullErrorMsg := fmt.Sprintf("%s Осталось подождать: %s.",
-				errorMsgText, // Используем полученный текст
-				remainingTime.Round(time.Second).String(),
-			)
-			if b.config.Debug {
-				log.Printf("[DEBUG] Чат %d: Rate limit активен. Текст ошибки из конфига: '%s'. Формированное сообщение: '%s'", chatID, errorMsgText, fullErrorMsg)
+		// Check rate limit
+		now := time.Now()
+		b.summaryMutex.Lock() // Используем мьютекс для lastSummaryRequest
+		lastReq, ok := b.lastSummaryRequest[chatID]
+		if ok && now.Sub(lastReq) < summaryRequestInterval {
+			log.Printf("[DEBUG] Чат %d: /summary отклонен из-за rate limit. Прошло: %v < %v", chatID, now.Sub(lastReq), summaryRequestInterval)
+			b.summaryMutex.Unlock()
+			// --- Удаляем предыдущее инфо-сообщение перед отправкой нового ---
+			if lastInfoMsgID != 0 {
+				b.deleteMessage(chatID, lastInfoMsgID)
 			}
-			// Отправляем сформированное сообщение
-			b.sendReply(chatID, fullErrorMsg)
+			// --- Отправляем сообщение об ошибке и сохраняем его ID ---
+			msg := tgbotapi.NewMessage(chatID, b.config.RateLimitErrorMessage)
+			sentMsg, err := b.api.Send(msg)
+			if err == nil {
+				b.settingsMutex.Lock()
+				settings.LastInfoMessageID = sentMsg.MessageID // Обновляем settings через RLock/Lock
+				b.settingsMutex.Unlock()
+			}
 			return
 		}
-
-		// Если ограничение прошло или запроса еще не было, обновляем время и генерируем саммари
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Rate limit пройден. Обновляю время последнего запроса на %v.", chatID, time.Now())
-		}
-		b.summaryMutex.Lock()
-		b.lastSummaryRequest[chatID] = time.Now()
+		// Update last request time
+		b.lastSummaryRequest[chatID] = now
 		b.summaryMutex.Unlock()
 
-		if b.config.Debug {
-			log.Printf("[DEBUG] Чат %d: Начинаю генерацию саммари (после обновления времени).", chatID)
+		log.Printf("[DEBUG] Чат %d: /summary вызван. Последний запрос был: %v (ok=%t). Прошло: %v. Лимит: %v.",
+			chatID, lastReq, ok, now.Sub(lastReq), summaryRequestInterval)
+
+		// --- Удаляем предыдущее инфо-сообщение перед отправкой нового ---
+		if lastInfoMsgID != 0 {
+			b.deleteMessage(chatID, lastInfoMsgID)
 		}
-		go b.generateSummary(chatID) // Запускаем в горутине, чтобы не блокировать
+		// --- Отправляем сообщение о начале генерации и сохраняем его ID ---
+		msg := tgbotapi.NewMessage(chatID, "Генерирую саммари, подождите...")
+		sentMsg, err := b.api.Send(msg)
+		if err == nil {
+			b.settingsMutex.Lock()
+			settings.LastInfoMessageID = sentMsg.MessageID // Обновляем settings через RLock/Lock
+			b.settingsMutex.Unlock()
+		} else {
+			log.Printf("[ERROR] Ошибка отправки сообщения 'Генерирую саммари...' в чат %d: %v", chatID, err)
+		}
 
-	case "settings":
-		b.sendSettingsKeyboard(chatID)
-
-	case "menu": // Добавляем обработку /menu
-		// Добавляем информацию о модели
-		modelInfo := fmt.Sprintf("Текущая модель: %s (%s)", b.config.LLMProvider, b.getCurrentModelName())
-		b.sendReplyWithKeyboard(chatID, "Главное меню:\n"+modelInfo, getMainKeyboard())
-
-	case "srach": // Добавляем обработку /srach
-		b.toggleSrachAnalysis(chatID)
-		b.sendSettingsKeyboard(chatID) // Показываем обновленное меню настроек
-
-		// Можно добавить default для неизвестных команд
-		// default:
-		// 	b.sendReply(chatID, "Неизвестная команда.")
+		// Запускаем генерацию в горутине
+		go b.createAndSendSummary(chatID)
+	default:
+		log.Printf("Неизвестная команда: %s от пользователя %d в чате %d", command, message.From.ID, chatID)
+		// Можно отправить сообщение об ошибке или проигнорировать
 	}
 }

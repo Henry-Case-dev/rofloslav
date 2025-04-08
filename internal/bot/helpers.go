@@ -1,8 +1,12 @@
 package bot
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -145,4 +149,106 @@ func formatMessageForAnalysis(msg *tgbotapi.Message) string {
 	}
 
 	return fmt.Sprintf("[%s]%s: %s", userName, replyInfo, text)
+}
+
+// deleteMessage удаляет сообщение из чата
+func (b *Bot) deleteMessage(chatID int64, messageID int) {
+	if messageID == 0 {
+		return // Нечего удалять
+	}
+	deleteMsgConfig := tgbotapi.NewDeleteMessage(chatID, messageID)
+	_, err := b.api.Request(deleteMsgConfig)
+	if err != nil {
+		// Логируем ошибку, но не прерываем выполнение (сообщение могло быть уже удалено)
+		// Игнорируем "message to delete not found" и "message can't be deleted"
+		if !strings.Contains(err.Error(), "message to delete not found") && !strings.Contains(err.Error(), "message can't be deleted") {
+			log.Printf("[WARN][DeleteMessage] Ошибка удаления сообщения %d в чате %d: %v", messageID, chatID, err)
+		}
+	} else {
+		if b.config.Debug {
+			log.Printf("[DEBUG][DeleteMessage] Сообщение %d успешно удалено из чата %d", messageID, chatID)
+		}
+	}
+}
+
+// saveChatSettings сохраняет настройки чата в JSON файл
+func (b *Bot) saveChatSettings(chatID int64, settings *ChatSettings) error {
+	filePath := filepath.Join("data", fmt.Sprintf("settings_%d.json", chatID))
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("ошибка маршалинга настроек чата %d: %w", chatID, err)
+	}
+
+	// Создаем директорию data, если она не существует
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return fmt.Errorf("ошибка создания директории data: %w", err)
+	}
+
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return fmt.Errorf("ошибка записи файла настроек чата %d: %w", chatID, err)
+	}
+	// log.Printf("Настройки для чата %d сохранены в %s", chatID, filePath)
+	return nil
+}
+
+// loadChatSettings загружает настройки чата из JSON файла
+func (b *Bot) loadChatSettings(chatID int64) (*ChatSettings, error) {
+	filePath := filepath.Join("data", fmt.Sprintf("settings_%d.json", chatID))
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // Файл не найден, возвращаем nil без ошибки
+		}
+		return nil, fmt.Errorf("ошибка чтения файла настроек чата %d: %w", chatID, err)
+	}
+
+	var settings ChatSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, fmt.Errorf("ошибка демаршалинга настроек чата %d: %w", chatID, err)
+	}
+	// log.Printf("Настройки для чата %d загружены из %s", chatID, filePath)
+	return &settings, nil
+}
+
+// loadAllChatSettings загружает настройки для всех чатов из папки data
+func (b *Bot) loadAllChatSettings() (map[int64]*ChatSettings, error) {
+	settingsMap := make(map[int64]*ChatSettings)
+	files, err := os.ReadDir("data")
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Println("Директория 'data' не найдена, настройки не загружены.")
+			return settingsMap, nil // Не ошибка, просто нет сохраненных настроек
+		}
+		return nil, fmt.Errorf("ошибка чтения директории data: %w", err)
+	}
+
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), "settings_") && strings.HasSuffix(file.Name(), ".json") {
+			var chatID int64
+			_, err := fmt.Sscan(strings.TrimSuffix(strings.TrimPrefix(file.Name(), "settings_"), ".json"), &chatID)
+			if err != nil {
+				log.Printf("Ошибка парсинга chatID из имени файла %s: %v", file.Name(), err)
+				continue
+			}
+			settings, err := b.loadChatSettings(chatID)
+			if err != nil {
+				log.Printf("Ошибка загрузки настроек из файла %s: %v", file.Name(), err)
+				continue
+			}
+			if settings != nil {
+				settingsMap[chatID] = settings
+			}
+		}
+	}
+	log.Printf("Загружено %d наборов настроек чатов.", len(settingsMap))
+	return settingsMap, nil
+}
+
+// getRandomElement возвращает случайный элемент из среза строк
+func getRandomElement(slice []string) string {
+	if len(slice) == 0 {
+		return ""
+	}
+	rand.Seed(time.Now().UnixNano()) // Убедимся, что генератор случайных чисел инициализирован
+	return slice[rand.Intn(len(slice))]
 }

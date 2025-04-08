@@ -28,6 +28,11 @@ type ChatSettings struct {
 	SrachMessages        []string  `json:"srach_messages"`          // Сообщения, собранные во время срача для анализа
 	LastSrachTriggerTime time.Time `json:"last_srach_trigger_time"` // Время последнего триггерного сообщения для таймера завершения
 	SrachLlmCheckCounter int       `json:"srach_llm_check_counter"` // Счетчик сообщений для LLM проверки срача
+
+	// IDs for deletable messages
+	LastMenuMessageID     int `json:"last_menu_message_id,omitempty"`     // ID последнего сообщения с главным меню
+	LastSettingsMessageID int `json:"last_settings_message_id,omitempty"` // ID последнего сообщения с меню настроек
+	LastInfoMessageID     int `json:"last_info_message_id,omitempty"`     // ID последнего информационного сообщения (запроса ввода)
 }
 
 // formatSummaryInterval форматирует интервал саммари для отображения
@@ -97,6 +102,12 @@ func getSettingsKeyboard(settings *ChatSettings) tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardButtonData(srachText, srachCallback),
 	}
 	rows = append(rows, srachRow)
+
+	// Добавляем кнопку "Назад"
+	backRow := []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "back_to_main"),
+	}
+	rows = append(rows, backRow)
 
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }

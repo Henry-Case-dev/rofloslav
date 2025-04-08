@@ -1,53 +1,104 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// sendSettingsKeyboard отправляет клавиатуру настроек
-func (b *Bot) sendSettingsKeyboard(chatID int64) {
+// sendSettingsKeyboard отправляет клавиатуру настроек, удаляя предыдущую (если есть)
+// и сохраняя ID нового сообщения.
+func (b *Bot) sendSettingsKeyboard(chatID int64, lastSettingsMsgID int) {
+	// Удаляем предыдущее сообщение настроек, если оно есть
+	if lastSettingsMsgID != 0 {
+		b.deleteMessage(chatID, lastSettingsMsgID)
+	}
+
+	// Получаем актуальные настройки для отображения
 	b.settingsMutex.RLock()
 	settings, exists := b.chatSettings[chatID]
 	if !exists {
-		log.Printf("sendSettingsKeyboard: Настройки для чата %d не найдены!", chatID)
 		b.settingsMutex.RUnlock()
-		// Можно отправить сообщение об ошибке или создать настройки по умолчанию
-		b.sendReply(chatID, "Ошибка: не удалось загрузить настройки чата.")
+		log.Printf("sendSettingsKeyboard: Настройки для чата %d не найдены!", chatID)
+		// Можно отправить сообщение об ошибке, но лучше просто не отправлять клавиатуру
 		return
 	}
 
-	b.settingsMutex.RUnlock()
+	// Формируем текст и клавиатуру ПОД мьютексом RLock, чтобы settings были актуальны
+	msgText := `⚙️ *Настройки чата:*
+`
+	msgText += fmt.Sprintf("\nАнализ срачей: %s", getEnabledStatusText(settings.SrachAnalysisEnabled))
+	msgText += fmt.Sprintf("\nИнтервал ответа: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)
+	msgText += fmt.Sprintf("\nВремя 'темы дня': %02d:00", settings.DailyTakeTime)
+	msgText += fmt.Sprintf("\nИнтервал авто-саммари: %s", formatSummaryInterval(settings.SummaryIntervalHours))
 
-	keyboard := getSettingsKeyboard(settings)
-	b.sendReplyWithKeyboard(chatID, "⚙️ Настройки чата:", keyboard)
+	// Получаем клавиатуру настроек
+	keyboard := getSettingsKeyboard(settings) // Передаем сам объект настроек
+	b.settingsMutex.RUnlock()                 // Теперь можно разблокировать
+
+	// Отправляем новое сообщение с клавиатурой
+	msg := tgbotapi.NewMessage(chatID, msgText)
+	msg.ReplyMarkup = keyboard
+	msg.ParseMode = "Markdown"
+
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("Ошибка отправки клавиатуры настроек в чат %d: %v", chatID, err)
+		return
+	}
+
+	// Сохраняем ID нового сообщения настроек
+	b.settingsMutex.Lock()
+	if settings, exists := b.chatSettings[chatID]; exists { // Проверяем еще раз на всякий случай
+		settings.LastSettingsMessageID = sentMsg.MessageID
+		if b.config.Debug {
+			log.Printf("[DEBUG] Сохранен новый LastSettingsMessageID: %d для чата %d", sentMsg.MessageID, chatID)
+		}
+	} else {
+		log.Printf("[WARN] Настройки для чата %d не найдены при попытке сохранить новый LastSettingsMessageID.", chatID)
+	}
+	b.settingsMutex.Unlock()
 }
 
-// updateSettingsKeyboard обновляет существующее сообщение с клавиатурой настроек
-func (b *Bot) updateSettingsKeyboard(callback *tgbotapi.CallbackQuery) {
-	if callback.Message == nil {
-		return // Нечего обновлять
-	}
-	chatID := callback.Message.Chat.ID
-	messageID := callback.Message.MessageID
+// updateSettingsKeyboard обновляет существующее сообщение настроек
+func (b *Bot) updateSettingsKeyboard(query *tgbotapi.CallbackQuery) {
+	chatID := query.Message.Chat.ID
+	messageID := query.Message.MessageID
 
+	// Получаем актуальные настройки
 	b.settingsMutex.RLock()
 	settings, exists := b.chatSettings[chatID]
 	if !exists {
-		log.Printf("updateSettingsKeyboard: Настройки для чата %d не найдены!", chatID)
 		b.settingsMutex.RUnlock()
+		log.Printf("updateSettingsKeyboard: Настройки для чата %d не найдены!", chatID)
+		b.answerCallback(query.ID, "Ошибка: настройки чата не найдены.")
 		return
 	}
 
-	b.settingsMutex.RUnlock()
+	// Формируем новый текст и клавиатуру ПОД мьютексом RLock
+	msgText := `⚙️ *Настройки чата:*
+`
+	msgText += fmt.Sprintf("\nАнализ срачей: %s", getEnabledStatusText(settings.SrachAnalysisEnabled))
+	msgText += fmt.Sprintf("\nИнтервал ответа: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)
+	msgText += fmt.Sprintf("\nВремя 'темы дня': %02d:00", settings.DailyTakeTime)
+	msgText += fmt.Sprintf("\nИнтервал авто-саммари: %s", formatSummaryInterval(settings.SummaryIntervalHours))
 
-	newKeyboard := getSettingsKeyboard(settings)
-	editMsg := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, newKeyboard)
+	// Получаем обновленную клавиатуру
+	keyboard := getSettingsKeyboard(settings) // Передаем сам объект настроек
+	b.settingsMutex.RUnlock()                 // Теперь можно разблокировать
 
-	_, err := b.api.Request(editMsg)
+	// Создаем конфиг для редактирования сообщения
+	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msgText)
+	editMsg.ReplyMarkup = &keyboard
+	editMsg.ParseMode = "Markdown"
+
+	_, err := b.api.Send(editMsg)
 	if err != nil {
-		log.Printf("Ошибка обновления клавиатуры настроек: %v", err)
+		log.Printf("Ошибка обновления клавиатуры настроек в чате %d: %v", chatID, err)
+		b.answerCallback(query.ID, "Ошибка обновления настроек.")
+	} else {
+		b.answerCallback(query.ID, "Настройки обновлены.") // Отвечаем на колбэк
 	}
 }
 
