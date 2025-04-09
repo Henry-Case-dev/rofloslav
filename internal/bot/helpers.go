@@ -172,7 +172,7 @@ func (b *Bot) deleteMessage(chatID int64, messageID int) {
 }
 
 // saveChatSettings сохраняет настройки чата в JSON файл
-func (b *Bot) saveChatSettings(chatID int64, settings *ChatSettings) error {
+func saveChatSettings(chatID int64, settings *ChatSettings) error {
 	filePath := filepath.Join("data", fmt.Sprintf("settings_%d.json", chatID))
 	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
@@ -192,7 +192,7 @@ func (b *Bot) saveChatSettings(chatID int64, settings *ChatSettings) error {
 }
 
 // loadChatSettings загружает настройки чата из JSON файла
-func (b *Bot) loadChatSettings(chatID int64) (*ChatSettings, error) {
+func loadChatSettings(chatID int64) (*ChatSettings, error) {
 	filePath := filepath.Join("data", fmt.Sprintf("settings_%d.json", chatID))
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -211,7 +211,7 @@ func (b *Bot) loadChatSettings(chatID int64) (*ChatSettings, error) {
 }
 
 // loadAllChatSettings загружает настройки для всех чатов из папки data
-func (b *Bot) loadAllChatSettings() (map[int64]*ChatSettings, error) {
+func loadAllChatSettings() (map[int64]*ChatSettings, error) {
 	settingsMap := make(map[int64]*ChatSettings)
 	files, err := os.ReadDir("data")
 	if err != nil {
@@ -230,7 +230,7 @@ func (b *Bot) loadAllChatSettings() (map[int64]*ChatSettings, error) {
 				log.Printf("Ошибка парсинга chatID из имени файла %s: %v", file.Name(), err)
 				continue
 			}
-			settings, err := b.loadChatSettings(chatID)
+			settings, err := loadChatSettings(chatID)
 			if err != nil {
 				log.Printf("Ошибка загрузки настроек из файла %s: %v", file.Name(), err)
 				continue

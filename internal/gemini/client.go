@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 )
+
+var botUserID int64
 
 // Client для взаимодействия с Gemini API
 type Client struct {
@@ -20,6 +24,27 @@ type Client struct {
 
 // New создает нового клиента Gemini
 func New(apiKey, modelName string, debug bool) (*Client, error) {
+	if apiKey == "" {
+		return nil, fmt.Errorf("API ключ Gemini не предоставлен")
+	}
+	if modelName == "" {
+		return nil, fmt.Errorf("имя модели Gemini не предоставлено")
+	}
+
+	// Получаем ID бота из переменной окружения
+	botIDStr := os.Getenv("BOT_USER_ID")
+	if botIDStr != "" {
+		var err error
+		botUserID, err = strconv.ParseInt(botIDStr, 10, 64)
+		if err != nil {
+			log.Printf("[WARN] Не удалось преобразовать BOT_USER_ID ('%s') в int64: %v", botIDStr, err)
+		} else {
+			log.Printf("[INFO] ID бота загружен из переменной окружения: %d", botUserID)
+		}
+	} else {
+		log.Printf("[WARN] Переменная окружения BOT_USER_ID не установлена. Определение сообщений бота может быть неточным.")
+	}
+
 	ctx := context.Background()
 	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
@@ -44,43 +69,70 @@ func (c *Client) Close() error {
 }
 
 // GenerateResponse генерирует ответ с использованием Gemini API
-func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Message) (string, error) {
+// history - сообщения ДО lastMessage
+// lastMessage - сообщение, на которое отвечаем
+func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Message, lastMessage *tgbotapi.Message) (string, error) {
 	ctx := context.Background()
 	model := c.genaiClient.GenerativeModel(c.modelName)
 
-	// Настройки модели (можно вынести в конфиг при необходимости)
+	// Настройки модели
 	model.SetTemperature(1)
-	model.SetTopK(40) // Gemini 1.5 не рекомендует использовать TopK одновременно с Temperature > 0
 	model.SetTopP(0.95)
 	model.SetMaxOutputTokens(8192)
-	// model.ResponseMIMEType = "text/plain" // Можно установить, если нужен только текст
+
+	// Устанавливаем SystemInstruction
+	if systemPrompt != "" {
+		model.SystemInstruction = &genai.Content{
+			Parts: []genai.Part{genai.Text(systemPrompt)},
+		}
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Запрос: Установлен SystemInstruction: %s...", truncateString(systemPrompt, 100))
+		}
+	}
 
 	// Начинаем чат сессию
 	session := model.StartChat()
 
-	// Формируем историю для API
-	history, lastMessageText := c.prepareChatHistory(messages)
-	session.History = history
+	// Формируем историю для API (только history, без lastMessage)
+	preparedHistory := c.prepareChatHistory(history) // Функция теперь принимает только историю ДО последнего сообщения
 
-	// Формируем текст запроса: системный промпт + последнее сообщение
-	// Важно: Системный промпт лучше передавать через API, если он это поддерживает,
-	// но в простом чате его можно добавить к первому сообщению пользователя.
-	// Здесь мы добавляем его к *последнему* сообщению для простоты.
-	// Можно экспериментировать с добавлением его в начало session.History
-	fullPrompt := systemPrompt
+	// Устанавливаем подготовленную историю
+	session.History = preparedHistory
+
+	// Формируем контент для отправки из lastMessage
+	var contentToSend genai.Part
+	lastMessageText := "" // Текст последнего сообщения
+	if lastMessage != nil {
+		lastMessageText = lastMessage.Text // Используем основной текст
+		if lastMessageText == "" && lastMessage.Caption != "" {
+			lastMessageText = lastMessage.Caption // Или caption
+		}
+	}
+
 	if lastMessageText != "" {
-		fullPrompt += "\n\n" + lastMessageText
+		contentToSend = genai.Text(lastMessageText)
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Запрос: Текст lastMessage для отправки: %s...", truncateString(lastMessageText, 50))
+		}
+	} else {
+		// Если lastMessage пустой (например, стикер или медиа без текста/caption), что отправлять?
+		// Отправка пустого текста после истории все еще может вызвать 400.
+		// Возможно, стоит передать плейсхолдер или описание медиа, если это важно.
+		// Пока отправляем плейсхолдер, чтобы избежать пустой строки.
+		contentToSend = genai.Text("[сообщение без текста]")
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Запрос: lastMessage был пуст, отправляется плейсхолдер.")
+		}
 	}
 
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос: Полный промпт (system + last message) = %s...", truncateString(fullPrompt, 100))
-		log.Printf("[DEBUG] Gemini Запрос: История содержит %d сообщений.", len(session.History))
-		log.Printf("[DEBUG] Gemini Запрос: Модель %s, Temp: %v, TopP: %v, MaxTokens: %v",
+		log.Printf("[DEBUG] Gemini Запрос: Подготовленная история содержит %d сообщений.", len(preparedHistory))
+		log.Printf("[DEBUG] Gemini Запрос: Модель %s, Temp: %+v, TopP: %+v, MaxTokens: %+v",
 			c.modelName, model.Temperature, model.TopP, model.MaxOutputTokens)
 	}
 
 	// Отправляем сообщение
-	resp, err := session.SendMessage(ctx, genai.Text(fullPrompt))
+	resp, err := session.SendMessage(ctx, contentToSend)
 	if err != nil {
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Ошибка отправки: %v", err)
@@ -92,13 +144,12 @@ func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Mess
 	var responseText strings.Builder
 	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
 		for _, part := range resp.Candidates[0].Content.Parts {
-			responseText.WriteString(fmt.Sprintf("%s", part)) // Преобразуем part в строку
+			responseText.WriteString(fmt.Sprintf("%s", part))
 		}
 	} else {
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Ответ: Получен пустой ответ или нет кандидатов.")
 		}
-		// Можно вернуть пустую строку или ошибку в зависимости от логики
 		return "", fmt.Errorf("Gemini не вернул валидный ответ")
 	}
 
@@ -110,89 +161,100 @@ func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Mess
 	return finalResponse, nil
 }
 
-// prepareChatHistory преобразует сообщения Telegram в историю для Gemini API
-// Возвращает историю и текст последнего сообщения (если есть)
-func (c *Client) prepareChatHistory(messages []*tgbotapi.Message) ([]*genai.Content, string) {
-	history := []*genai.Content{}
-	var lastMessageText string
-
+// prepareChatHistory подготавливает историю сообщений для Gemini API.
+// Конвертирует и объединяет роли.
+// НЕ включает последнее сообщение, т.к. оно передается отдельно.
+func (c *Client) prepareChatHistory(messages []*tgbotapi.Message) []*genai.Content {
 	if len(messages) == 0 {
-		return history, ""
+		return []*genai.Content{}
 	}
 
-	// Обрабатываем все сообщения, кроме последнего
-	processUpToIndex := len(messages) - 1
-	for i := 0; i < processUpToIndex; i++ {
-		msg := messages[i]
+	// 1. Конвертируем все сообщения в genai.Content с ролями
+	fullHistoryWithRoles := []*genai.Content{}
+	for _, msg := range messages {
 		content := c.convertMessageToGenaiContent(msg)
 		if content != nil {
-			history = append(history, content)
+			fullHistoryWithRoles = append(fullHistoryWithRoles, content)
 		}
 	}
 
-	// Сохраняем текст последнего сообщения отдельно
-	lastMsg := messages[len(messages)-1]
-	if lastMsg.Text != "" {
-		// Определяем роль последнего сообщения
-		role := "user"
-		if lastMsg.From != nil && lastMsg.From.IsBot { // Простая проверка, возможно, нужна ID бота
-			role = "model"
-		}
-		// Если последнее сообщение от бота, добавляем его в историю как "model"
-		if role == "model" {
-			content := c.convertMessageToGenaiContent(lastMsg)
-			if content != nil {
-				history = append(history, content)
+	if len(fullHistoryWithRoles) == 0 {
+		return []*genai.Content{}
+	}
+
+	// 2. Объединяем последовательные сообщения с одинаковой ролью
+	mergedHistory := []*genai.Content{fullHistoryWithRoles[0]}
+	for i := 1; i < len(fullHistoryWithRoles); i++ {
+		lastMerged := mergedHistory[len(mergedHistory)-1]
+		current := fullHistoryWithRoles[i]
+
+		if current.Role == lastMerged.Role {
+			// Объединяем текст
+			var combinedText strings.Builder
+			for _, p := range lastMerged.Parts {
+				combinedText.WriteString(fmt.Sprintf("%s", p))
 			}
+			combinedText.WriteString("\n") // Добавляем разделитель
+			for _, p := range current.Parts {
+				combinedText.WriteString(fmt.Sprintf("%s", p))
+			}
+			// Обновляем Parts последнего элемента в mergedHistory
+			lastMerged.Parts = []genai.Part{genai.Text(combinedText.String())}
 		} else {
-			// Если последнее сообщение от пользователя, сохраняем текст для отправки
-			lastMessageText = lastMsg.Text
+			// Если роли разные, просто добавляем
+			mergedHistory = append(mergedHistory, current)
 		}
-
 	}
 
-	// Очистка истории от последовательных сообщений с одинаковой ролью (рекомендация Gemini)
-	if len(history) > 1 {
-		cleanedHistory := []*genai.Content{history[0]}
-		for i := 1; i < len(history); i++ {
-			if history[i].Role != cleanedHistory[len(cleanedHistory)-1].Role {
-				cleanedHistory = append(cleanedHistory, history[i])
-			} else {
-				// Объединяем текст, если роли совпадают
-				lastContent := cleanedHistory[len(cleanedHistory)-1]
-				var combinedText strings.Builder
-				for _, p := range lastContent.Parts {
-					combinedText.WriteString(fmt.Sprintf("%s", p))
-				}
-				combinedText.WriteString("\n") // Добавляем разделитель
-				for _, p := range history[i].Parts {
-					combinedText.WriteString(fmt.Sprintf("%s", p))
-				}
-				lastContent.Parts = []genai.Part{genai.Text(combinedText.String())}
-			}
-		}
-		history = cleanedHistory
+	// 3. Убедимся, что история не заканчивается сообщением модели (если она не пустая)
+	//    Если заканчивается, API может ожидать сообщение пользователя.
+	//    Однако, передавая lastMessage отдельно, это должно решиться.
+	//    Просто возвращаем объединенную историю.
+
+	if c.debug {
+		log.Printf("[DEBUG][prepareChatHistory] Исходных сообщений для истории: %d", len(messages))
+		log.Printf("[DEBUG][prepareChatHistory] Сообщений после конвертации: %d", len(fullHistoryWithRoles))
+		log.Printf("[DEBUG][prepareChatHistory] Финальная история для API после слияния содержит %d сообщений.", len(mergedHistory))
 	}
 
-	return history, lastMessageText
+	return mergedHistory
 }
 
 // convertMessageToGenaiContent преобразует одно сообщение Telegram
 func (c *Client) convertMessageToGenaiContent(msg *tgbotapi.Message) *genai.Content {
-	if msg == nil || msg.Text == "" {
+	if msg == nil {
+		return nil
+	}
+	// Считаем и пустые сообщения, если они не от бота (важно для сохранения чередования)
+	// if msg.Text == "" && (msg.From == nil || !msg.From.IsBot){
+	// 	return nil // Пропускаем пустые сообщения от пользователей (или без отправителя)
+	// }
+
+	// Определяем текст сообщения, учитывая подписи к медиа
+	textContent := msg.Text
+	if textContent == "" && msg.Caption != "" {
+		textContent = msg.Caption // Используем подпись, если текста нет
+	}
+
+	// Если текста все равно нет, пропускаем сообщение (или можно вернуть пустой контент?)
+	// Пока пропускаем, чтобы не отправлять пустоту в API
+	if textContent == "" {
 		return nil
 	}
 
 	role := "user"
-	// Примечание: Проверка на IsBot может быть недостаточной.
-	// В идеале, нужно знать ID вашего бота и сравнивать msg.From.ID с ним.
-	// Пока используем простую проверку.
-	if msg.From != nil && msg.From.IsBot {
+	// Проверяем ID бота, если он загружен
+	if botUserID != 0 {
+		if msg.From != nil && msg.From.ID == botUserID {
+			role = "model"
+		}
+	} else if msg.From != nil && msg.From.IsBot {
+		// Fallback на IsBot, если ID не загружен
 		role = "model"
 	}
 
 	return &genai.Content{
-		Parts: []genai.Part{genai.Text(msg.Text)},
+		Parts: []genai.Part{genai.Text(textContent)}, // Используем textContent
 		Role:  role,
 	}
 }
@@ -204,23 +266,33 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 
 	// Используем те же настройки модели, что и в GenerateResponse
 	model.SetTemperature(1)
-	// model.SetTopK(40) // Не используется с Temp > 0
+	// Убираем TopK
+	// model.SetTopK(40)
 	model.SetTopP(0.95)
 	model.SetMaxOutputTokens(8192)
 
-	// Формируем полный промпт
-	// В этом случае мы не используем историю чата, а передаем всё как один большой промпт.
-	// Системный промпт идет первым, затем контекст.
-	fullPrompt := systemPrompt + "\n\nКонтекст для анализа:\n" + contextText
+	// Устанавливаем системный промпт через специальное поле
+	if systemPrompt != "" {
+		model.SystemInstruction = &genai.Content{
+			Parts: []genai.Part{genai.Text(systemPrompt)},
+		}
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Установлен SystemInstruction: %s...", truncateString(systemPrompt, 100))
+		}
+	}
+
+	// Убираем формирование fullPrompt
+	// fullPrompt := systemPrompt + "\n\nКонтекст для анализа:\n" + contextText
+	contentToSend := genai.Text(contextText) // Формируем контент только из contextText
 
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Полный промпт = %s...", truncateString(fullPrompt, 150))
+		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Текст для отправки: %s...", truncateString(contextText, 150))
 		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Модель %s, Temp: %v, TopP: %v, MaxTokens: %v",
 			c.modelName, model.Temperature, model.TopP, model.MaxOutputTokens)
 	}
 
-	// Отправляем сообщение (без истории чата)
-	resp, err := model.GenerateContent(ctx, genai.Text(fullPrompt))
+	// Отправляем сообщение (без истории чата), только контекст
+	resp, err := model.GenerateContent(ctx, contentToSend)
 	if err != nil {
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Ошибка генерации (Arbitrary): %v", err)

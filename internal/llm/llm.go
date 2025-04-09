@@ -7,7 +7,9 @@ import (
 // LLMClient определяет общий интерфейс для взаимодействия с различными LLM.
 type LLMClient interface {
 	// GenerateResponse генерирует ответ на основе истории сообщений и системного промпта.
-	GenerateResponse(systemPrompt string, messages []*tgbotapi.Message) (string, error)
+	// history - это сообщения ДО текущего lastMessage.
+	// lastMessage - это последнее сообщение пользователя, на которое нужно сгенерировать ответ.
+	GenerateResponse(systemPrompt string, history []*tgbotapi.Message, lastMessage *tgbotapi.Message) (string, error)
 
 	// GenerateArbitraryResponse генерирует ответ на основе системного промпта и произвольного текстового контекста.
 	// Используется для задач, не требующих истории чата (например, анализ срача).

@@ -54,11 +54,18 @@ func (c *Client) Close() error {
 }
 
 // GenerateResponse генерирует ответ с использованием DeepSeek API
-func (c *Client) GenerateResponse(systemPrompt string, messages []*tgbotapi.Message) (string, error) {
+func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Message, lastMessage *tgbotapi.Message) (string, error) {
 	ctx := context.Background()
 
+	// Объединяем историю и последнее сообщение для DeepSeek
+	allMessages := make([]*tgbotapi.Message, 0, len(history)+1)
+	allMessages = append(allMessages, history...)
+	if lastMessage != nil { // Добавляем последнее сообщение, если оно не nil
+		allMessages = append(allMessages, lastMessage)
+	}
+
 	// Подготавливаем историю сообщений для OpenAI формата
-	chatMessages := c.prepareChatHistory(systemPrompt, messages)
+	chatMessages := c.prepareChatHistory(systemPrompt, allMessages) // Передаем весь набор
 
 	// Формируем запрос
 	req := openai.ChatCompletionRequest{

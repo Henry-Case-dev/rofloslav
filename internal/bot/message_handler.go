@@ -181,7 +181,20 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 	}
 	// --- Конец обработки ввода ---
 
-	log.Printf("[DEBUG][MH] Chat %d: No pending setting. Proceeding to Srach Analysis.", chatID)
+	log.Printf("[DEBUG][MH] Chat %d: No pending setting. Proceeding to normal message handling.", chatID)
+
+	// >>> ДОБАВЛЯЕМ СООБЩЕНИЕ В ХРАНИЛИЩЕ <<<
+	// Делаем это здесь, после всех проверок на команды, отмены, ввод настроек,
+	// чтобы команды и системные сообщения не попадали в историю для AI.
+	if message != nil && message.Text != "" && !message.IsCommand() { // Добавляем проверку, что это не команда и текст не пустой
+		log.Printf("[DEBUG][MH] Chat %d: Adding message ID %d to storage.", chatID, message.MessageID)
+		b.storage.AddMessage(chatID, message) // Вызов метода интерфейса
+	} else {
+		log.Printf("[DEBUG][MH] Chat %d: Message ID %d skipped for storage (nil, empty text, or command).", chatID, message.MessageID)
+	}
+	// >>> КОНЕЦ ДОБАВЛЕНИЯ В ХРАНИЛИЩЕ <<<
+
+	log.Printf("[DEBUG][MH] Chat %d: Proceeding to Srach Analysis.", chatID)
 
 	// Команды обрабатываются в handleUpdate перед вызовом handleMessage
 
@@ -354,83 +367,78 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 	// Проверка на добавление бота в чат остается в handleUpdate
 }
 
-// sendDirectResponse отправляет ответ на прямое обращение к боту
+// sendDirectResponse отправляет ответ на прямое упоминание или ответ боту
 func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
-	if b.config.Debug {
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Starting direct response generation for message ID %d.",
-			chatID, message.MessageID)
-	}
+	log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Handling direct response to message ID %d", chatID, message.MessageID)
 
-	// Получаем некоторый контекст из истории
-	messages := b.storage.GetMessages(chatID)
+	// Используем DIRECT_PROMPT
+	directPrompt := b.config.DirectPrompt
 
-	// Для прямого ответа используем только DIRECT_PROMPT
-	prompt := b.config.DirectPrompt
-	log.Printf("[DEBUG][MH][Goroutine] Chat %d: Generating direct response using prompt: %s...", chatID, truncateString(prompt, 50))
-	response, err := b.llm.GenerateResponse(prompt, messages)
+	// Генерируем ответ, передавая пустую историю и текущее сообщение
+	responseText, err := b.llm.GenerateResponse(directPrompt, nil, message) // Передаем nil для history
 	if err != nil {
-		log.Printf("[ERROR][MH][Goroutine] Chat %d: Error generating direct response: %v.", chatID, err)
+		log.Printf("Ошибка генерации прямого ответа для чата %d: %v", chatID, err)
 		return
 	}
-	log.Printf("[DEBUG][MH][Goroutine] Chat %d: Direct response generated: %s...", chatID, truncateString(response, 50))
 
-	// Создаем сообщение с ответом на исходное сообщение
-	msg := tgbotapi.NewMessage(chatID, response)
+	// Отправляем ответ (возможно, как реплай на исходное сообщение)
+	msg := tgbotapi.NewMessage(chatID, responseText)
+	msg.ReplyToMessageID = message.MessageID // Отвечаем на сообщение пользователя
 	msg.ParseMode = "Markdown"
-	msg.ReplyToMessageID = message.MessageID
 
-	log.Printf("[DEBUG][MH][Goroutine] Chat %d: Sending direct response.", chatID)
 	_, err = b.api.Send(msg)
 	if err != nil {
-		log.Printf("[ERROR][MH][Goroutine] Chat %d: Error sending direct response: %v", chatID, err)
-	} else if b.config.Debug {
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Successfully sent direct response.", chatID)
+		log.Printf("Ошибка отправки прямого ответа в чат %d: %v", chatID, err)
 	}
 }
 
-// sendAIResponse генерирует и отправляет ответ нейросети
+// sendAIResponse генерирует и отправляет стандартный AI ответ в фоновом режиме
 func (b *Bot) sendAIResponse(chatID int64) {
 	if b.config.Debug {
 		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Starting AI response generation.", chatID)
 	}
 
-	// Получаем историю сообщений
-	messages := b.storage.GetMessages(chatID)
-	if len(messages) == 0 {
-		if b.config.Debug {
-			log.Printf("[DEBUG][MH][Goroutine] Chat %d: No messages in history, skipping AI response.", chatID)
+	// Получаем историю сообщений ИЗ ХРАНИЛИЩА
+	fullHistory := b.storage.GetMessages(chatID)
+
+	// Разделяем историю и последнее сообщение
+	var historyForLLM []*tgbotapi.Message
+	var lastMessageForLLM *tgbotapi.Message
+
+	if len(fullHistory) > 0 {
+		lastMessageIndex := len(fullHistory) - 1
+		lastMessageForLLM = fullHistory[lastMessageIndex]
+		if lastMessageIndex > 0 {
+			historyForLLM = fullHistory[:lastMessageIndex]
 		}
-		return
-	}
-	log.Printf("[DEBUG][MH][Goroutine] Chat %d: Fetched %d messages from history.", chatID, len(messages))
-
-	// Получаем настройки промпта
-	b.settingsMutex.RLock()
-	settings, exists := b.chatSettings[chatID]
-	prompt := b.config.DefaultPrompt
-	if exists && settings.CustomPrompt != "" {
-		prompt = settings.CustomPrompt
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Using custom prompt.", chatID)
 	} else {
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Using default prompt.", chatID)
-	}
-	b.settingsMutex.RUnlock()
-
-	if b.config.Debug {
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Generating AI response using prompt: %s...", chatID, truncateString(prompt, 50))
+		// Если история пуста, lastMessageForLLM будет nil, historyForLLM будет пустым срезом
+		// Это не должно происходить в sendAIResponse, т.к. она вызывается после добавления сообщения
+		log.Printf("[WARN] sendAIResponse: fullHistory пуста для чата %d, хотя сообщение должно было быть добавлено.", chatID)
 	}
 
-	// Отправляем запрос к LLM
-	response, err := b.llm.GenerateResponse(prompt, messages)
+	log.Printf("[DEBUG][MH][AIResponse] Chat %d: History has %d messages. Last message ID: %d", chatID, len(fullHistory), lastMessageForLLM.MessageID)
+
+	// Берем системный промпт из конфига (используем DefaultPrompt для обычных ответов)
+	systemPrompt := b.config.DefaultPrompt
+	log.Printf("[DEBUG][MH][AIResponse] Chat %d: Using default system prompt: %s...", chatID, truncateString(systemPrompt, 50))
+
+	// Генерируем ответ, передавая историю и последнее сообщение отдельно
+	responseText, err := b.llm.GenerateResponse(systemPrompt, historyForLLM, lastMessageForLLM)
 	if err != nil {
-		log.Printf("[ERROR][MH][Goroutine] Chat %d: Error generating AI response: %v", chatID, err)
+		log.Printf("[ERROR][MH][AIResponse] Chat %d: Error generating AI response: %v", chatID, err)
 		return
 	}
-	log.Printf("[DEBUG][MH][Goroutine] Chat %d: AI response generated: %s...", chatID, truncateString(response, 50))
+	log.Printf("[DEBUG][MH][AIResponse] Chat %d: AI response generated: %s...", chatID, truncateString(responseText, 50))
 
-	// Отправляем ответ в чат
-	log.Printf("[DEBUG][MH][Goroutine] Chat %d: Sending AI response.", chatID)
-	b.sendReply(chatID, response) // sendReply уже содержит логирование ошибок отправки
+	// Отправляем сгенерированный ответ
+	msg := tgbotapi.NewMessage(chatID, responseText)
+	msg.ParseMode = "Markdown"
+
+	_, err = b.api.Send(msg)
+	if err != nil {
+		log.Printf("Ошибка отправки AI ответа в чат %d: %v", chatID, err)
+	}
 
 	if b.config.Debug {
 		log.Printf("[DEBUG][MH][Goroutine] Chat %d: AI response goroutine finished.", chatID)

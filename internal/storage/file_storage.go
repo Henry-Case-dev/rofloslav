@@ -81,10 +81,10 @@ func ConvertToAPIMessage(stored *StoredMessage) *tgbotapi.Message {
 }
 
 // SaveChatHistory сохраняет историю сообщений в файл
-func (s *Storage) SaveChatHistory(chatID int64) error {
-	s.mutex.RLock()
-	messages, exists := s.messages[chatID]
-	s.mutex.RUnlock()
+func (fs *FileStorage) SaveChatHistory(chatID int64) error {
+	fs.mutex.RLock()
+	messages, exists := fs.messages[chatID]
+	fs.mutex.RUnlock()
 
 	if !exists || len(messages) == 0 {
 		// Убрал лог, т.к. это нормальная ситуация
@@ -139,7 +139,7 @@ func (s *Storage) SaveChatHistory(chatID int64) error {
 }
 
 // LoadChatHistory загружает историю сообщений из файла
-func (s *Storage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {
+func (fs *FileStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {
 	// --- Используем директорию /data для Amvera ---
 	historyDir := "/data"
 	fileName := filepath.Join(historyDir, fmt.Sprintf("chat_%d.json", chatID))

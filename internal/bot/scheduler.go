@@ -8,6 +8,7 @@ import (
 
 // scheduleDailyTake запускает планировщик для ежедневного тейка
 func (b *Bot) scheduleDailyTake(dailyTakeTime int, timeZone string) {
+	log.Println("[Scheduler DEBUG] Запущен цикл планировщика DailyTake.")
 	// Получаем локацию из конфига
 	loc, err := time.LoadLocation(timeZone)
 	if err != nil {
@@ -111,6 +112,7 @@ func (b *Bot) sendDailyTakeToAllChats() {
 
 // scheduleAutoSummary запускает планировщик для автоматического саммари
 func (b *Bot) scheduleAutoSummary() {
+	log.Println("[Scheduler DEBUG] Запущен цикл планировщика AutoSummary.")
 	// Используем общий тикер, чтобы проверять все чаты раз в час (например)
 	// Точность до секунды тут не нужна
 	checkInterval := time.Hour

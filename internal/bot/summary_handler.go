@@ -43,6 +43,15 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	// Используем только промпт для саммари без комбинирования
 	summaryPrompt := b.config.SummaryPrompt
 
+	// Формируем единый текст из сообщений для контекста
+	var contextBuilder strings.Builder
+	for _, msg := range messages {
+		// Добавляем базовую информацию о сообщении для LLM
+		prefix := fmt.Sprintf("[%s (%s)]", msg.Time().Format("15:04"), msg.From.UserName)
+		contextBuilder.WriteString(fmt.Sprintf("%s: %s\n", prefix, msg.Text))
+	}
+	contextText := contextBuilder.String()
+
 	const maxAttempts = 3 // Максимальное количество попыток генерации
 	const minWords = 10   // Минимальное количество слов в саммари
 
@@ -55,8 +64,8 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 			log.Printf("[DEBUG] Чат %d: Попытка генерации саммари №%d", chatID, attempt)
 		}
 
-		// Отправляем запрос к LLM с промптом для саммари
-		summary, err := b.llm.GenerateResponse(summaryPrompt, messages)
+		// Отправляем запрос к LLM с промптом для саммари и собранным контекстом
+		summary, err := b.llm.GenerateArbitraryResponse(summaryPrompt, contextText)
 		if err != nil {
 			lastErr = err // Сохраняем последнюю ошибку
 			if b.config.Debug {
