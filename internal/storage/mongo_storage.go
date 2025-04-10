@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors" // Для проверки ошибок MongoDB
 	"fmt"
 	"log"
 	"time"
@@ -66,15 +67,21 @@ func convertMongoToAPIMessage(mongoMsg *MongoMessage) *tgbotapi.Message {
 
 // MongoStorage реализует ChatHistoryStorage с использованием MongoDB.
 type MongoStorage struct {
-	client        *mongo.Client
-	database      *mongo.Database
-	collection    *mongo.Collection
-	contextWindow int
-	debug         bool
+	client                 *mongo.Client
+	database               *mongo.Database
+	messagesCollection     *mongo.Collection // Коллекция для сообщений
+	userProfilesCollection *mongo.Collection // Коллекция для профилей пользователей
+	contextWindow          int
+	debug                  bool
 }
 
 // NewMongoStorage создает новое хранилище MongoDB.
-func NewMongoStorage(mongoURI, dbName, collectionName string, contextWindow int, debug bool) (*MongoStorage, error) {
+// Добавляем имя коллекции для профилей.
+func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, contextWindow int, debug bool) (*MongoStorage, error) {
+	if mongoURI == "" || dbName == "" || messagesCollectionName == "" || userProfilesCollectionName == "" {
+		return nil, fmt.Errorf("URI MongoDB, имя БД и имена коллекций (сообщения, профили) должны быть указаны")
+	}
+
 	// Увеличиваем таймаут подключения
 	ctxConnect, cancelConnect := context.WithTimeout(context.Background(), 30*time.Second) // Было 10*time.Second
 	defer cancelConnect()
@@ -95,57 +102,118 @@ func NewMongoStorage(mongoURI, dbName, collectionName string, contextWindow int,
 		return nil, fmt.Errorf("ошибка проверки соединения с MongoDB (Ping): %w", err)
 	}
 
-	log.Println("Успешное подключение к MongoDB.")
+	log.Println("Успешно подключено к MongoDB.")
 
-	db := client.Database(dbName)
-	collection := db.Collection(collectionName)
+	database := client.Database(dbName)
+	messagesCollection := database.Collection(messagesCollectionName)
+	userProfilesCollection := database.Collection(userProfilesCollectionName)
 
-	storage := &MongoStorage{
-		client:        client,
-		database:      db,
-		collection:    collection,
-		contextWindow: contextWindow,
-		debug:         debug,
+	ms := &MongoStorage{
+		client:                 client,
+		database:               database,
+		messagesCollection:     messagesCollection,
+		userProfilesCollection: userProfilesCollection, // Сохраняем коллекцию профилей
+		contextWindow:          contextWindow,
+		debug:                  debug,
 	}
 
-	// Создаем индексы (можно добавить обработку ошибок, если критично)
-	err = storage.ensureIndexes() // Вызываем синхронно
-	if err != nil {
-		// Логируем ошибку, но не считаем фатальной для старта
-		log.Printf("[WARN] Ошибка при создании индекса MongoDB при инициализации: %v", err)
+	// Создаем индексы для обеих коллекций
+	if err := ms.ensureIndexes(); err != nil {
+		ms.Close() // Закрываем соединение в случае ошибки
+		return nil, fmt.Errorf("ошибка создания индексов MongoDB: %w", err)
 	}
 
-	return storage, nil
+	log.Println("Хранилище MongoDB успешно инициализировано.")
+
+	return ms, nil
 }
 
-// ensureIndexes создает необходимые индексы в коллекции MongoDB.
-// Возвращает ошибку, если создание не удалось.
-func (ms *MongoStorage) ensureIndexes() error { // Изменяем сигнатуру для возврата ошибки
-	// Индекс по chat_id и date для быстрой выборки сообщений чата в правильном порядке
-	indexModel := mongo.IndexModel{
-		Keys: bson.D{
-			{"chat_id", 1}, // 1 для сортировки по возрастанию
-			{"date", -1},   // -1 для сортировки по убыванию (новые первыми)
-		},
-	}
-
-	// Увеличим таймаут для создания индекса, если коллекция большая
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+// ensureIndexes создает необходимые индексы в коллекциях MongoDB.
+func (ms *MongoStorage) ensureIndexes() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Увеличим таймаут
 	defer cancel()
 
-	// Проверяем, что коллекция не nil
-	if ms.collection == nil {
-		return fmt.Errorf("коллекция MongoDB не инициализирована перед созданием индекса")
+	// --- Индексы для коллекции сообщений ---
+	messagesIndexes := []mongo.IndexModel{
+		{ // Добавляем индекс для выборки и сортировки сообщений по дате
+			Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "date", Value: -1}},
+			Options: options.Index().SetName("chat_id_date_desc"), // Имя индекса
+		},
+		// Можно добавить другие индексы для сообщений при необходимости, например, для поиска по user_id
+		// {
+		// 	Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "user_id", Value: 1}},
+		// 	Options: options.Index().SetName("chat_id_user_id"),
+		// },
 	}
+	// Убрал лог отсюда, т.к. он дублировался ниже
 
-	indexName, err := ms.collection.Indexes().CreateOne(ctx, indexModel)
+	// --- Индексы для коллекции профилей пользователей ---
+	profilesIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "user_id", Value: 1}}, // Уникальный составной индекс
+			Options: options.Index().SetName("chat_id_user_id_unique").SetUnique(true),
+		},
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "last_seen", Value: -1}}, // Для выборки всех профилей чата и сортировки
+			Options: options.Index().SetName("chat_id_last_seen_desc"),
+		},
+	}
+	// Создаем индексы для сообщений
+	_, err := ms.messagesCollection.Indexes().CreateMany(ctx, messagesIndexes)
 	if err != nil {
-		// Возвращаем ошибку для логирования в вызывающей функции
-		return fmt.Errorf("не удалось создать индекс MongoDB (chat_id, date): %w", err)
+		// Проверяем на специфическую ошибку (индексы уже существуют) и игнорируем ее
+		cmdErr, ok := err.(mongo.CommandError)
+		if !ok || !cmdErr.HasErrorCode(85) { // 85 = IndexOptionsConflict (при изменении опций существующего)
+			// 86 = IndexKeySpecsConflict (при изменении ключей существующего)
+			// Error codes могут отличаться в версиях MongoDB, но 85/86 частые для конфликтов индексов
+			writeErr, okWrite := err.(mongo.WriteException)
+			alreadyExists := false
+			if okWrite {
+				for _, we := range writeErr.WriteErrors {
+					if we.Code == 11000 { // Код ошибки дубликата ключа, может возникать при гонке создания уникального индекса
+						alreadyExists = true
+						break
+					}
+				}
+			}
+			if !alreadyExists { // Если это не ошибка конфликта или дубликата, возвращаем ее
+				return fmt.Errorf("ошибка создания индексов для коллекции сообщений: %w", err)
+			}
+		}
+		// Если ошибка связана с конфликтом или дубликатом, просто логируем как debug
+		if ms.debug {
+			log.Printf("[DEBUG] Индексы для сообщений: конфликт или уже существуют (%v)", err)
+		}
 	}
+	log.Println("Индексы для коллекции сообщений MongoDB проверены/созданы.")
 
-	log.Printf("Индекс MongoDB '%s' (chat_id, date) успешно создан или уже существует.", indexName)
-	return nil // Успех
+	// --- Индексы для коллекции профилей пользователей ---
+	_, err = ms.userProfilesCollection.Indexes().CreateMany(ctx, profilesIndexes)
+	if err != nil {
+		// Аналогичная проверка на ошибки конфликта/дубликата
+		cmdErr, ok := err.(mongo.CommandError)
+		if !ok || !cmdErr.HasErrorCode(85) {
+			writeErr, okWrite := err.(mongo.WriteException)
+			alreadyExists := false
+			if okWrite {
+				for _, we := range writeErr.WriteErrors {
+					if we.Code == 11000 {
+						alreadyExists = true
+						break
+					}
+				}
+			}
+			if !alreadyExists {
+				return fmt.Errorf("ошибка создания индексов для коллекции профилей: %w", err)
+			}
+		}
+		if ms.debug {
+			log.Printf("[DEBUG] Индексы для профилей: конфликт или уже существуют (%v)", err)
+		}
+	}
+	log.Println("Индексы для коллекции профилей MongoDB проверены/созданы.")
+
+	return nil
 }
 
 // Close закрывает соединение с MongoDB.
@@ -183,7 +251,7 @@ func (ms *MongoStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
 	defer cancel()
 
 	// Вставляем одно сообщение
-	insertResult, err := ms.collection.InsertOne(ctx, mongoMsg)
+	insertResult, err := ms.messagesCollection.InsertOne(ctx, mongoMsg)
 	if err != nil {
 		// Логируем ошибку более подробно
 		log.Printf("[Mongo AddMessage ERROR] Чат %d: Ошибка вставки сообщения ID %d: %v", chatID, message.MessageID, err)
@@ -270,7 +338,7 @@ func (ms *MongoStorage) GetMessages(chatID int64) []*tgbotapi.Message {
 		SetSort(bson.D{{"date", -1}}). // Сортируем по дате, новые первыми
 		SetLimit(int64(ms.contextWindow))
 
-	cursor, err := ms.collection.Find(ctx, filter, findOptions)
+	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			if ms.debug {
@@ -324,7 +392,7 @@ func (ms *MongoStorage) GetMessagesSince(chatID int64, since time.Time) []*tgbot
 	// Сортируем по дате, старые первыми, лимит не нужен
 	findOptions := options.Find().SetSort(bson.D{{"date", 1}})
 
-	cursor, err := ms.collection.Find(ctx, filter, findOptions)
+	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			if ms.debug {
@@ -423,7 +491,7 @@ func (ms *MongoStorage) AddMessagesToContext(chatID int64, messages []*tgbotapi.
 		return
 	}
 
-	_, err := ms.collection.InsertMany(ctx, mongoMessages)
+	_, err := ms.messagesCollection.InsertMany(ctx, mongoMessages)
 	if err != nil {
 		log.Printf("[Mongo AddToContext ERROR] Чат %d: Ошибка вставки %d сообщений: %v", chatID, len(mongoMessages), err)
 	} else {
@@ -438,4 +506,132 @@ func (ms *MongoStorage) GetAllChatIDs() ([]int64, error) {
 	// TODO: Реализовать получение уникальных chat_id из MongoDB
 	log.Printf("[Mongo GetAllChatIDs STUB]")
 	return nil, nil
+}
+
+// --- Методы для профилей пользователей ---
+
+// GetUserProfile возвращает профиль пользователя из MongoDB.
+func (ms *MongoStorage) GetUserProfile(chatID int64, userID int64) (*UserProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID, "user_id": userID}
+	var profile UserProfile
+
+	err := ms.userProfilesCollection.FindOne(ctx, filter).Decode(&profile)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			if ms.debug {
+				log.Printf("DEBUG: Профиль пользователя userID %d в чате %d не найден в MongoDB.", userID, chatID)
+			}
+			return nil, nil // Не найдено - не ошибка
+		}
+		log.Printf("ERROR: Ошибка получения профиля пользователя из MongoDB (чат %d, user %d): %v", chatID, userID, err)
+		return nil, fmt.Errorf("ошибка запроса профиля пользователя: %w", err)
+	}
+
+	if ms.debug {
+		log.Printf("DEBUG: Профиль пользователя userID %d в чате %d успешно получен из MongoDB.", userID, chatID)
+	}
+	return &profile, nil
+}
+
+// SetUserProfile создает или обновляет профиль пользователя в MongoDB (UPSERT).
+func (ms *MongoStorage) SetUserProfile(profile *UserProfile) error {
+	if profile == nil || profile.ChatID == 0 || profile.UserID == 0 {
+		log.Printf("[Mongo SetUserProfile WARN] Попытка сохранить невалидный профиль: ChatID=%d, UserID=%d", profile.ChatID, profile.UserID)
+		return fmt.Errorf("невалидный профиль для сохранения (nil, chat_id=0 или user_id=0)")
+	}
+
+	if ms.debug {
+		log.Printf("[Mongo SetUserProfile DEBUG] Попытка сохранения профиля: ChatID=%d, UserID=%d, Username=%s, FirstName=%s, LastName=%s, RealName=%s, Bio=%s, LastSeen=%s",
+			profile.ChatID, profile.UserID, profile.Username, profile.FirstName, profile.LastName, profile.RealName, profile.Bio, profile.LastSeen)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Фильтр для поиска существующего документа
+	filter := bson.M{"chat_id": profile.ChatID, "user_id": profile.UserID}
+
+	// Данные для обновления или вставки
+	// Используем $set для обновления всех полей, кроме chat_id и user_id, которые в фильтре
+	// Используем $setOnInsert для полей, которые нужно установить только при создании документа
+	update := bson.M{
+		"$set": bson.M{
+			// Обновляем основные данные из Telegram при каждом сохранении
+			"username":   profile.Username, // Может меняться
+			"first_name": profile.FirstName,
+			"last_name":  profile.LastName,
+			"last_seen":  profile.LastSeen, // Обновляем время последней активности
+			// Обновляем кастомные поля, если они были изменены
+			"real_name": profile.RealName,
+			"bio":       profile.Bio,
+		},
+		"$setOnInsert": bson.M{
+			"chat_id": profile.ChatID,
+			"user_id": profile.UserID,
+		},
+	}
+
+	// Опции для выполнения Upsert (Update or Insert)
+	opts := options.Update().SetUpsert(true)
+
+	if ms.debug {
+		log.Printf("[Mongo SetUserProfile DEBUG] Выполнение Upsert для ChatID=%d, UserID=%d", profile.ChatID, profile.UserID)
+	}
+
+	// Выполняем операцию
+	result, err := ms.userProfilesCollection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[Mongo SetUserProfile ERROR] Ошибка при Upsert профиля ChatID=%d, UserID=%d: %v", profile.ChatID, profile.UserID, err)
+		return fmt.Errorf("ошибка сохранения профиля пользователя: %w", err)
+	}
+
+	if ms.debug {
+		if result.UpsertedCount > 0 {
+			log.Printf("[Mongo SetUserProfile DEBUG] Профиль для ChatID=%d, UserID=%d успешно создан (UpsertedID: %v).", profile.ChatID, profile.UserID, result.UpsertedID)
+		} else if result.ModifiedCount > 0 {
+			log.Printf("[Mongo SetUserProfile DEBUG] Профиль для ChatID=%d, UserID=%d успешно обновлен.", profile.ChatID, profile.UserID)
+		} else if result.MatchedCount > 0 {
+			log.Printf("[Mongo SetUserProfile DEBUG] Профиль для ChatID=%d, UserID=%d найден, но не изменен (данные совпадают).", profile.ChatID, profile.UserID)
+		} else {
+			// Эта ветка не должна достигаться при upsert=true, если не было ошибки
+			log.Printf("[Mongo SetUserProfile WARN] Upsert для ChatID=%d, UserID=%d завершился без ошибки, но результат неопределен: Matched=%d, Modified=%d, Upserted=%d",
+				profile.ChatID, profile.UserID, result.MatchedCount, result.ModifiedCount, result.UpsertedCount)
+		}
+	}
+
+	return nil
+}
+
+// GetAllUserProfiles возвращает все профили пользователей для указанного чата из MongoDB.
+func (ms *MongoStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	// Сортируем по last_seen для релевантности
+	findOptions := options.Find().SetSort(bson.D{{Key: "last_seen", Value: -1}})
+
+	cursor, err := ms.userProfilesCollection.Find(ctx, filter, findOptions)
+	if err != nil {
+		log.Printf("ERROR: Ошибка получения всех профилей пользователей из MongoDB (чат %d): %v", chatID, err)
+		return nil, fmt.Errorf("ошибка запроса профилей: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var profiles []*UserProfile
+	if err = cursor.All(ctx, &profiles); err != nil {
+		log.Printf("ERROR: Ошибка декодирования профилей пользователей из MongoDB (чат %d): %v", chatID, err)
+		return nil, fmt.Errorf("ошибка декодирования профилей: %w", err)
+	}
+
+	// Важно: если профилей нет, cursor.All вернет пустой слайс и nil ошибку.
+	// Проверка на profiles == nil не нужна.
+
+	if ms.debug {
+		log.Printf("DEBUG: Получено %d профилей пользователей из MongoDB для чата %d.", len(profiles), chatID)
+	}
+	return profiles, nil
 }

@@ -7,9 +7,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	// Импортируем config
+	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -251,4 +254,110 @@ func getRandomElement(slice []string) string {
 	}
 	rand.Seed(time.Now().UnixNano()) // Убедимся, что генератор случайных чисел инициализирован
 	return slice[rand.Intn(len(slice))]
+}
+
+// isAdmin проверяет, является ли пользователь администратором бота.
+// Сравнивает username пользователя (без @) со списком AdminUsernames из конфига.
+func (b *Bot) isAdmin(user *tgbotapi.User) bool {
+	if user == nil {
+		return false
+	}
+	usernameLower := strings.ToLower(user.UserName)
+	for _, adminUsername := range b.config.AdminUsernames {
+		if strings.ToLower(adminUsername) == usernameLower {
+			return true
+		}
+	}
+	return false
+}
+
+// parseProfileArgs разбирает строку с данными профиля.
+// Ожидаемый формат: "@username - ID - FirstName - RealName - Bio"
+// ID - необязательное целое число. Если некорректно или отсутствует, возвращается 0.
+// Возвращает: targetUsername (без @), targetUserID (или 0), firstName, realName, bio, error
+func parseProfileArgs(text string) (targetUsername string, targetUserID int64, firstName, realName, bio string, err error) {
+	argsText := text                             // The input text is already the arguments
+	argParts := strings.SplitN(argsText, "-", 5) // Разделяем по тире, ожидаем 5 частей
+
+	if len(argParts) != 5 {
+		err = fmt.Errorf("неверное количество аргументов. Ожидается 5 частей, разделенные тире: @username - ID - Имя - Реал.имя - Био")
+		return
+	}
+
+	targetUsername = strings.TrimSpace(argParts[0])
+	idStr := strings.TrimSpace(argParts[1])
+	firstName = strings.TrimSpace(argParts[2])
+	realName = strings.TrimSpace(argParts[3])
+	bio = strings.TrimSpace(argParts[4])
+
+	// Парсим ID, если он не пустой
+	if idStr != "" {
+		parsedID, parseErr := strconv.ParseInt(idStr, 10, 64)
+		if parseErr != nil {
+			// Ошибка парсинга ID не фатальна, просто используем 0
+			log.Printf("[WARN][parseProfileArgs] Не удалось распарсить ID '%s': %v. Используется ID=0.", idStr, parseErr)
+			targetUserID = 0
+		} else {
+			targetUserID = parsedID
+		}
+	} else {
+		// ID не указан, используем 0
+		targetUserID = 0
+	}
+
+	// Проверяем, что username начинается с @
+	if !strings.HasPrefix(targetUsername, "@") {
+		err = fmt.Errorf("имя пользователя должно начинаться с @")
+		return
+	}
+	targetUsername = targetUsername[1:] // Убираем @ для поиска
+
+	if targetUsername == "" || firstName == "" {
+		err = fmt.Errorf("имя пользователя и короткое имя не могут быть пустыми")
+		return
+	}
+
+	return
+}
+
+// getUserIDByUsername ищет ID пользователя по его Username в сохраненных профилях.
+// Возвращает 0, если пользователь не найден.
+// Username передается БЕЗ символа @
+func (b *Bot) getUserIDByUsername(chatID int64, username string) (int64, error) {
+	profiles, err := b.storage.GetAllUserProfiles(chatID)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка получения профилей чата: %w", err)
+	}
+
+	usernameLower := strings.ToLower(username)
+	for _, profile := range profiles {
+		if strings.ToLower(profile.Username) == usernameLower {
+			return profile.UserID, nil
+		}
+	}
+
+	return 0, nil // Пользователь не найден
+}
+
+// findUserProfileByUsername ищет профиль пользователя по его Username в указанном чате.
+// Возвращает nil, nil если профиль не найден.
+// Username передается БЕЗ символа @
+func (b *Bot) findUserProfileByUsername(chatID int64, username string) (*storage.UserProfile, error) {
+	profiles, err := b.storage.GetAllUserProfiles(chatID)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения профилей чата %d для поиска @%s: %w", chatID, username, err)
+	}
+
+	usernameLower := strings.ToLower(username)
+	for _, profile := range profiles {
+		// Сравниваем без учета регистра
+		if strings.ToLower(profile.Username) == usernameLower {
+			// Нашли профиль, возвращаем его копию (для безопасности)
+			foundProfile := *profile // Копируем значение
+			return &foundProfile, nil
+		}
+	}
+
+	// Профиль не найден
+	return nil, nil
 }

@@ -70,12 +70,14 @@ type Config struct {
 	PostgresqlPassword string
 	PostgresqlDbname   string
 	// Настройки MongoDB
-	MongoDbURI        string // Строка подключения MongoDB
-	MongoDbName       string // Имя базы данных MongoDB
-	MongoDbCollection string // Имя коллекции MongoDB
-
+	MongoDbURI                    string // Строка подключения MongoDB
+	MongoDbName                   string // Имя базы данных MongoDB
+	MongoDbMessagesCollection     string // Имя коллекции для сообщений MongoDB
+	MongoDbUserProfilesCollection string // Имя коллекции для профилей MongoDB
 	// Тип хранилища ("file", "postgres" или "mongo")
 	StorageType StorageType
+	// Список администраторов бота (через запятую)
+	AdminUsernames []string
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -250,14 +252,15 @@ func Load() (*Config, error) {
 		ContextWindow:              contextWindow,
 		Debug:                      debug,
 		// Заполняем новые поля для БД с префиксом Postgresql
-		PostgresqlHost:     dbHost,
-		PostgresqlPort:     dbPort,
-		PostgresqlUser:     dbUser,
-		PostgresqlPassword: dbPassword,
-		PostgresqlDbname:   dbName,
-		MongoDbURI:         getEnvOrDefault("MONGODB_URI", ""),
-		MongoDbName:        getEnvOrDefault("MONGODB_DBNAME", "rofloslav_history"),
-		MongoDbCollection:  getEnvOrDefault("MONGODB_COLLECTION", "chat_messages"),
+		PostgresqlHost:                dbHost,
+		PostgresqlPort:                dbPort,
+		PostgresqlUser:                dbUser,
+		PostgresqlPassword:            dbPassword,
+		PostgresqlDbname:              dbName,
+		MongoDbURI:                    getEnvOrDefault("MONGODB_URI", ""),
+		MongoDbName:                   getEnvOrDefault("MONGODB_DBNAME", "rofloslav_history"),
+		MongoDbMessagesCollection:     getEnvOrDefault("MONGODB_MESSAGES_COLLECTION", "chat_messages"),
+		MongoDbUserProfilesCollection: getEnvOrDefault("MONGODB_USER_PROFILES_COLLECTION", "user_profiles"),
 	}
 
 	// Валидация и установка StorageType
@@ -330,9 +333,29 @@ func Load() (*Config, error) {
 		if cfg.MongoDbName == "" {
 			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_DBNAME не установлен")
 		}
-		if cfg.MongoDbCollection == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_COLLECTION не установлен")
+		if cfg.MongoDbMessagesCollection == "" {
+			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_MESSAGES_COLLECTION не установлен")
 		}
+		if cfg.MongoDbUserProfilesCollection == "" {
+			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_USER_PROFILES_COLLECTION не установлен")
+		}
+	}
+
+	// Администраторы
+	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight") // По умолчанию lightnight
+	cfg.AdminUsernames = strings.Split(adminUsernamesStr, ",")
+	// Очистка пробелов и пустых строк
+	cleanedAdmins := make([]string, 0, len(cfg.AdminUsernames))
+	for _, admin := range cfg.AdminUsernames {
+		trimmedAdmin := strings.TrimSpace(admin)
+		if trimmedAdmin != "" {
+			cleanedAdmins = append(cleanedAdmins, trimmedAdmin)
+		}
+	}
+	cfg.AdminUsernames = cleanedAdmins
+	// Убедимся, что хотя бы один админ есть (lightnight по умолчанию)
+	if len(cfg.AdminUsernames) == 0 {
+		cfg.AdminUsernames = []string{"lightnight"}
 	}
 
 	// Логирование загруженной конфигурации (без секретов)
@@ -388,7 +411,8 @@ func logLoadedConfig(cfg *Config) {
 	case StorageTypeMongo:
 		log.Printf("  MongoDB URI: %s", maskSecretURI(cfg.MongoDbURI))
 		log.Printf("  MongoDB DB Name: %s", cfg.MongoDbName)
-		log.Printf("  MongoDB Collection: %s", cfg.MongoDbCollection)
+		log.Printf("  MongoDB Messages Collection: %s", cfg.MongoDbMessagesCollection)
+		log.Printf("  MongoDB User Profiles Collection: %s", cfg.MongoDbUserProfilesCollection)
 	case StorageTypeFile:
 		log.Printf("  File Storage Path: /data/chat_*.json")
 	}

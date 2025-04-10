@@ -46,19 +46,28 @@ func NewPostgresStorage(dbHost, dbPort, dbUser, dbPassword, dbName string, conte
 		debug:         debug,
 	}
 
-	// Создаем таблицу, если она не существует
-	if err = storage.createTableIfNotExists(); err != nil {
+	// Создаем таблицы, если их нет
+	if err := storage.createTablesIfNotExists(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("ошибка создания таблицы chat_messages: %w", err)
+		return nil, fmt.Errorf("ошибка создания таблиц PostgreSQL: %w", err)
 	}
 
-	log.Printf("Хранилище PostgreSQL успешно инициализировано и подключено к '%s' на '%s:%s'", dbName, dbHost, dbPort)
+	log.Println("Таблицы PostgreSQL проверены/созданы.")
+
 	return storage, nil
 }
 
-// createTableIfNotExists создает таблицу для хранения сообщений чата.
-func (ps *PostgresStorage) createTableIfNotExists() error {
-	query := `
+// createTablesIfNotExists создает необходимые таблицы в базе данных, если они не существуют.
+func (ps *PostgresStorage) createTablesIfNotExists() error {
+	ctx := context.Background()
+	tx, err := ps.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("ошибка начала транзакции: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Таблица для сообщений чата
+	chatMessagesQuery := `
 	CREATE TABLE IF NOT EXISTS chat_messages (
 		chat_id BIGINT NOT NULL,
 		message_id INT NOT NULL,
@@ -80,14 +89,60 @@ func (ps *PostgresStorage) createTableIfNotExists() error {
 	-- Добавляем индекс для user_id (может быть полезно для аналитики)
 	CREATE INDEX IF NOT EXISTS idx_chat_messages_user_id ON chat_messages (user_id);
 	`
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	_, err := ps.db.ExecContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("ошибка выполнения SQL для создания таблицы/индексов: %w", err)
+	if _, err := tx.ExecContext(ctx, chatMessagesQuery); err != nil {
+		return fmt.Errorf("ошибка создания таблицы chat_messages: %w", err)
 	}
-	log.Println("Таблица 'chat_messages' и индексы проверены/созданы.")
+	log.Println("Индекс для chat_messages проверен/создан.")
+
+	// Таблица для профилей пользователей
+	profilesTableQuery := `
+	CREATE TABLE IF NOT EXISTS user_profiles (
+		chat_id BIGINT NOT NULL,
+		user_id BIGINT NOT NULL,
+		username VARCHAR(255),
+		first_name VARCHAR(255),
+		last_name VARCHAR(255),
+		real_name TEXT DEFAULT '', -- Реальное имя
+		bio TEXT DEFAULT '',       -- Био/Описание
+		last_seen TIMESTAMPTZ,     -- Время последнего сообщения
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (chat_id, user_id) -- Составной первичный ключ
+	);`
+	if _, err := tx.ExecContext(ctx, profilesTableQuery); err != nil {
+		return fmt.Errorf("ошибка создания таблицы user_profiles: %w", err)
+	}
+	log.Println("Таблица user_profiles проверена/создана.")
+
+	// Триггер для автоматического обновления updated_at в user_profiles
+	triggerFunctionQuery := `
+	CREATE OR REPLACE FUNCTION update_updated_at_column()
+	RETURNS TRIGGER AS $$
+	BEGIN
+	   NEW.updated_at = NOW();
+	   RETURN NEW;
+	END;
+	$$ language 'plpgsql';`
+	if _, err := tx.ExecContext(ctx, triggerFunctionQuery); err != nil {
+		return fmt.Errorf("ошибка создания триггерной функции update_updated_at_column: %w", err)
+	}
+
+	triggerQuery := `
+	DROP TRIGGER IF EXISTS update_user_profiles_updated_at ON user_profiles; -- Удаляем старый триггер, если он есть
+	CREATE TRIGGER update_user_profiles_updated_at
+	BEFORE UPDATE ON user_profiles
+	FOR EACH ROW
+	EXECUTE FUNCTION update_updated_at_column();`
+	if _, err := tx.ExecContext(ctx, triggerQuery); err != nil {
+		return fmt.Errorf("ошибка создания триггера для user_profiles: %w", err)
+	}
+	log.Println("Триггер updated_at для user_profiles проверен/создан.")
+
+	// Коммит транзакции
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("ошибка коммита транзакции: %w", err)
+	}
+
 	return nil
 }
 
@@ -353,4 +408,188 @@ func jsonify(v interface{}) sql.NullString {
 		String: string(data),
 		Valid:  true,
 	}
+}
+
+// --- Методы для профилей пользователей ---
+
+// GetUserProfile возвращает профиль пользователя из PostgreSQL.
+func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	query := `
+		SELECT username, first_name, last_name, real_name, bio, last_seen, created_at, updated_at
+		FROM user_profiles
+		WHERE chat_id = $1 AND user_id = $2;
+	`
+	row := ps.db.QueryRowContext(ctx, query, chatID, userID)
+
+	var profile UserProfile
+	profile.ChatID = chatID // Заполняем известные поля
+	profile.UserID = userID
+
+	// Используем NullString и NullTime для полей, которые могут быть NULL
+	var username, firstName, lastName, realName, bio sql.NullString
+	var lastSeen, createdAt, updatedAt sql.NullTime
+
+	err := row.Scan(
+		&username, &firstName, &lastName, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			if ps.debug {
+				log.Printf("DEBUG: Профиль пользователя userID %d в чате %d не найден в PostgreSQL.", userID, chatID)
+			}
+			return nil, nil // Не найдено - не ошибка
+		}
+		log.Printf("ERROR: Ошибка получения профиля пользователя из PostgreSQL (чат %d, user %d): %v", chatID, userID, err)
+		return nil, fmt.Errorf("ошибка запроса профиля пользователя: %w", err)
+	}
+
+	// Заполняем профиль данными из базы, проверяя Valid
+	if username.Valid {
+		profile.Username = username.String
+	}
+	if firstName.Valid {
+		profile.FirstName = firstName.String
+	}
+	if lastName.Valid {
+		profile.LastName = lastName.String
+	}
+	if realName.Valid {
+		profile.RealName = realName.String
+	}
+	if bio.Valid {
+		profile.Bio = bio.String
+	}
+	if lastSeen.Valid {
+		profile.LastSeen = lastSeen.Time
+	}
+	if createdAt.Valid {
+		profile.CreatedAt = createdAt.Time
+	}
+	if updatedAt.Valid {
+		profile.UpdatedAt = updatedAt.Time
+	}
+
+	if ps.debug {
+		log.Printf("DEBUG: Профиль пользователя userID %d в чате %d успешно получен из PostgreSQL.", userID, chatID)
+	}
+	return &profile, nil
+}
+
+// SetUserProfile создает или обновляет профиль пользователя в PostgreSQL (UPSERT).
+func (ps *PostgresStorage) SetUserProfile(profile *UserProfile) error {
+	if profile == nil || profile.ChatID == 0 || profile.UserID == 0 {
+		return fmt.Errorf("невалидный профиль для сохранения (nil, chat_id=0 или user_id=0)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Используем INSERT ... ON CONFLICT ... DO UPDATE для UPSERT
+	query := `
+		INSERT INTO user_profiles (
+			chat_id, user_id, username, first_name, last_name, real_name, bio, last_seen, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+		ON CONFLICT (chat_id, user_id) DO UPDATE SET
+			username = EXCLUDED.username,
+			first_name = EXCLUDED.first_name,
+			last_name = EXCLUDED.last_name,
+			real_name = EXCLUDED.real_name,
+			bio = EXCLUDED.bio,
+			last_seen = EXCLUDED.last_seen,
+			updated_at = NOW(); -- Обновляем updated_at при обновлении (триггер тоже это делает, но так надежнее)
+	`
+
+	_, err := ps.db.ExecContext(ctx, query,
+		profile.ChatID,
+		profile.UserID,
+		sql.NullString{String: profile.Username, Valid: profile.Username != ""},
+		sql.NullString{String: profile.FirstName, Valid: profile.FirstName != ""},
+		sql.NullString{String: profile.LastName, Valid: profile.LastName != ""},
+		sql.NullString{String: profile.RealName, Valid: true}, // real_name и bio всегда Valid, но могут быть пустыми
+		sql.NullString{String: profile.Bio, Valid: true},
+		sql.NullTime{Time: profile.LastSeen, Valid: !profile.LastSeen.IsZero()}, // Сохраняем, если не нулевое время
+	)
+
+	if err != nil {
+		log.Printf("ERROR: Ошибка сохранения/обновления профиля пользователя в PostgreSQL (чат %d, user %d): %v", profile.ChatID, profile.UserID, err)
+		return fmt.Errorf("ошибка сохранения профиля: %w", err)
+	}
+
+	if ps.debug {
+		log.Printf("DEBUG: Профиль пользователя userID %d в чате %d успешно сохранен/обновлен в PostgreSQL.", profile.UserID, profile.ChatID)
+	}
+	return nil
+}
+
+// GetAllUserProfiles возвращает все профили пользователей для указанного чата из PostgreSQL.
+func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := `
+		SELECT user_id, username, first_name, last_name, real_name, bio, last_seen, created_at, updated_at
+		FROM user_profiles
+		WHERE chat_id = $1
+		ORDER BY last_seen DESC NULLS LAST, updated_at DESC; -- Сортируем для возможной релевантности
+	`
+	rows, err := ps.db.QueryContext(ctx, query, chatID)
+	if err != nil {
+		log.Printf("ERROR: Ошибка получения всех профилей пользователей из PostgreSQL (чат %d): %v", chatID, err)
+		return nil, fmt.Errorf("ошибка запроса профилей: %w", err)
+	}
+	defer rows.Close()
+
+	var profiles []*UserProfile
+	for rows.Next() {
+		var profile UserProfile
+		profile.ChatID = chatID // Заполняем chatID
+
+		var userID int64
+		var username, firstName, lastName, realName, bio sql.NullString
+		var lastSeen, createdAt, updatedAt sql.NullTime
+
+		if err := rows.Scan(
+			&userID, &username, &firstName, &lastName, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
+		); err != nil {
+			log.Printf("ERROR: Ошибка сканирования строки профиля пользователя PostgreSQL (чат %d): %v", chatID, err)
+			continue
+		}
+
+		profile.UserID = userID
+		if username.Valid {
+			profile.Username = username.String
+		}
+		if firstName.Valid {
+			profile.FirstName = firstName.String
+		}
+		if lastName.Valid {
+			profile.LastName = lastName.String
+		}
+		if realName.Valid {
+			profile.RealName = realName.String
+		}
+		if bio.Valid {
+			profile.Bio = bio.String
+		}
+		if lastSeen.Valid {
+			profile.LastSeen = lastSeen.Time
+		}
+		if createdAt.Valid {
+			profile.CreatedAt = createdAt.Time
+		}
+		if updatedAt.Valid {
+			profile.UpdatedAt = updatedAt.Time
+		}
+
+		profiles = append(profiles, &profile)
+	}
+
+	if ps.debug {
+		log.Printf("DEBUG: Получено %d профилей пользователей из PostgreSQL для чата %d.", len(profiles), chatID)
+	}
+	return profiles, nil
 }

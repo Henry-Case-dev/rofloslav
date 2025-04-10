@@ -9,6 +9,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// Максимальное количество последних сообщений из 24ч окна для отправки на саммари
+const maxMessagesForSummary = 1500
+
 // createAndSendSummary создает и отправляет саммари диалога,
 // редактируя существующее сообщение или отправляя новое.
 func (b *Bot) createAndSendSummary(chatID int64) {
@@ -36,8 +39,15 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 		return
 	}
 
+	// --- Ограничение количества сообщений для саммари ---
+	if len(messages) > maxMessagesForSummary {
+		log.Printf("[DEBUG][Summary] Чат %d: Слишком много сообщений для саммари (%d > %d). Обрезаю до последних %d.", chatID, len(messages), maxMessagesForSummary, maxMessagesForSummary)
+		messages = messages[len(messages)-maxMessagesForSummary:]
+	}
+	// --- Конец ограничения ---
+
 	if b.config.Debug {
-		log.Printf("[DEBUG] Создаю саммари для чата %d. Найдено сообщений: %d. Инфо-сообщение ID: %d", chatID, len(messages), infoMessageID)
+		log.Printf("[DEBUG] Создаю саммари для чата %d. Используется сообщений: %d. Инфо-сообщение ID: %d", chatID, len(messages), infoMessageID)
 	}
 
 	// Используем только промпт для саммари без комбинирования

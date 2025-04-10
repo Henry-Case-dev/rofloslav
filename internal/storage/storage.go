@@ -1,6 +1,8 @@
 package storage
 
 import (
+	// Добавим для sql.NullString в Postgres
+
 	"fmt"
 	"log"
 	"os"
@@ -9,38 +11,49 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.mongodb.org/mongo-driver/bson/primitive" // Добавим для MongoDB ID
 )
 
-// ChatHistoryStorage определяет общий интерфейс для хранения истории сообщений.
-// Это позволяет использовать разные бэкенды (файлы, PostgreSQL).
+// UserProfile содержит информацию о пользователе чата.
+type UserProfile struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty"`              // ID для MongoDB
+	ChatID    int64              `bson:"chat_id" db:"chat_id"`       // ID чата, к которому привязан профиль
+	UserID    int64              `bson:"user_id" db:"user_id"`       // ID пользователя Telegram
+	Username  string             `bson:"username" db:"username"`     // Никнейм Telegram (@username)
+	FirstName string             `bson:"first_name" db:"first_name"` // Имя Telegram
+	LastName  string             `bson:"last_name" db:"last_name"`   // Фамилия Telegram
+	RealName  string             `bson:"real_name" db:"real_name"`   // Реальное имя (если известно)
+	Bio       string             `bson:"bio" db:"bio"`               // Редактируемое описание/бэкграунд
+	LastSeen  time.Time          `bson:"last_seen" db:"last_seen"`   // Время последнего сообщения (для актуальности)
+	// Можно добавить другие поля по необходимости
+	CreatedAt time.Time `bson:"created_at" db:"created_at"` // Время создания записи
+	UpdatedAt time.Time `bson:"updated_at" db:"updated_at"` // Время последнего обновления
+}
+
+// ChatHistoryStorage определяет общий интерфейс для хранения истории сообщений и профилей пользователей.
 type ChatHistoryStorage interface {
-	// AddMessage добавляет одно сообщение в историю чата.
+	// === Методы для истории сообщений ===
 	AddMessage(chatID int64, message *tgbotapi.Message)
-
-	// GetMessages возвращает все сообщения из истории чата (в пределах окна контекста).
 	GetMessages(chatID int64) []*tgbotapi.Message
-
-	// GetMessagesSince возвращает сообщения из истории чата, начиная с указанного времени.
 	GetMessagesSince(chatID int64, since time.Time) []*tgbotapi.Message
-
-	// LoadChatHistory загружает историю сообщений для чата из постоянного хранилища.
-	// Возвращает nil, nil если история не найдена.
 	LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error)
-
-	// SaveChatHistory сохраняет текущую историю сообщений чата в постоянное хранилище.
 	SaveChatHistory(chatID int64) error
-
-	// ClearChatHistory очищает историю сообщений для чата как в памяти, так и в постоянном хранилище (если применимо).
 	ClearChatHistory(chatID int64) error
-
-	// AddMessagesToContext добавляет массив сообщений в контекст чата (в память).
 	AddMessagesToContext(chatID int64, messages []*tgbotapi.Message)
-
-	// GetAllChatIDs возвращает список ID всех чатов, для которых есть история.
-	// Необходимо для периодического сохранения.
 	GetAllChatIDs() ([]int64, error)
 
-	// Close закрывает соединение с хранилищем (например, с БД), если это необходимо.
+	// === Методы для профилей пользователей ===
+	// GetUserProfile возвращает профиль пользователя для конкретного чата.
+	// Возвращает nil, nil если профиль не найден.
+	GetUserProfile(chatID int64, userID int64) (*UserProfile, error)
+
+	// SetUserProfile создает или обновляет профиль пользователя для конкретного чата.
+	SetUserProfile(profile *UserProfile) error
+
+	// GetAllUserProfiles возвращает все профили пользователей для указанного чата.
+	GetAllUserProfiles(chatID int64) ([]*UserProfile, error)
+
+	// Close закрывает соединение с хранилищем.
 	Close() error
 }
 
@@ -204,4 +217,18 @@ func (fs *FileStorage) GetAllChatIDs() ([]int64, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// --- Методы для профилей пользователей (не реализованы для FileStorage) ---
+
+func (fs *FileStorage) GetUserProfile(chatID int64, userID int64) (*UserProfile, error) {
+	return nil, fmt.Errorf("GetUserProfile не реализован для FileStorage")
+}
+
+func (fs *FileStorage) SetUserProfile(profile *UserProfile) error {
+	return fmt.Errorf("SetUserProfile не реализован для FileStorage")
+}
+
+func (fs *FileStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
+	return nil, fmt.Errorf("GetAllUserProfiles не реализован для FileStorage")
 }

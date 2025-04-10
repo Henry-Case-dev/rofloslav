@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ type Bot struct {
 	summaryMutex       sync.RWMutex
 	lastSummaryRequest map[int64]time.Time
 	autoSummaryTicker  *time.Ticker // Оставляем для авто-саммари
+	randSource         *rand.Rand   // Источник случайных чисел
 }
 
 // New создает и инициализирует новый экземпляр бота
@@ -90,18 +92,18 @@ func New(cfg *config.Config) (*Bot, error) {
 		}
 	case config.StorageTypeMongo:
 		log.Println("Попытка инициализации MongoDB хранилища...")
-		// Используем новые поля из конфига для имени БД и коллекции
 		mongoStorage, mongoErr := storage.NewMongoStorage(
 			cfg.MongoDbURI,
-			cfg.MongoDbName,       // Передаем имя БД
-			cfg.MongoDbCollection, // Передаем имя коллекции
+			cfg.MongoDbName,
+			cfg.MongoDbMessagesCollection,
+			cfg.MongoDbUserProfilesCollection,
 			cfg.ContextWindow,
 			cfg.Debug,
 		)
 		if mongoErr != nil {
 			log.Printf("[WARN] Ошибка инициализации MongoDB хранилища: %v. Переключение на файловое хранилище.", mongoErr)
 			// Fallback на файловое хранилище
-			chatStorage = storage.NewFileStorage(cfg.ContextWindow, true) // true для autoSave
+			chatStorage = storage.NewFileStorage(cfg.ContextWindow, true)
 			log.Println("Используется файловое хранилище (fallback).")
 		} else {
 			chatStorage = mongoStorage
@@ -135,6 +137,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		stop:               make(chan struct{}),
 		summaryMutex:       sync.RWMutex{},
 		lastSummaryRequest: make(map[int64]time.Time),
+		randSource:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	log.Println("Инициализация бота завершена.")
@@ -264,7 +267,6 @@ func (b *Bot) ensureChatInitializedAndWelcome(update tgbotapi.Update) (*ChatSett
 	}
 
 	b.settingsMutex.Lock() // Блокируем для проверки и возможного создания
-	defer b.settingsMutex.Unlock()
 
 	settings, exists := b.chatSettings[chatID]
 	if !exists {
@@ -284,28 +286,40 @@ func (b *Bot) ensureChatInitializedAndWelcome(update tgbotapi.Update) (*ChatSett
 			// Оставляем ID сообщений нулевыми при инициализации
 		}
 		b.chatSettings[chatID] = settings
+		settingsCopy := *settings // Копируем настройки для передачи в горутину
+		b.settingsMutex.Unlock()  // --- ОТПУСКАЕМ МЬЮТЕКС ЗДЕСЬ ---
 
-		// Отправляем приветствие и главное меню после создания настроек
+		// Отправляем приветствие и главное меню ПОСЛЕ освобождения мьютекса
 		go func(cid int64, cName string) { // Передаем имя чата
 			// Небольшая задержка, чтобы бот успел обработать команду /start, если она была
 			time.Sleep(1 * time.Second)
 			b.sendReply(cid, fmt.Sprintf("Привет, чат %s! Я Рофлослав. Теперь я с вами.", cName))
-			b.sendMainMenu(cid, 0)    // Отправляем меню без удаления старого
-			go b.loadChatHistory(cid) // Запускаем загрузку истории для нового чата
+			// Передаем 0 как ID старого меню, так как его нет при инициализации
+			b.sendMainMenu(cid, 0)
+			// Запускаем загрузку истории после отправки приветствия
+			go b.loadChatHistory(cid)
 		}(chatID, chatName)
 
 		log.Printf("Чат %d (%s) успешно инициализирован.", chatID, chatName)
-		return settings, true // Чат был только что инициализирован
+		// Передаем копию, созданную перед разблокировкой
+		return &settingsCopy, true // Чат был только что инициализирован
 	}
 
 	// Если настройки существуют, проверяем, активен ли бот
 	if !settings.Active && update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
 		settings.Active = true
+		lastMenuID := settings.LastMenuMessageID // Сохраняем ID перед разблокировкой
+		b.settingsMutex.Unlock()                 // --- ОТПУСКАЕМ МЬЮТЕКС ЗДЕСЬ ---
 		log.Printf("Бот активирован в чате %d (%s) командой /start.", chatID, chatName)
-		go b.sendMainMenu(chatID, settings.LastMenuMessageID) // Отправляем меню
-		return settings, false                                // Чат не был инициализирован только что, просто активирован
+		go b.sendMainMenu(chatID, lastMenuID) // Отправляем меню ПОСЛЕ разблокировки
+		// Возвращаем nil, так как исходный settings может быть изменен другой горутиной
+		// Правильнее было бы вернуть копию, но в данном случае мы просто сигнализируем, что чат активирован.
+		// Логика в handleUpdate должна будет перечитать settings при необходимости.
+		return nil, false // Чат не был инициализирован только что, просто активирован
 	}
 
+	// Если ничего не создавали и не активировали, просто отпускаем мьютекс
+	b.settingsMutex.Unlock()
 	return settings, false // Чат уже существовал
 }
 
