@@ -100,8 +100,8 @@ func (ps *PostgresStorage) createTablesIfNotExists() error {
 		chat_id BIGINT NOT NULL,
 		user_id BIGINT NOT NULL,
 		username VARCHAR(255),
-		first_name VARCHAR(255),
-		last_name VARCHAR(255),
+		alias VARCHAR(255) DEFAULT '', -- Прозвище (ранее first_name)
+		gender VARCHAR(50) DEFAULT '',  -- Пол (ранее last_name), varchar т.к. может быть не только m/f
 		real_name TEXT DEFAULT '', -- Реальное имя
 		bio TEXT DEFAULT '',       -- Био/Описание
 		last_seen TIMESTAMPTZ,     -- Время последнего сообщения
@@ -418,7 +418,7 @@ func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProf
 	defer cancel()
 
 	query := `
-		SELECT username, first_name, last_name, real_name, bio, last_seen, created_at, updated_at
+		SELECT username, alias, gender, real_name, bio, last_seen, created_at, updated_at
 		FROM user_profiles
 		WHERE chat_id = $1 AND user_id = $2;
 	`
@@ -429,11 +429,11 @@ func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProf
 	profile.UserID = userID
 
 	// Используем NullString и NullTime для полей, которые могут быть NULL
-	var username, firstName, lastName, realName, bio sql.NullString
+	var username, alias, gender, realName, bio sql.NullString
 	var lastSeen, createdAt, updatedAt sql.NullTime
 
 	err := row.Scan(
-		&username, &firstName, &lastName, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
+		&username, &alias, &gender, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
 	)
 
 	if err != nil {
@@ -451,11 +451,11 @@ func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProf
 	if username.Valid {
 		profile.Username = username.String
 	}
-	if firstName.Valid {
-		profile.FirstName = firstName.String
+	if alias.Valid {
+		profile.Alias = alias.String
 	}
-	if lastName.Valid {
-		profile.LastName = lastName.String
+	if gender.Valid {
+		profile.Gender = gender.String
 	}
 	if realName.Valid {
 		profile.RealName = realName.String
@@ -491,12 +491,12 @@ func (ps *PostgresStorage) SetUserProfile(profile *UserProfile) error {
 	// Используем INSERT ... ON CONFLICT ... DO UPDATE для UPSERT
 	query := `
 		INSERT INTO user_profiles (
-			chat_id, user_id, username, first_name, last_name, real_name, bio, last_seen, created_at, updated_at
+			chat_id, user_id, username, alias, gender, real_name, bio, last_seen, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
 		ON CONFLICT (chat_id, user_id) DO UPDATE SET
 			username = EXCLUDED.username,
-			first_name = EXCLUDED.first_name,
-			last_name = EXCLUDED.last_name,
+			alias = EXCLUDED.alias,
+			gender = EXCLUDED.gender,
 			real_name = EXCLUDED.real_name,
 			bio = EXCLUDED.bio,
 			last_seen = EXCLUDED.last_seen,
@@ -507,8 +507,8 @@ func (ps *PostgresStorage) SetUserProfile(profile *UserProfile) error {
 		profile.ChatID,
 		profile.UserID,
 		sql.NullString{String: profile.Username, Valid: profile.Username != ""},
-		sql.NullString{String: profile.FirstName, Valid: profile.FirstName != ""},
-		sql.NullString{String: profile.LastName, Valid: profile.LastName != ""},
+		sql.NullString{String: profile.Alias, Valid: profile.Alias != ""},
+		sql.NullString{String: profile.Gender, Valid: profile.Gender != ""},
 		sql.NullString{String: profile.RealName, Valid: true}, // real_name и bio всегда Valid, но могут быть пустыми
 		sql.NullString{String: profile.Bio, Valid: true},
 		sql.NullTime{Time: profile.LastSeen, Valid: !profile.LastSeen.IsZero()}, // Сохраняем, если не нулевое время
@@ -531,7 +531,7 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 	defer cancel()
 
 	query := `
-		SELECT user_id, username, first_name, last_name, real_name, bio, last_seen, created_at, updated_at
+		SELECT user_id, username, alias, gender, real_name, bio, last_seen, created_at, updated_at
 		FROM user_profiles
 		WHERE chat_id = $1
 		ORDER BY last_seen DESC NULLS LAST, updated_at DESC; -- Сортируем для возможной релевантности
@@ -549,11 +549,11 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 		profile.ChatID = chatID // Заполняем chatID
 
 		var userID int64
-		var username, firstName, lastName, realName, bio sql.NullString
+		var username, alias, gender, realName, bio sql.NullString
 		var lastSeen, createdAt, updatedAt sql.NullTime
 
 		if err := rows.Scan(
-			&userID, &username, &firstName, &lastName, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
+			&userID, &username, &alias, &gender, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
 		); err != nil {
 			log.Printf("ERROR: Ошибка сканирования строки профиля пользователя PostgreSQL (чат %d): %v", chatID, err)
 			continue
@@ -563,11 +563,11 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 		if username.Valid {
 			profile.Username = username.String
 		}
-		if firstName.Valid {
-			profile.FirstName = firstName.String
+		if alias.Valid {
+			profile.Alias = alias.String
 		}
-		if lastName.Valid {
-			profile.LastName = lastName.String
+		if gender.Valid {
+			profile.Gender = gender.String
 		}
 		if realName.Valid {
 			profile.RealName = realName.String

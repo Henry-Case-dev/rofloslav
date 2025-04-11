@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -271,56 +270,75 @@ func (b *Bot) isAdmin(user *tgbotapi.User) bool {
 	return false
 }
 
-// parseProfileArgs разбирает строку с данными профиля.
-// Ожидаемый формат: "@username - ID - FirstName - RealName - Bio"
-// ID - необязательное целое число. Если некорректно или отсутствует, возвращается 0.
-// Возвращает: targetUsername (без @), targetUserID (или 0), firstName, realName, bio, error
-func parseProfileArgs(text string) (targetUsername string, targetUserID int64, firstName, realName, bio string, err error) {
-	argsText := text                             // The input text is already the arguments
-	argParts := strings.SplitN(argsText, "-", 5) // Разделяем по тире, ожидаем 5 частей
-
-	if len(argParts) != 5 {
-		err = fmt.Errorf("неверное количество аргументов. Ожидается 5 частей, разделенные тире: @username - ID - Имя - Реал.имя - Био")
+// parseProfileArgs разбирает текст сообщения для команды /profile_set.
+// Ожидаемый формат: @username - Alias - RealName - Bio или @username - Alias - Gender - RealName - Bio
+// или @username - Alias - RealName - Gender - Bio
+func parseProfileArgs(text string) (targetUsername string, targetUserID int64, alias, gender, realName, bio string, err error) {
+	if text == "" {
+		err = fmt.Errorf("пустой текст сообщения")
 		return
 	}
 
-	targetUsername = strings.TrimSpace(argParts[0])
-	idStr := strings.TrimSpace(argParts[1])
-	firstName = strings.TrimSpace(argParts[2])
-	realName = strings.TrimSpace(argParts[3])
-	bio = strings.TrimSpace(argParts[4])
+	parts := strings.SplitN(text, " - ", 5) // Разделяем максимум на 5 частей
 
-	// Парсим ID, если он не пустой
-	if idStr != "" {
-		parsedID, parseErr := strconv.ParseInt(idStr, 10, 64)
-		if parseErr != nil {
-			// Ошибка парсинга ID не фатальна, просто используем 0
-			log.Printf("[WARN][parseProfileArgs] Не удалось распарсить ID '%s': %v. Используется ID=0.", idStr, parseErr)
-			targetUserID = 0
-		} else {
-			targetUserID = parsedID
+	// 1. Извлечение username
+	if len(parts) < 1 || !strings.HasPrefix(parts[0], "@") {
+		err = fmt.Errorf("не удалось извлечь @username из начала строки")
+		return
+	}
+	targetUsername = strings.TrimPrefix(parts[0], "@")
+
+	// 2. Минимум должно быть @username и Alias
+	if len(parts) < 2 {
+		err = fmt.Errorf("недостаточно аргументов, минимум: @username - Alias")
+		return
+	}
+	alias = strings.TrimSpace(parts[1])
+
+	// 3. Обработка остальных частей (Gender, RealName, Bio)
+	// Они могут быть в разном порядке или отсутствовать
+	for i := 2; i < len(parts); i++ {
+		part := strings.TrimSpace(parts[i])
+		if part == "" {
+			continue // Пропускаем пустые части
 		}
-	} else {
-		// ID не указан, используем 0
-		targetUserID = 0
+
+		// Пытаемся определить Gender (например, "male", "female", "m", "f")
+		// Можно добавить более строгую валидацию
+		lowerPart := strings.ToLower(part)
+		if gender == "" && (lowerPart == "male" || lowerPart == "female" || lowerPart == "m" || lowerPart == "f" || lowerPart == "other") {
+			gender = part // Сохраняем оригинальное значение, не lowerPart
+			continue
+		}
+
+		// Если RealName еще не задан, считаем это им
+		if realName == "" {
+			realName = part
+			continue
+		}
+
+		// Все остальное считаем частью Bio
+		if bio == "" {
+			bio = part
+		} else {
+			// Если частей больше 4, объединяем остаток в Bio
+			bio += " - " + part
+		}
 	}
 
-	// Проверяем, что username начинается с @
-	if !strings.HasPrefix(targetUsername, "@") {
-		err = fmt.Errorf("имя пользователя должно начинаться с @")
+	// Проверка, что Alias не пустой
+	if alias == "" {
+		err = fmt.Errorf("Alias не может быть пустым")
 		return
 	}
-	targetUsername = targetUsername[1:] // Убираем @ для поиска
 
-	if targetUsername == "" || firstName == "" {
-		err = fmt.Errorf("имя пользователя и короткое имя не могут быть пустыми")
-		return
-	}
+	// Возвращаем nil для targetUserID, так как мы не можем определить его из текста
+	targetUserID = 0
 
 	return
 }
 
-// getUserIDByUsername ищет ID пользователя по его Username в сохраненных профилях.
+// getUserIDByUsername ищет пользователя в профилях чата по его username.
 // Возвращает 0, если пользователь не найден.
 // Username передается БЕЗ символа @
 func (b *Bot) getUserIDByUsername(chatID int64, username string) (int64, error) {

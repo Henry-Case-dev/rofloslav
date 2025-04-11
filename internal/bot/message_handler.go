@@ -92,57 +92,81 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 				// --- Handle 'profile_data' input ---
 				b.deleteMessage(chatID, message.MessageID)
 
-				log.Printf("[DEBUG][MH profile_data] Текст для парсинга: '%s'", message.Text)
-				targetUsername, targetUserID, firstName, realName, bio, err := parseProfileArgs(message.Text)
-				if err != nil {
-					log.Printf("[ERROR][MH profile_data] Ошибка парсинга данных профиля от %s: %v. Текст: '%s'", username, err, message.Text)
-					b.sendReply(chatID, fmt.Sprintf("❌ Ошибка парсинга: %v", err))
-					return
-				}
-				// targetUsername здесь уже БЕЗ '@'
-				log.Printf("[DEBUG][MH profile_data] Распарсено: Username='%s', FirstName='%s', RealName='%s', Bio='%s'", targetUsername, firstName, realName, bio)
-
-				// --- ИЗМЕНЕННАЯ ЛОГИКА: Поиск профиля и создание/обновление ---
-				profile, err := b.findUserProfileByUsername(chatID, targetUsername)
-				if err != nil {
-					// Это ошибка получения списка профилей, а не отсутствия профиля
-					log.Printf("[ERROR][MH profile_data] Ошибка поиска профиля @%s в чате %d: %v", targetUsername, chatID, err)
-					b.sendReply(chatID, fmt.Sprintf("❌ Ошибка при поиске профиля @%s: %v", targetUsername, err))
-					return
+				log.Printf("[DEBUG][MH Profile Data] Чат %d: Обработка ввода профиля: %s", chatID, message.Text)
+				targetUsername, _, alias, gender, realName, bio, parseErr := parseProfileArgs(message.Text)
+				if parseErr != nil {
+					log.Printf("[ERROR][MH Profile Data] Чат %d: Ошибка парсинга данных профиля '%s': %v", chatID, message.Text, parseErr)
+					b.sendReply(chatID, fmt.Sprintf("🚫 Ошибка парсинга: %v\nПопробуйте еще раз или введите /cancel", parseErr))
+					// Оставляем PendingSetting = "profile_data", чтобы пользователь мог попробовать еще раз
+					b.settingsMutex.Unlock() // Разблокируем перед выходом
+					return                   // Выходим, чтобы пользователь попробовал снова
 				}
 
-				if profile == nil {
-					// Профиль не найден, создаем новый
-					log.Printf("[INFO][MH profile_data] Профиль для @%s не найден, создаю новый с UserID=%d.", targetUsername, targetUserID)
-					profile = &storage.UserProfile{
-						ChatID:   chatID,
-						UserID:   targetUserID,
-						Username: targetUsername,
-					}
+				log.Printf("[DEBUG][MH Profile Data] Чат %d: Распарсено: User=%s, Alias=%s, Gender=%s, RealName=%s, Bio=%s",
+					chatID, targetUsername, alias, gender, realName, bio)
+
+				// Пытаемся найти существующий профиль по username
+				existingProfile, findErr := b.findUserProfileByUsername(chatID, targetUsername)
+				if findErr != nil {
+					log.Printf("[ERROR][MH Profile Data] Чат %d: Ошибка поиска профиля по username '%s': %v", chatID, targetUsername, findErr)
+					b.sendReply(chatID, "🚫 Произошла ошибка при поиске существующего профиля. Попробуйте позже.")
+					settings.PendingSetting = "" // Сбрасываем ожидание
+					b.settingsMutex.Unlock()     // Разблокируем перед выходом
+					return
+				}
+
+				var profileToSave storage.UserProfile
+				if existingProfile != nil {
+					log.Printf("[DEBUG][MH Profile Data] Чат %d: Найден существующий профиль для @%s (UserID: %d). Обновляем.", chatID, targetUsername, existingProfile.UserID)
+					profileToSave = *existingProfile // Копируем существующий
+					// Обновляем только те поля, которые были введены
+					profileToSave.Alias = alias       // Всегда обновляем Alias
+					profileToSave.Gender = gender     // Всегда обновляем Gender
+					profileToSave.RealName = realName // Всегда обновляем RealName
+					profileToSave.Bio = bio           // Всегда обновляем Bio
 				} else {
-					// Профиль найден, будем обновлять
-					log.Printf("[INFO][MH profile_data] Найден существующий профиль для @%s (UserID: %d). Обновляю.", profile.Username, profile.UserID)
+					log.Printf("[DEBUG][MH Profile Data] Чат %d: Профиль для @%s не найден. Создаем новый.", chatID, targetUsername)
+					// Пытаемся получить ID пользователя по username (может быть неточным, если пользователя нет в чате)
+					foundUserID, _ := b.getUserIDByUsername(chatID, targetUsername)
+					if foundUserID == 0 {
+						log.Printf("[WARN][MH Profile Data] Чат %d: Не удалось определить UserID для @%s. Профиль будет создан без UserID.", chatID, targetUsername)
+					}
+					profileToSave = storage.UserProfile{
+						ChatID:   chatID,
+						UserID:   foundUserID, // Может быть 0
+						Username: targetUsername,
+						Alias:    alias,
+						Gender:   gender,
+						RealName: realName,
+						Bio:      bio,
+					}
 				}
 
-				// Обновляем поля профиля (нового или существующего)
-				profile.FirstName = firstName
-				profile.RealName = realName
-				profile.Bio = bio
-				// Username уже установлен при создании или был в существующем
-				// НЕ ОБНОВЛЯЕМ UserID, если профиль уже существовал (оставляем старый ID)
+				// Устанавливаем время последнего обновления
+				profileToSave.LastSeen = time.Now() // Используем текущее время как LastSeen при обновлении профиля
 
-				// Сохраняем профиль (создание или обновление)
-				log.Printf("[DEBUG][MH profile_data] Попытка сохранения профиля: %+v", profile)
-				err = b.storage.SetUserProfile(profile)
-				if err != nil {
-					log.Printf("[ERROR][MH profile_data] Ошибка сохранения профиля @%s (UserID: %d, ChatID: %d): %v. Профиль: %+v",
-						profile.Username, profile.UserID, profile.ChatID, err, profile)
-					b.sendReply(chatID, fmt.Sprintf("❌ Произошла ошибка при сохранении профиля @%s.", targetUsername))
-					return
+				// Сохраняем профиль
+				if saveErr := b.storage.SetUserProfile(&profileToSave); saveErr != nil {
+					log.Printf("[ERROR][MH Profile Data] Чат %d: Ошибка сохранения профиля для @%s: %v", chatID, targetUsername, saveErr)
+					b.sendReply(chatID, "🚫 Произошла ошибка при сохранении профиля.")
+				} else {
+					log.Printf("[INFO][MH Profile Data] Чат %d: Профиль для @%s успешно сохранен/обновлен.", chatID, targetUsername)
+					b.sendReply(chatID, fmt.Sprintf("✅ Профиль для @%s успешно сохранен/обновлен.", targetUsername))
 				}
-				log.Printf("[ADMIN CMD OK] Профиль для @%s (UserID: %d) успешно сохранен/обновлен админом %s.", profile.Username, profile.UserID, message.From.UserName)
-				b.sendReply(chatID, fmt.Sprintf("✅ Профиль для @%s успешно сохранен/обновлен.", profile.Username))
-				return // Profile data handled, exit handleMessage
+
+				// Сбрасываем ожидание ввода
+				settings.PendingSetting = ""
+				b.settingsMutex.Unlock() // Разблокируем после обработки
+
+				// Удаляем сообщение с введенными данными и сообщение-инструкцию
+				b.deleteMessage(chatID, message.MessageID)
+				if settings.LastInfoMessageID != 0 {
+					b.deleteMessage(chatID, settings.LastInfoMessageID)
+					// Можно сбросить LastInfoMessageID в настройках после удаления, если нужно
+					// settings.LastInfoMessageID = 0 // Сброс ID инструкции
+				}
+
+				return // Завершаем обработку этого сообщения
 			} // --- End Handle 'profile_data' ---
 
 			// --- НОВЫЙ БЛОК: Обработка остальных PendingSettings и /cancel ---

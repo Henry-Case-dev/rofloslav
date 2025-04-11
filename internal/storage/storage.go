@@ -16,15 +16,15 @@ import (
 
 // UserProfile содержит информацию о пользователе чата.
 type UserProfile struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty"`              // ID для MongoDB
-	ChatID    int64              `bson:"chat_id" db:"chat_id"`       // ID чата, к которому привязан профиль
-	UserID    int64              `bson:"user_id" db:"user_id"`       // ID пользователя Telegram
-	Username  string             `bson:"username" db:"username"`     // Никнейм Telegram (@username)
-	FirstName string             `bson:"first_name" db:"first_name"` // Имя Telegram
-	LastName  string             `bson:"last_name" db:"last_name"`   // Фамилия Telegram
-	RealName  string             `bson:"real_name" db:"real_name"`   // Реальное имя (если известно)
-	Bio       string             `bson:"bio" db:"bio"`               // Редактируемое описание/бэкграунд
-	LastSeen  time.Time          `bson:"last_seen" db:"last_seen"`   // Время последнего сообщения (для актуальности)
+	ID       primitive.ObjectID `bson:"_id,omitempty"`            // ID для MongoDB
+	ChatID   int64              `bson:"chat_id" db:"chat_id"`     // ID чата, к которому привязан профиль
+	UserID   int64              `bson:"user_id" db:"user_id"`     // ID пользователя Telegram
+	Username string             `bson:"username" db:"username"`   // Никнейм Telegram (@username)
+	Alias    string             `bson:"alias" db:"alias"`         // Прозвище / Короткое имя (ранее FirstName)
+	Gender   string             `bson:"gender" db:"gender"`       // Пол (ранее LastName)
+	RealName string             `bson:"real_name" db:"real_name"` // Реальное имя (если известно)
+	Bio      string             `bson:"bio" db:"bio"`             // Редактируемое описание/бэкграунд
+	LastSeen time.Time          `bson:"last_seen" db:"last_seen"` // Время последнего сообщения (для актуальности)
 	// Можно добавить другие поля по необходимости
 	CreatedAt time.Time `bson:"created_at" db:"created_at"` // Время создания записи
 	UpdatedAt time.Time `bson:"updated_at" db:"updated_at"` // Время последнего обновления

@@ -304,7 +304,7 @@ func convertAPIToMongoMessage(chatID int64, apiMsg *tgbotapi.Message) *MongoMess
 	if apiMsg.From != nil {
 		mongoMsg.UserID = apiMsg.From.ID
 		mongoMsg.Username = apiMsg.From.UserName
-		mongoMsg.FirstName = apiMsg.From.FirstName
+		mongoMsg.FirstName = apiMsg.From.FirstName // Сохраняем оригинальные FirstName/LastName в сообщении
 		mongoMsg.LastName = apiMsg.From.LastName
 		mongoMsg.IsBot = apiMsg.From.IsBot
 	}
@@ -544,8 +544,8 @@ func (ms *MongoStorage) SetUserProfile(profile *UserProfile) error {
 	}
 
 	if ms.debug {
-		log.Printf("[Mongo SetUserProfile DEBUG] Попытка сохранения профиля: ChatID=%d, UserID=%d, Username=%s, FirstName=%s, LastName=%s, RealName=%s, Bio=%s, LastSeen=%s",
-			profile.ChatID, profile.UserID, profile.Username, profile.FirstName, profile.LastName, profile.RealName, profile.Bio, profile.LastSeen)
+		log.Printf("[Mongo SetUserProfile DEBUG] Попытка сохранения профиля: ChatID=%d, UserID=%d, Username=%s, Alias=%s, Gender=%s, RealName=%s, Bio=%s, LastSeen=%s",
+			profile.ChatID, profile.UserID, profile.Username, profile.Alias, profile.Gender, profile.RealName, profile.Bio, profile.LastSeen)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -560,10 +560,10 @@ func (ms *MongoStorage) SetUserProfile(profile *UserProfile) error {
 	update := bson.M{
 		"$set": bson.M{
 			// Обновляем основные данные из Telegram при каждом сохранении
-			"username":   profile.Username, // Может меняться
-			"first_name": profile.FirstName,
-			"last_name":  profile.LastName,
-			"last_seen":  profile.LastSeen, // Обновляем время последней активности
+			"username":  profile.Username, // Может меняться
+			"alias":     profile.Alias,    // Обновляем Alias (бывший FirstName)
+			"gender":    profile.Gender,   // Обновляем Gender (бывший LastName)
+			"last_seen": profile.LastSeen, // Обновляем время последней активности
 			// Обновляем кастомные поля, если они были изменены
 			"real_name": profile.RealName,
 			"bio":       profile.Bio,
