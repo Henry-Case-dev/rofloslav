@@ -107,6 +107,20 @@ func max(a, b int) int {
 	return b
 }
 
+// formatRemainingTime форматирует оставшееся время в строку "X мин Y сек"
+func formatRemainingTime(d time.Duration) string {
+	if d <= 0 {
+		return "0 сек"
+	}
+	d = d.Round(time.Second)
+	m := d / time.Minute
+	s := (d % time.Minute) / time.Second
+	if m > 0 {
+		return fmt.Sprintf("%d мин %d сек", m, s)
+	}
+	return fmt.Sprintf("%d сек", s)
+}
+
 // formatMessageForAnalysis форматирует сообщение для передачи в LLM при анализе срача
 // или для логов. Включает имя пользователя и информацию об ответе.
 func formatMessageForAnalysis(msg *tgbotapi.Message) string {
@@ -378,4 +392,129 @@ func (b *Bot) findUserProfileByUsername(chatID int64, username string) (*storage
 
 	// Профиль не найден
 	return nil, nil
+}
+
+// formatHistoryWithProfiles форматирует историю сообщений и профили пользователей в единый текст
+// ОПТИМИЗИРОВАННАЯ ВЕРСИЯ: Загружает профили один раз.
+func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store storage.ChatHistoryStorage, debug bool) string {
+	var contextBuilder strings.Builder
+
+	// 1. Получаем ВСЕ профили для чата ОДНИМ запросом
+	allProfiles, err := store.GetAllUserProfiles(chatID)
+	if err != nil {
+		log.Printf("[WARN][FormatHistory] Чат %d: Ошибка получения профилей: %v. Контекст будет без профилей.", chatID, err)
+		// Продолжаем без профилей
+	}
+
+	// 2. Создаем карту профилей для быстрого доступа по UserID
+	profilesMap := make(map[int64]*storage.UserProfile)
+	if len(allProfiles) > 0 {
+		for _, p := range allProfiles {
+			if p != nil { // Дополнительная проверка на nil
+				profilesMap[p.UserID] = p
+			}
+		}
+		if debug && len(profilesMap) > 0 {
+			log.Printf("[DEBUG][FormatHistory] Чат %d: Создана карта профилей (%d записей).", chatID, len(profilesMap))
+		}
+	}
+
+	// 3. Добавляем информацию о профилях в начало контекста (если они есть)
+	if len(profilesMap) > 0 {
+		contextBuilder.WriteString("=== Информация об участниках чата ===\n")
+		profileCount := 0
+		for _, p := range profilesMap { // Итерируемся по карте
+			profileInfo := fmt.Sprintf("- @%s:", p.Username)
+			details := []string{}
+			if p.Alias != "" {
+				details = append(details, fmt.Sprintf("Прозвище: %s", p.Alias))
+			}
+			if p.Gender != "" && p.Gender != "unknown" {
+				details = append(details, fmt.Sprintf("Пол: %s", p.Gender))
+			}
+			if p.RealName != "" {
+				details = append(details, fmt.Sprintf("Наст.имя: %s", p.RealName))
+			}
+			if p.Bio != "" {
+				details = append(details, fmt.Sprintf("Био: %s", p.Bio))
+			}
+			if len(details) > 0 {
+				profileInfo += " " + strings.Join(details, "; ")
+				contextBuilder.WriteString(profileInfo + "\n")
+				profileCount++
+			}
+		}
+		if profileCount == 0 { // Если все профили оказались без деталей
+			contextBuilder.Reset() // Убираем заголовок
+			if debug {
+				log.Printf("[DEBUG][FormatHistory] Чат %d: Профили загружены, но без деталей для включения в контекст.", chatID)
+			}
+		} else {
+			contextBuilder.WriteString("=================================\n\n")
+			if debug {
+				log.Printf("[DEBUG][FormatHistory] Чат %d: Добавлено %d профилей в контекст.", chatID, profileCount)
+			}
+		}
+	} else if debug {
+		log.Printf("[DEBUG][FormatHistory] Чат %d: Профили пользователей не найдены или карта пуста.", chatID)
+	}
+
+	// 4. Добавляем историю сообщений, используя карту профилей
+	contextBuilder.WriteString("=== История сообщений ===\n")
+	processedMessages := 0
+	for _, msg := range messages {
+		if msg == nil || (msg.Text == "" && msg.Caption == "") {
+			continue
+		}
+
+		var authorInfo string
+		if msg.From != nil {
+			username := msg.From.UserName
+			userID := msg.From.ID
+			// Ищем профиль в КАРТЕ
+			profile, exists := profilesMap[userID]
+			if exists && profile.Alias != "" {
+				authorInfo = fmt.Sprintf("[%s (%s, @%s)]", msg.Time().Format("15:04"), profile.Alias, username)
+			} else if username != "" {
+				authorInfo = fmt.Sprintf("[%s (@%s)]", msg.Time().Format("15:04"), username)
+			} else {
+				name := msg.From.FirstName
+				if name == "" {
+					name = fmt.Sprintf("User_%d", userID)
+				}
+				authorInfo = fmt.Sprintf("[%s (%s)]", msg.Time().Format("15:04"), name)
+			}
+		} else {
+			authorInfo = fmt.Sprintf("[%s (Unknown User)]", msg.Time().Format("15:04"))
+		}
+
+		// Добавляем текст или подпись
+		messageText := msg.Text
+		if messageText == "" && msg.Caption != "" {
+			messageText = fmt.Sprintf("[Медиа с подписью: %s]", msg.Caption)
+		} else if msg.Photo != nil || msg.Video != nil || msg.Document != nil || msg.Audio != nil || msg.Voice != nil || msg.Sticker != nil {
+			if messageText == "" {
+				messageText = "[Медиа без подписи]"
+			} else {
+				messageText = fmt.Sprintf("[Медиа] %s", messageText)
+			}
+		}
+
+		contextBuilder.WriteString(fmt.Sprintf("%s: %s\n", authorInfo, messageText))
+		processedMessages++
+	}
+
+	if processedMessages == 0 && contextBuilder.Len() < 50 {
+		if debug {
+			log.Printf("[DEBUG][FormatHistory] Чат %d: История сообщений пуста или содержит только пустые сообщения.", chatID)
+		}
+		return ""
+	}
+
+	contextBuilder.WriteString("=========================\n")
+	if debug {
+		log.Printf("[DEBUG][FormatHistory] Чат %d: Добавлено %d сообщений в контекст.", chatID, processedMessages)
+	}
+
+	return contextBuilder.String()
 }

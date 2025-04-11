@@ -263,64 +263,74 @@ func (b *Bot) ensureChatInitializedAndWelcome(update tgbotapi.Update) (*ChatSett
 		chatID = update.CallbackQuery.Message.Chat.ID
 		chatName = update.CallbackQuery.Message.Chat.Title
 	} else {
-		return nil, false // Неизвестный тип обновления
+		// Неизвестный тип обновления, пропускаем инициализацию
+		return nil, false
 	}
 
-	b.settingsMutex.Lock() // Блокируем для проверки и возможного создания
-
+	// Сначала проверяем с RLock для скорости
+	b.settingsMutex.RLock()
 	settings, exists := b.chatSettings[chatID]
+	b.settingsMutex.RUnlock()
+
 	if !exists {
+		var settings *ChatSettings // Объявляем settings здесь
+		b.settingsMutex.Lock()     // Блокируем для проверки и возможного создания
+
+		// Повторно проверяем существование чата под полным мьютексом (Double-Checked Locking)
+		if _, exists := b.chatSettings[chatID]; exists {
+			settings, _ = b.chatSettings[chatID] // Присваиваем существующие настройки
+			b.settingsMutex.Unlock()
+			return settings, false // Другая горутина могла создать его
+		}
+
+		// --- Инициализация нового чата ---
 		log.Printf("Чат %d (%s) не найден. Инициализация настроек...", chatID, chatName)
-		settings = &ChatSettings{
-			Active:               true, // Активируем по умолчанию при добавлении
+		// Создаем новые настройки для этого чата
+		newSettings := &ChatSettings{
+			Active:               true,
 			MinMessages:          b.config.MinMessages,
 			MaxMessages:          b.config.MaxMessages,
 			MessageCount:         0,
-			LastMessageID:        0,
 			DailyTakeTime:        b.config.DailyTakeTime,
 			SummaryIntervalHours: b.config.SummaryIntervalHours,
-			LastAutoSummaryTime:  time.Time{},
-			SrachAnalysisEnabled: true, // Включаем по умолчанию
+			LastAutoSummaryTime:  time.Time{},                   // Инициализируем пустым временем
+			SrachAnalysisEnabled: b.config.SrachAnalysisEnabled, // Берем значение по умолчанию из конфига
 			SrachState:           "none",
 			SrachMessages:        make([]string, 0),
-			// Оставляем ID сообщений нулевыми при инициализации
 		}
-		b.chatSettings[chatID] = settings
-		settingsCopy := *settings // Копируем настройки для передачи в горутину
-		b.settingsMutex.Unlock()  // --- ОТПУСКАЕМ МЬЮТЕКС ЗДЕСЬ ---
-
-		// Отправляем приветствие и главное меню ПОСЛЕ освобождения мьютекса
-		go func(cid int64, cName string) { // Передаем имя чата
-			// Небольшая задержка, чтобы бот успел обработать команду /start, если она была
-			time.Sleep(1 * time.Second)
-			b.sendReply(cid, fmt.Sprintf("Привет, чат %s! Я Рофлослав. Теперь я с вами.", cName))
-			// Передаем 0 как ID старого меню, так как его нет при инициализации
-			b.sendMainMenu(cid, 0)
-			// Запускаем загрузку истории после отправки приветствия
-			go b.loadChatHistory(cid)
-		}(chatID, chatName)
+		b.chatSettings[chatID] = newSettings
+		isNewChat := true        // Устанавливаем флаг
+		b.settingsMutex.Unlock() // --- ОСВОБОЖДАЕМ МЬЮТЕКС ЗДЕСЬ ---
 
 		log.Printf("Чат %d (%s) успешно инициализирован.", chatID, chatName)
-		// Передаем копию, созданную перед разблокировкой
-		return &settingsCopy, true // Чат был только что инициализирован
+
+		// --- Действия ПОСЛЕ освобождения мьютекса ---
+		if isNewChat {
+			// --- Динамическое приветствие --- (Вынесено из-под мьютекса)
+			welcomeText := ""
+			if b.config.WelcomePrompt != "" {
+				generatedWelcome, err := b.llm.GenerateArbitraryResponse(b.config.WelcomePrompt, "")
+				if err != nil {
+					log.Printf("[WARN][ensureChatInitialized] Chat %d: Ошибка генерации приветствия: %v. Использую стандартное.", chatID, err)
+					welcomeText = fmt.Sprintf("Привет, чат %s! Я Рофлослав. Теперь я с вами.", chatName)
+				} else {
+					welcomeText = generatedWelcome
+				}
+			} else {
+				welcomeText = fmt.Sprintf("Привет, чат %s! Я Рофлослав. Теперь я с вами.", chatName) // Стандартное, если промпт пуст
+			}
+			b.sendReply(chatID, welcomeText) // Отправляем приветствие
+
+			// --- Загрузка истории (асинхронно) ---
+			go b.loadChatHistory(chatID)
+
+			// Отправляем главное меню после приветствия и начала загрузки истории
+			b.sendMainMenu(chatID, 0) // 0 т.к. нет старого меню для удаления
+		}
+		return newSettings, isNewChat // Возвращаем созданные настройки и флаг нового чата
 	}
 
-	// Если настройки существуют, проверяем, активен ли бот
-	if !settings.Active && update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
-		settings.Active = true
-		lastMenuID := settings.LastMenuMessageID // Сохраняем ID перед разблокировкой
-		b.settingsMutex.Unlock()                 // --- ОТПУСКАЕМ МЬЮТЕКС ЗДЕСЬ ---
-		log.Printf("Бот активирован в чате %d (%s) командой /start.", chatID, chatName)
-		go b.sendMainMenu(chatID, lastMenuID) // Отправляем меню ПОСЛЕ разблокировки
-		// Возвращаем nil, так как исходный settings может быть изменен другой горутиной
-		// Правильнее было бы вернуть копию, но в данном случае мы просто сигнализируем, что чат активирован.
-		// Логика в handleUpdate должна будет перечитать settings при необходимости.
-		return nil, false // Чат не был инициализирован только что, просто активирован
-	}
-
-	// Если ничего не создавали и не активировали, просто отпускаем мьютекс
-	b.settingsMutex.Unlock()
-	return settings, false // Чат уже существовал
+	return settings, false // Чат уже был инициализирован
 }
 
 // handleUpdate обрабатывает входящие обновления

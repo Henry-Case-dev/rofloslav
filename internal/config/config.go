@@ -44,7 +44,8 @@ type Config struct {
 	DeepSeekModelName string
 	DeepSeekBaseURL   string // Опционально, для кастомного URL
 	// Настройки поведения бота
-	RateLimitErrorMessage string
+	RateLimitStaticText string // Статический текст для сообщения о лимите
+	RateLimitPrompt     string // Промпт для LLM для сообщения о лимите
 	// Промпты для ввода настроек
 	PromptEnterMinMessages     string
 	PromptEnterMaxMessages     string
@@ -55,6 +56,7 @@ type Config struct {
 	SRACH_ANALYSIS_PROMPT string
 	SRACH_CONFIRM_PROMPT  string
 	SrachKeywords         []string
+	SrachAnalysisEnabled  bool // Значение по умолчанию из .env
 	// Настройки времени и интервалов
 	DailyTakeTime        int
 	TimeZone             string
@@ -78,6 +80,8 @@ type Config struct {
 	StorageType StorageType
 	// Список администраторов бота (через запятую)
 	AdminUsernames []string
+	// Промпт для приветствия
+	WelcomePrompt string
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -127,6 +131,7 @@ func Load() (*Config, error) {
 	srachAnalysisPrompt := getEnvOrDefault("SRACH_ANALYSIS_PROMPT", "Анализирую срач...")
 	srachConfirmPrompt := getEnvOrDefault("SRACH_CONFIRM_PROMPT", "Это сообщение - часть срача? Ответь true или false:")
 	srachKeywordsRaw := getEnvOrDefault("SRACH_KEYWORDS", "")
+	srachEnabledStr := getEnvOrDefault("SRACH_ANALYSIS_ENABLED", "true") // Загружаем новую переменную
 
 	// --- Загрузка переменных PostgreSQL ---
 	dbHost := getEnvOrDefault("POSTGRESQL_HOST", "")         // Используем POSTGRESQL_
@@ -134,6 +139,11 @@ func Load() (*Config, error) {
 	dbUser := getEnvOrDefault("POSTGRESQL_USER", "")         // Используем POSTGRESQL_
 	dbPassword := getEnvOrDefault("POSTGRESQL_PASSWORD", "") // Используем POSTGRESQL_
 	dbName := getEnvOrDefault("POSTGRESQL_DBNAME", "")       // Используем POSTGRESQL_DBNAME
+
+	// --- Загрузка прочих переменных ---
+	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypeMongo))) // По умолчанию Mongo
+	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight")                        // По умолчанию lightnight
+	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав.")              // Загрузка приветственного промпта
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
@@ -163,6 +173,7 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] --- Timing & Limits ---")
 	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
 	log.Printf("[Config Load] DEBUG: %s", debugStr)
+	log.Printf("[Config Load] WELCOME_PROMPT: %s...", truncateString(welcomePrompt, 50))
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -235,7 +246,8 @@ func Load() (*Config, error) {
 		DirectPrompt:               directPrompt,
 		DailyTakePrompt:            dailyTakePrompt,
 		SummaryPrompt:              summaryPrompt,
-		RateLimitErrorMessage:      rateLimitErrorMsg,
+		RateLimitStaticText:        getEnvOrDefault("RATE_LIMIT_STATIC_TEXT", "Слишком часто! Попробуйте позже."),
+		RateLimitPrompt:            getEnvOrDefault("RATE_LIMIT_PROMPT", "Скажи пользователю, что он слишком часто нажимает кнопку."),
 		PromptEnterMinMessages:     promptEnterMin,
 		PromptEnterMaxMessages:     promptEnterMax,
 		PromptEnterDailyTime:       promptEnterDailyTime,
@@ -261,10 +273,11 @@ func Load() (*Config, error) {
 		MongoDbName:                   getEnvOrDefault("MONGODB_DBNAME", "rofloslav_history"),
 		MongoDbMessagesCollection:     getEnvOrDefault("MONGODB_MESSAGES_COLLECTION", "chat_messages"),
 		MongoDbUserProfilesCollection: getEnvOrDefault("MONGODB_USER_PROFILES_COLLECTION", "user_profiles"),
+		SrachAnalysisEnabled:          srachEnabledStr == "true" || srachEnabledStr == "1" || srachEnabledStr == "yes",
+		WelcomePrompt:                 welcomePrompt, // Сохраняем приветственный промпт
 	}
 
 	// Валидация и установка StorageType
-	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypePostgres))) // По умолчанию PostgreSQL
 	switch StorageType(storageTypeStr) {
 	case StorageTypeFile:
 		cfg.StorageType = StorageTypeFile
@@ -342,7 +355,6 @@ func Load() (*Config, error) {
 	}
 
 	// Администраторы
-	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight") // По умолчанию lightnight
 	cfg.AdminUsernames = strings.Split(adminUsernamesStr, ",")
 	// Очистка пробелов и пустых строк
 	cleanedAdmins := make([]string, 0, len(cfg.AdminUsernames))
@@ -384,7 +396,8 @@ func logLoadedConfig(cfg *Config) {
 		log.Printf("  DeepSeek Base URL: %s", cfg.DeepSeekBaseURL)
 	}
 
-	log.Printf("Rate Limit Message: %s", cfg.RateLimitErrorMessage)
+	log.Printf("Rate Limit Static Text: %s", cfg.RateLimitStaticText)
+	log.Printf("Rate Limit Prompt: %s...", truncateStringEnd(cfg.RateLimitPrompt, 80))
 	log.Printf("Prompt Min Messages: %s", cfg.PromptEnterMinMessages)
 	log.Printf("Prompt Max Messages: %s", cfg.PromptEnterMaxMessages)
 	log.Printf("Prompt Daily Time: %s", cfg.PromptEnterDailyTime)
@@ -393,6 +406,8 @@ func logLoadedConfig(cfg *Config) {
 	log.Printf("Srach Analysis Prompt: %s...", truncateStringEnd(cfg.SRACH_ANALYSIS_PROMPT, 80))
 	log.Printf("Srach Confirm Prompt: %s...", truncateStringEnd(cfg.SRACH_CONFIRM_PROMPT, 80))
 	log.Printf("Srach Keywords: %d слов", len(cfg.SrachKeywords))
+	log.Printf("Srach Analysis Enabled by default: %t", cfg.SrachAnalysisEnabled)
+	log.Printf("Welcome Prompt: %s...", truncateStringEnd(cfg.WelcomePrompt, 80))
 	log.Printf("Daily Take Time: %d", cfg.DailyTakeTime)
 	log.Printf("Time Zone: %s", cfg.TimeZone)
 	log.Printf("Summary Interval: %d hours", cfg.SummaryIntervalHours)

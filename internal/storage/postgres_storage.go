@@ -593,3 +593,18 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 	}
 	return profiles, nil
 }
+
+// GetStatus для PostgresStorage
+func (ps *PostgresStorage) GetStatus(chatID int64) string {
+	status := "Хранилище: PostgreSQL. "
+	var count int64
+	err := ps.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_id = $1", chatID).Scan(&count)
+	if err != nil {
+		log.Printf("[Postgres GetStatus WARN] Чат %d: Ошибка получения количества сообщений: %v", chatID, err)
+		status += "Состояние: Ошибка подсчета сообщений."
+	} else {
+		status += fmt.Sprintf("Сообщений в базе: %d", count)
+	}
+	// Можно добавить проверку Ping() для статуса подключения, но это может быть медленно
+	return status
+}

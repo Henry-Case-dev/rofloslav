@@ -560,57 +560,71 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 	}
 }
 
-// sendAIResponse генерирует и отправляет стандартный AI ответ в фоновом режиме
+// sendAIResponse генерирует и отправляет ответ с помощью AI
 func (b *Bot) sendAIResponse(chatID int64) {
-	if b.config.Debug {
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: Starting AI response generation.", chatID)
-	}
+	// --- Загрузка истории сообщений ---
+	history := b.storage.GetMessages(chatID) // Получаем всю доступную историю
 
-	// Получаем историю сообщений ИЗ ХРАНИЛИЩА
-	fullHistory := b.storage.GetMessages(chatID)
-
-	// Разделяем историю и последнее сообщение
-	var historyForLLM []*tgbotapi.Message
-	var lastMessageForLLM *tgbotapi.Message
-
-	if len(fullHistory) > 0 {
-		lastMessageIndex := len(fullHistory) - 1
-		lastMessageForLLM = fullHistory[lastMessageIndex]
-		if lastMessageIndex > 0 {
-			historyForLLM = fullHistory[:lastMessageIndex]
+	// Ограничиваем историю до contextWindow, если она слишком большая
+	if len(history) > b.config.ContextWindow {
+		if b.config.Debug {
+			log.Printf("[DEBUG][sendAIResponse] Чат %d: История (%d) больше окна (%d), обрезаю.", chatID, len(history), b.config.ContextWindow)
 		}
-	} else {
-		// Если история пуста, lastMessageForLLM будет nil, historyForLLM будет пустым срезом
-		// Это не должно происходить в sendAIResponse, т.к. она вызывается после добавления сообщения
-		log.Printf("[WARN] sendAIResponse: fullHistory пуста для чата %d, хотя сообщение должно было быть добавлено.", chatID)
+		history = history[len(history)-b.config.ContextWindow:]
 	}
 
-	log.Printf("[DEBUG][MH][AIResponse] Chat %d: History has %d messages. Last message ID: %d", chatID, len(fullHistory), lastMessageForLLM.MessageID)
-
-	// Берем системный промпт из конфига (используем DefaultPrompt для обычных ответов)
-	systemPrompt := b.config.DefaultPrompt
-	log.Printf("[DEBUG][MH][AIResponse] Chat %d: Using default system prompt: %s...", chatID, truncateString(systemPrompt, 50))
-
-	// Генерируем ответ, передавая историю и последнее сообщение отдельно
-	responseText, err := b.llm.GenerateResponse(systemPrompt, historyForLLM, lastMessageForLLM)
-	if err != nil {
-		log.Printf("[ERROR][MH][AIResponse] Chat %d: Error generating AI response: %v", chatID, err)
+	// --- Форматирование контекста с профилями ---
+	contextText := formatHistoryWithProfiles(chatID, history, b.storage, b.config.Debug)
+	if contextText == "" {
+		log.Printf("[WARN][sendAIResponse] Чат %d: Не удалось сформировать контекст для AI (возможно, нет сообщений или профилей).", chatID)
+		// Можно отправить сообщение об ошибке или просто ничего не делать
+		// b.sendReply(chatID, "Не смог подготовить данные для ответа.")
 		return
 	}
-	log.Printf("[DEBUG][MH][AIResponse] Chat %d: AI response generated: %s...", chatID, truncateString(responseText, 50))
 
-	// Отправляем сгенерированный ответ
-	msg := tgbotapi.NewMessage(chatID, responseText)
-	msg.ParseMode = "Markdown"
-
-	_, err = b.api.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка отправки AI ответа в чат %d: %v", chatID, err)
-	}
+	// --- Получение промпта ---
+	// Используем основной промпт по умолчанию
+	prompt := b.config.DefaultPrompt
+	// TODO: Проверить, нужен ли CustomPrompt из настроек чата?
+	// b.settingsMutex.RLock()
+	// if settings, exists := b.chatSettings[chatID]; exists && settings.CustomPrompt != "" {
+	// 	prompt = settings.CustomPrompt
+	// }
+	// b.settingsMutex.RUnlock()
 
 	if b.config.Debug {
-		log.Printf("[DEBUG][MH][Goroutine] Chat %d: AI response goroutine finished.", chatID)
+		log.Printf("[DEBUG][sendAIResponse] Чат %d: Вызываю LLM с отформатированным контекстом (длина: %d байт).", chatID, len(contextText))
+		// Можно логировать начало контекста, если нужно
+		// log.Printf("[DEBUG][sendAIResponse] Context start: %s...", truncateString(contextText, 150))
 	}
+
+	// --- Вызов LLM с отформатированным контекстом ---
+	response, err := b.llm.GenerateResponseFromTextContext(prompt, contextText)
+	if err != nil {
+		log.Printf("[ERROR][sendAIResponse] Чат %d: Ошибка генерации ответа LLM: %v", chatID, err)
+		// Обработка специфических ошибок (лимит, блокировка), если они не обработаны в клиенте LLM
+		if response == "[Лимит]" || response == "[Заблокировано]" {
+			log.Printf("[WARN][sendAIResponse] Чат %d: Ответ LLM был '[Лимит]' или '[Заблокировано]'. Не отправляем сообщение.", chatID)
+			// Можно отправить пользователю кастомное сообщение
+		} else {
+			// Общая ошибка
+			// b.sendReply(chatID, "Извините, произошла ошибка при генерации ответа.")
+		}
+		return
+	}
+
+	if response == "" || response == "[Лимит]" || response == "[Заблокировано]" {
+		if b.config.Debug {
+			log.Printf("[DEBUG][sendAIResponse] Чат %d: Получен пустой ответ, '[Лимит]' или '[Заблокировано]' от LLM. Ответ не отправлен.", chatID)
+		}
+		return
+	}
+
+	// --- Отправка ответа ---
+	if b.config.Debug {
+		log.Printf("[DEBUG][sendAIResponse] Чат %d: AI сгенерировал ответ: %s", chatID, response)
+	}
+	b.sendReply(chatID, response) // Отправляем сгенерированный ответ
 }
 
 // --- Вспомогательная функция для обрезки ---

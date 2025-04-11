@@ -13,52 +13,57 @@ func (b *Bot) loadChatHistory(chatID int64) {
 		log.Printf("[DEBUG][Load History] Чат %d: Начинаю загрузку истории.", chatID)
 	}
 
-	b.sendReply(chatID, "⏳ Загружаю историю чата для лучшего понимания контекста...")
+	initialStatus := b.storage.GetStatus(chatID) // Получаем статус ДО загрузки
+	b.sendReply(chatID, fmt.Sprintf("⏳ Загружаю историю чата...\nСтатус хранилища: %s", initialStatus))
 
 	// Загружаем историю из файла
 	history, err := b.storage.LoadChatHistory(chatID)
 	if err != nil {
 		// Логируем ошибку, но не останавливаемся, просто начинаем без истории
 		log.Printf("[ERROR][Load History] Чат %d: Ошибка загрузки истории: %v", chatID, err)
-		b.sendReply(chatID, "⚠️ Не удалось загрузить историю чата. Начинаю работу с чистого листа.")
+		finalStatus := b.storage.GetStatus(chatID) // Статус ПОСЛЕ ошибки
+		b.sendReply(chatID, fmt.Sprintf("⚠️ Не удалось загрузить историю чата.\nСтатус хранилища: %s", finalStatus))
 		// Убедимся, что старая история в памяти очищена, если была ошибка загрузки
-		b.storage.ClearChatHistory(chatID) // Используем существующий метод
+		_ = b.storage.ClearChatHistory(chatID) // Используем существующий метод, игнорируем ошибку тут
 		return
 	}
+
+	loadedCount := 0
+	messageText := ""
 
 	if history == nil { // LoadChatHistory теперь возвращает nil, nil если файла нет
 		if b.config.Debug {
 			log.Printf("[DEBUG][Load History] Чат %d: История не найдена или файл не существует.", chatID)
 		}
-		b.sendReply(chatID, "✅ История чата не найдена. Начинаю работу с чистого листа!")
-		return
-	}
-
-	if len(history) == 0 {
+		messageText = "✅ История чата не найдена."
+	} else if len(history) == 0 {
 		if b.config.Debug {
 			log.Printf("[DEBUG][Load History] Чат %d: Загружена пустая история (файл был пуст или содержал []).", chatID)
 		}
-		b.sendReply(chatID, "✅ История чата пуста. Начинаю работу с чистого листа!")
-		return
+		messageText = "✅ История чата пуста."
+	} else {
+		// Определяем, сколько сообщений загружать (берем последние N)
+		loadCount := len(history)
+		if loadCount > b.config.ContextWindow {
+			log.Printf("[DEBUG][Load History] Чат %d: История (%d) длиннее окна (%d), обрезаю.", chatID, loadCount, b.config.ContextWindow)
+			history = history[loadCount-b.config.ContextWindow:]
+			loadCount = len(history) // Обновляем количество после обрезки
+		}
+
+		// Добавляем сообщения в хранилище (в память)
+		log.Printf("[DEBUG][Load History] Чат %d: Добавляю %d загруженных сообщений в контекст.", chatID, loadCount)
+		b.storage.AddMessagesToContext(chatID, history) // Этот метод не должен вызывать автосохранение
+		loadedCount = loadCount
+		messageText = fmt.Sprintf("✅ Контекст загружен: %d сообщений.", loadedCount)
+
+		if b.config.Debug {
+			log.Printf("[DEBUG][Load History] Чат %d: Загружено и добавлено в контекст %d сообщений.", chatID, loadedCount)
+		}
 	}
 
-	// Определяем, сколько сообщений загружать (берем последние N)
-	loadCount := len(history)
-	if loadCount > b.config.ContextWindow {
-		log.Printf("[DEBUG][Load History] Чат %d: История (%d) длиннее окна (%d), обрезаю.", chatID, loadCount, b.config.ContextWindow)
-		history = history[loadCount-b.config.ContextWindow:]
-		loadCount = len(history) // Обновляем количество после обрезки
-	}
-
-	// Добавляем сообщения в хранилище (в память)
-	log.Printf("[DEBUG][Load History] Чат %d: Добавляю %d загруженных сообщений в контекст.", chatID, loadCount)
-	b.storage.AddMessagesToContext(chatID, history) // Этот метод не должен вызывать автосохранение
-
-	if b.config.Debug {
-		log.Printf("[DEBUG][Load History] Чат %d: Загружено и добавлено в контекст %d сообщений.", chatID, loadCount)
-	}
-
-	b.sendReply(chatID, fmt.Sprintf("✅ Контекст загружен: %d сообщений. Я готов к работе!", loadCount))
+	// Отправляем итоговое сообщение со статусом
+	finalStatus := b.storage.GetStatus(chatID) // Статус ПОСЛЕ загрузки
+	b.sendReply(chatID, fmt.Sprintf("%s\nСтатус хранилища: %s", messageText, finalStatus))
 }
 
 // scheduleHistorySaving запускает планировщик для периодического сохранения истории

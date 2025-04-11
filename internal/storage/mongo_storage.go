@@ -635,3 +635,31 @@ func (ms *MongoStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error)
 	}
 	return profiles, nil
 }
+
+// GetStatus для MongoStorage
+func (ms *MongoStorage) GetStatus(chatID int64) string {
+	status := "Хранилище: MongoDB. "
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	count, err := ms.messagesCollection.CountDocuments(ctx, bson.M{"chat_id": chatID})
+	if err != nil {
+		log.Printf("[Mongo GetStatus WARN] Чат %d: Ошибка получения количества сообщений: %v", chatID, err)
+		status += "Состояние: Ошибка подсчета сообщений."
+	} else {
+		status += fmt.Sprintf("Сообщений в базе: %d", count)
+	}
+
+	// Проверка подключения (Ping)
+	ctxPing, cancelPing := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelPing()
+	err = ms.client.Ping(ctxPing, nil)
+	if err != nil {
+		log.Printf("[Mongo GetStatus WARN] Чат %d: Ошибка Ping: %v", chatID, err)
+		status += " Подключение: Ошибка."
+	} else {
+		status += " Подключение: ОК."
+	}
+
+	return status
+}

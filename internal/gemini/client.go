@@ -10,6 +10,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/generative-ai-go/genai"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -321,7 +322,74 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 	return finalResponse, nil
 }
 
-// Вспомогательная функция для обрезки строки
+// GenerateResponseFromTextContext генерирует ответ на основе промпта и готового текстового контекста
+func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextText string) (string, error) {
+	ctx := context.Background()
+	model := c.genaiClient.GenerativeModel(c.modelName)
+
+	// Настраиваем генерацию
+	model.SetTemperature(1.0)      // Можно сделать настраиваемым
+	model.SetMaxOutputTokens(8192) // Максимум для Gemini 1.5 Flash/Pro
+
+	// Формируем контент для Gemini: системный промпт и контекст как единый текст
+	fullText := systemPrompt + "\n\n---\n\n" + contextText
+	part := genai.Text(fullText)
+
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Запрос (Text Context): Модель %s", c.modelName)
+	}
+
+	resp, err := model.GenerateContent(ctx, part) // Передаем одну часть
+	if err != nil {
+		log.Printf("[ERROR] Gemini Ошибка API (Text Context): %v", err)
+		// Добавляем парсинг специфичной ошибки Gemini, если возможно
+		if genErr, ok := err.(*googleapi.Error); ok { // <-- Убедимся, что google.golang.org/api/googleapi импортирован
+			log.Printf("[ERROR] Gemini API Error Details: Code=%d, Message=%s", genErr.Code, genErr.Message)
+			// Проверка на Blocked prompt
+			if strings.Contains(genErr.Message, "blocked") || strings.Contains(genErr.Message, "SAFETY") {
+				log.Printf("[WARN] Gemini Запрос заблокирован (Safety/Policy): %s", genErr.Message)
+				return "[Заблокировано]", fmt.Errorf("запрос заблокирован политикой безопасности: %w", err)
+			}
+			// Проверка на Rate limit (429)
+			if genErr.Code == 429 {
+				log.Printf("[WARN] Gemini Достигнут лимит запросов (429): %s", genErr.Message)
+				return "[Лимит]", fmt.Errorf("достигнут лимит запросов Gemini: %w", err)
+			}
+		}
+		return "", fmt.Errorf("ошибка генерации ответа Gemini (Text Context): %w", err)
+	}
+
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+		log.Println("[WARN] Gemini Ответ (Text Context): Получен пустой ответ или нет валидных частей.")
+		return "", fmt.Errorf("Gemini вернул пустой ответ (Text Context)")
+	}
+
+	// Собираем текст из всех частей ответа
+	var responseText strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if text, ok := part.(genai.Text); ok {
+			responseText.WriteString(string(text))
+		}
+	}
+
+	finalResponse := responseText.String()
+
+	if c.debug {
+		finishReason := resp.Candidates[0].FinishReason
+		tokenCount := resp.Candidates[0].TokenCount
+		log.Printf("[DEBUG] Gemini Ответ (Text Context): Причина завершения: %s, Токенов: %d", finishReason, tokenCount)
+		log.Printf("[DEBUG] Gemini Ответ (Text Context): %s...", truncateString(finalResponse, 100))
+	}
+
+	if resp.Candidates[0].FinishReason == genai.FinishReasonSafety || resp.Candidates[0].FinishReason == genai.FinishReasonRecitation {
+		log.Printf("[WARN] Gemini Ответ заблокирован: Причина=%s", resp.Candidates[0].FinishReason)
+		return "[Заблокировано]", fmt.Errorf("ответ заблокирован Gemini: %s", resp.Candidates[0].FinishReason)
+	}
+
+	return finalResponse, nil
+}
+
+// truncateString обрезает строку до указанной длины, добавляя многоточие
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s

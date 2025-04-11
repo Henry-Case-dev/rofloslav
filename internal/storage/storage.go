@@ -55,6 +55,9 @@ type ChatHistoryStorage interface {
 
 	// Close закрывает соединение с хранилищем.
 	Close() error
+
+	// GetStatus возвращает строку с текущим статусом хранилища (тип, подключение, кол-во сообщений и т.д.)
+	GetStatus(chatID int64) string
 }
 
 // FileStorage реализует ChatHistoryStorage с использованием файлов.
@@ -231,4 +234,15 @@ func (fs *FileStorage) SetUserProfile(profile *UserProfile) error {
 
 func (fs *FileStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
 	return nil, fmt.Errorf("GetAllUserProfiles не реализован для FileStorage")
+}
+
+// GetStatus для FileStorage
+func (fs *FileStorage) GetStatus(chatID int64) string {
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+	count := 0
+	if messages, exists := fs.messages[chatID]; exists {
+		count = len(messages)
+	}
+	return fmt.Sprintf("Хранилище: Локальный файл. Загружено сообщений в память: %d", count)
 }

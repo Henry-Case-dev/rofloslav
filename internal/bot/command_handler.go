@@ -1,7 +1,9 @@
 package bot
 
 import (
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -50,20 +52,38 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		now := time.Now()
 		b.summaryMutex.Lock() // Используем мьютекс для lastSummaryRequest
 		lastReq, ok := b.lastSummaryRequest[chatID]
-		if ok && now.Sub(lastReq) < summaryRequestInterval {
-			log.Printf("[DEBUG] Чат %d: /summary отклонен из-за rate limit. Прошло: %v < %v", chatID, now.Sub(lastReq), summaryRequestInterval)
+		durationSinceLast := now.Sub(lastReq)
+		if ok && durationSinceLast < summaryRequestInterval {
+			remainingTime := summaryRequestInterval - durationSinceLast
+			log.Printf("[DEBUG] Чат %d: /summary отклонен из-за rate limit. Прошло: %v < %v. Осталось: %v", chatID, durationSinceLast, summaryRequestInterval, remainingTime)
 			b.summaryMutex.Unlock()
-			// --- Удаляем предыдущее инфо-сообщение перед отправкой нового ---
+
+			// --- Генерация динамической части сообщения ---
+			dynamicPart := ""
+			if b.config.RateLimitPrompt != "" {
+				generatedText, err := b.llm.GenerateArbitraryResponse(b.config.RateLimitPrompt, "") // Контекст не нужен
+				if err != nil {
+					log.Printf("[ERROR] Чат %d: Ошибка генерации динамической части сообщения о лимите: %v", chatID, err)
+					// В случае ошибки можно использовать пустую строку или запасной вариант
+				} else {
+					dynamicPart = strings.TrimSpace(generatedText)
+				}
+			}
+
+			// --- Формирование и отправка итогового сообщения ---
+			fullMessage := fmt.Sprintf("%s %s\nПодожди еще: %s",
+				b.config.RateLimitStaticText,
+				dynamicPart,
+				formatRemainingTime(remainingTime),
+			)
+
 			if lastInfoMsgID != 0 {
 				b.deleteMessage(chatID, lastInfoMsgID)
 			}
-			// --- Отправляем сообщение об ошибке и сохраняем его ID ---
-			msg := tgbotapi.NewMessage(chatID, b.config.RateLimitErrorMessage)
+			msg := tgbotapi.NewMessage(chatID, fullMessage)
 			sentMsg, err := b.api.Send(msg)
 			if err == nil {
 				b.settingsMutex.Lock()
-				// settings.LastInfoMessageID = sentMsg.MessageID // Обновляем settings через RLock/Lock
-				// TODO: Проверить необходимость обновления LastInfoMessageID здесь, возможно не нужно
 				if set, ok := b.chatSettings[chatID]; ok {
 					set.LastInfoMessageID = sentMsg.MessageID
 				}
@@ -76,7 +96,7 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		b.summaryMutex.Unlock()
 
 		log.Printf("[DEBUG] Чат %d: /summary вызван. Последний запрос был: %v (ok=%t). Прошло: %v. Лимит: %v.",
-			chatID, lastReq, ok, now.Sub(lastReq), summaryRequestInterval)
+			chatID, lastReq, ok, durationSinceLast, summaryRequestInterval)
 
 		// --- Удаляем предыдущее инфо-сообщение перед отправкой нового ---
 		if lastInfoMsgID != 0 {

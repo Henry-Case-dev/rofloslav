@@ -195,6 +195,56 @@ func (c *Client) prepareChatHistory(systemPrompt string, messages []*tgbotapi.Me
 	return openAiMessages
 }
 
+// GenerateResponseFromTextContext генерирует ответ на основе промпта и готового текстового контекста
+func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextText string) (string, error) {
+	ctx := context.Background()
+
+	// Формируем сообщения: системный промпт и контекст как сообщение пользователя
+	chatMessages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemPrompt,
+		},
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: contextText,
+		},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:       c.modelName,
+		Messages:    chatMessages,
+		Temperature: 1.0, // Можно сделать настраиваемым
+		MaxTokens:   8192,
+	}
+
+	if c.debug {
+		log.Printf("[DEBUG] DeepSeek Запрос (Text Context): Модель %s", c.modelName)
+	}
+
+	resp, err := c.openaiClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] DeepSeek Ошибка API (Text Context): %v", err)
+		}
+		return "", fmt.Errorf("ошибка вызова DeepSeek API (Text Context): %w", err)
+	}
+
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+		if c.debug {
+			log.Printf("[DEBUG] DeepSeek Ответ (Text Context): Получен пустой ответ или нет вариантов.")
+		}
+		return "", fmt.Errorf("DeepSeek не вернул валидный ответ (Text Context)")
+	}
+
+	finalResponse := resp.Choices[0].Message.Content
+	if c.debug {
+		log.Printf("[DEBUG] DeepSeek Ответ (Text Context): %s...", truncateString(finalResponse, 100))
+	}
+
+	return finalResponse, nil
+}
+
 // Вспомогательная функция для обрезки строки (можно вынести в общий util пакет)
 func truncateString(s string, maxLen int) string {
 	runes := []rune(s)

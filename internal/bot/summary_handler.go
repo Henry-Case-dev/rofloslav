@@ -53,14 +53,16 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	// Используем только промпт для саммари без комбинирования
 	summaryPrompt := b.config.SummaryPrompt
 
-	// Формируем единый текст из сообщений для контекста
-	var contextBuilder strings.Builder
-	for _, msg := range messages {
-		// Добавляем базовую информацию о сообщении для LLM
-		prefix := fmt.Sprintf("[%s (%s)]", msg.Time().Format("15:04"), msg.From.UserName)
-		contextBuilder.WriteString(fmt.Sprintf("%s: %s\n", prefix, msg.Text))
+	// --- Формирование контекста с профилями ---
+	contextText := formatHistoryWithProfiles(chatID, messages, b.storage, b.config.Debug)
+	if contextText == "" {
+		log.Printf("[WARN][createAndSendSummary] Чат %d: Отформатированный контекст для саммари пуст.", chatID)
+		editText = "Не удалось подготовить данные для саммари (контекст пуст)."
+		sendText = editText
+		b.updateOrCreateMessage(chatID, infoMessageID, editText, sendText, parseMode)
+		return
 	}
-	contextText := contextBuilder.String()
+	// --- Конец форматирования ---
 
 	const maxAttempts = 3 // Максимальное количество попыток генерации
 	const minWords = 10   // Минимальное количество слов в саммари
@@ -110,9 +112,10 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 		if b.config.Debug {
 			log.Printf("[DEBUG] Саммари успешно создано для чата %d после %d попыток", chatID, attempt)
 		}
-		editText = fmt.Sprintf("📋 *Саммари диалога за последние 24 часа:*\n\n%s", finalSummary)
+		// Убираем Markdown из основного текста, т.к. он может быть невалидным
+		editText = fmt.Sprintf("📋 Саммари диалога за последние 24 часа:\n\n%s", finalSummary)
 		sendText = editText
-		parseMode = "Markdown"
+		parseMode = "" // Отправляем как простой текст
 	} else {
 		if b.config.Debug {
 			log.Printf("[DEBUG] Чат %d: Не удалось сгенерировать достаточно длинное саммари после %d попыток.", chatID, maxAttempts)
