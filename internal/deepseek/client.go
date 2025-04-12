@@ -256,3 +256,8 @@ func truncateString(s string, maxLen int) string {
 	}
 	return string(runes[:maxLen-3]) + "..."
 }
+
+// TranscribeAudio для DeepSeek (возвращает ошибку, т.к. не поддерживается)
+func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, error) {
+	return "", fmt.Errorf("транскрибация аудио не поддерживается DeepSeek API")
+}

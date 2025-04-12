@@ -2,7 +2,9 @@ package bot
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +23,103 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 	if b.config.Debug {
 		log.Printf("[DEBUG][MH] Chat %d: Entering handleMessage for message ID %d.", chatID, message.MessageID)
 	}
+
+	// --- НАЧАЛО НОВОЙ ЛОГИКИ ГОЛОСОВЫХ ---
+	var originalMessage *tgbotapi.Message = update.Message
+	var textMessage *tgbotapi.Message // Для создания текстового представления
+
+	if update.Message != nil && update.Message.Voice != nil {
+		log.Printf("[DEBUG][VoiceHandler] Chat %d: Получено голосовое сообщение ID %d (FileID: %s, Duration: %ds)", chatID, originalMessage.MessageID, originalMessage.Voice.FileID, originalMessage.Voice.Duration)
+
+		// 1. Получаем URL для скачивания файла
+		fileURL, err := b.api.GetFileDirectURL(originalMessage.Voice.FileID)
+		if err != nil {
+			log.Printf("[ERROR][VoiceHandler] Chat %d: Ошибка получения URL файла: %v", chatID, err)
+			b.sendReply(chatID, "⚠️ Не удалось получить ссылку на аудиофайл.")
+			return // Прерываем обработку этого сообщения
+		}
+
+		// 2. Скачиваем файл
+		loadingMsg, _ := b.sendReplyAndDeleteAfter(chatID, "⏳ Скачиваю и распознаю голосовое...", 0) // 0 - не удалять пока
+		audioData, err := downloadFile(fileURL)
+		if err != nil {
+			log.Printf("[ERROR][VoiceHandler] Chat %d: Ошибка скачивания файла: %v", chatID, err)
+			b.sendReply(chatID, "⚠️ Не удалось скачать аудиофайл.")
+			if loadingMsg != nil {
+				b.deleteMessage(chatID, loadingMsg.MessageID)
+			}
+			return
+		}
+
+		// 3. Транскрибируем аудио
+		// Используем MIME-тип из Voice, если он есть, иначе предполагаем 'audio/ogg'
+		mimeType := originalMessage.Voice.MimeType
+		if mimeType == "" {
+			mimeType = "audio/ogg" // Типичный формат для голосовых Telegram
+		}
+		rawTranscript, err := b.llm.TranscribeAudio(audioData, mimeType)
+		if err != nil {
+			log.Printf("[ERROR][VoiceHandler] Chat %d: Ошибка транскрибации: %v", chatID, err)
+			b.sendReply(chatID, "⚠️ Не удалось распознать речь в сообщении.")
+			if loadingMsg != nil {
+				b.deleteMessage(chatID, loadingMsg.MessageID)
+			}
+			return
+		}
+
+		if rawTranscript == "" {
+			log.Printf("[WARN][VoiceHandler] Chat %d: Транскрипция вернула пустой текст.", chatID)
+			b.sendReply(chatID, "⚠️ Распознанный текст пуст.")
+			if loadingMsg != nil {
+				b.deleteMessage(chatID, loadingMsg.MessageID)
+			}
+			return
+		}
+
+		// 4. Форматируем текст (пунктуация, абзацы)
+		formattedText, err := b.llm.GenerateArbitraryResponse(b.config.VoiceFormatPrompt, rawTranscript)
+		if err != nil {
+			log.Printf("[WARN][VoiceHandler] Chat %d: Ошибка форматирования текста: %v. Использую сырой текст.", chatID, err)
+			formattedText = rawTranscript // Используем сырой текст как fallback
+		}
+
+		// 5. Создаем представительное текстовое сообщение
+		textMessage = &tgbotapi.Message{
+			MessageID:   originalMessage.MessageID,
+			From:        originalMessage.From,
+			SenderChat:  originalMessage.SenderChat,
+			Date:        originalMessage.Date,
+			Chat:        originalMessage.Chat,
+			ForwardFrom: originalMessage.ForwardFrom, // Сохраняем информацию о пересылке
+			// ... другие поля по необходимости ...
+			ReplyToMessage: originalMessage.ReplyToMessage,
+			Text:           formattedText, // Вставляем отформатированный текст
+			// Оставляем Entities пустым, т.к. мы их не генерировали
+			// Voice поле здесь не нужно, т.к. это текстовое представление
+		}
+
+		// 6. Удаляем сообщение "Скачиваю..."
+		if loadingMsg != nil {
+			b.deleteMessage(chatID, loadingMsg.MessageID)
+		}
+		log.Printf("[DEBUG][VoiceHandler] Chat %d: Голосовое сообщение ID %d обработано. Текст: %s...", chatID, originalMessage.MessageID, truncateString(formattedText, 50))
+
+	} else {
+		// Если это не голосовое, используем оригинальное сообщение
+		textMessage = originalMessage
+	}
+
+	// --- КОНЕЦ НОВОЙ ЛОГИКИ ГОЛОСОВЫХ ---
+
+	// Теперь используем textMessage (оригинальное или созданное из аудио) для дальнейшей обработки
+	if textMessage == nil {
+		// Это не должно происходить, но на всякий случай
+		log.Printf("[ERROR][MH] textMessage is nil after voice handling for update %d", update.UpdateID)
+		return
+	}
+
+	message = textMessage    // Используем переменную message далее
+	chatID = message.Chat.ID // Убедимся, что chatID актуален
 
 	// === Read Settings with Minimized Lock Duration ===
 	b.settingsMutex.Lock() // Lock 1 (Write lock)
@@ -365,10 +464,45 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			return // If bot is inactive, exit
 		}
 
-		// Add message to storage (does not need settings lock)
-		b.storage.AddMessage(chatID, message)
-		if b.config.Debug {
-			log.Printf("[DEBUG][MH] Chat %d: Message ID %d added to storage.", chatID, message.MessageID)
+		// Добавляем ОРИГИНАЛЬНОЕ сообщение в хранилище, чтобы сохранить метаданные (включая Voice для флага)
+		// а textMessage (с распознанным текстом) используем для дальнейшей обработки
+		if originalMessage != nil {
+			b.storage.AddMessage(originalMessage.Chat.ID, originalMessage)
+			if b.config.Debug {
+				log.Printf("[DEBUG][MH] Chat %d: Original Message ID %d added to storage.", originalMessage.Chat.ID, originalMessage.MessageID)
+			}
+		} else {
+			log.Printf("[WARN][MH] Chat %d: originalMessage is nil, cannot add to storage.", chatID)
+		}
+
+		// Обновляем профиль пользователя (используем From из textMessage/originalMessage)
+		if message.From != nil {
+			go func(chatID int64, user *tgbotapi.User) {
+				// Получаем текущий профиль (если есть) или создаем новый
+				profile, err := b.storage.GetUserProfile(chatID, user.ID)
+				if err != nil {
+					log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка получения профиля: %v", chatID, user.ID, err)
+					return // Не удалось получить, не обновляем
+				}
+				if profile == nil {
+					profile = &storage.UserProfile{
+						ChatID: chatID,
+						UserID: user.ID,
+					}
+				}
+				// Обновляем данные
+				profile.Username = user.UserName
+				profile.LastSeen = time.Unix(int64(message.Date), 0)
+				// Устанавливаем Alias из FirstName при первом создании, если Alias пуст
+				if profile.Alias == "" && user.FirstName != "" {
+					profile.Alias = user.FirstName
+				}
+				// Сохраняем
+				err = b.storage.SetUserProfile(profile)
+				if err != nil {
+					log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка сохранения профиля: %v", chatID, user.ID, err)
+				}
+			}(message.Chat.ID, message.From) // Передаем chatID и user в горутину
 		}
 
 		// --- Srach Analysis ---
@@ -641,3 +775,23 @@ func truncateString(s string, maxLen int) string {
 	return string(runes[:maxLen-3]) + "..."
 }
 */
+
+// downloadFile скачивает файл по URL и возвращает его содержимое
+func downloadFile(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка HTTP GET для %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body) // Читаем тело ответа для лога
+		return nil, fmt.Errorf("не удалось скачать файл, статус: %d, тело: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения тела ответа: %w", err)
+	}
+	return body, nil
+}

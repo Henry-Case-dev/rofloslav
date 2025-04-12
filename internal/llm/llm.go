@@ -20,6 +20,10 @@ type LLMClient interface {
 	// Используется для задач, не требующих истории чата (например, анализ срача, саммари без профилей).
 	GenerateArbitraryResponse(systemPrompt string, contextText string) (string, error)
 
+	// TranscribeAudio транскрибирует аудиоданные.
+	// Возвращает распознанный текст и ошибку.
+	TranscribeAudio(audioData []byte, mimeType string) (string, error)
+
 	// Close освобождает ресурсы, связанные с клиентом (если необходимо).
 	Close() error
 }

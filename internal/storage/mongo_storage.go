@@ -36,6 +36,7 @@ type MongoMessage struct {
 	Caption         string                   `bson:"caption,omitempty"`          // Текст подписи к медиа
 	CaptionEntities []tgbotapi.MessageEntity `bson:"caption_entities,omitempty"` // Форматирование подписи
 	HasMedia        bool                     `bson:"has_media,omitempty"`        // Флаг наличия медиа
+	IsVoice         bool                     `bson:"is_voice,omitempty"`         // Флаг, что сообщение из аудио
 }
 
 // convertMongoToAPIMessage преобразует MongoMessage обратно в *tgbotapi.Message
@@ -61,6 +62,11 @@ func convertMongoToAPIMessage(mongoMsg *MongoMessage) *tgbotapi.Message {
 
 	// Информацию об ответе не храним в MongoMessage, поэтому не восстанавливаем
 	// msg.ReplyToMessage = ...
+
+	// Добавляем префикс для голосовых сообщений
+	if mongoMsg.IsVoice {
+		msg.Text = fmt.Sprintf("[Голосовое]: %s", msg.Text)
+	}
 
 	return msg
 }
@@ -321,9 +327,8 @@ func convertAPIToMongoMessage(chatID int64, apiMsg *tgbotapi.Message) *MongoMess
 	}
 
 	// Добавляем информацию о медиа (простой флаг)
-	if len(apiMsg.Photo) > 0 || apiMsg.Video != nil || apiMsg.Voice != nil || apiMsg.Document != nil || apiMsg.Sticker != nil || apiMsg.Audio != nil {
-		mongoMsg.HasMedia = true
-	}
+	mongoMsg.HasMedia = mongoMsg.Caption != "" || (apiMsg.Photo != nil || apiMsg.Video != nil || apiMsg.Document != nil || apiMsg.Audio != nil || apiMsg.Voice != nil || apiMsg.Sticker != nil)
+	mongoMsg.IsVoice = apiMsg.Voice != nil // Устанавливаем флаг, если поле Voice не nil
 
 	return mongoMsg
 }

@@ -396,3 +396,57 @@ func truncateString(s string, maxLen int) string {
 	}
 	return s[:maxLen]
 }
+
+// TranscribeAudio транскрибирует аудиоданные с помощью Gemini API
+func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, error) {
+	// Проверяем, поддерживает ли модель аудио (хотя бы по названию)
+	if !strings.Contains(c.modelName, "1.5") {
+		log.Printf("[WARN][TranscribeAudio] Текущая модель '%s' может не поддерживать аудио. Для транскрибации рекомендуется Gemini 1.5 Flash/Pro.", c.modelName)
+		// Можно либо вернуть ошибку, либо попытаться использовать 1.5 Flash по умолчанию
+		// return "", fmt.Errorf("модель %s не поддерживает транскрибацию аудио", c.modelName)
+	}
+
+	ctx := context.Background()
+	// Используем модель, указанную при инициализации клиента, или 1.5 Flash как fallback
+	// model := c.genaiClient.GenerativeModel(c.modelName)
+	// TODO: Решить, как обрабатывать модели без поддержки аудио. Пока оставляем текущую.
+	model := c.genaiClient.GenerativeModel(c.modelName)
+
+	if c.debug {
+		log.Printf("[DEBUG][TranscribeAudio] Используется модель: %s, MIME-тип: %s, Размер данных: %d байт", c.modelName, mimeType, len(audioData))
+	}
+
+	// Формируем запрос с аудиоданными и простым промптом для транскрибации
+	prompt := genai.Text("Transcribe this audio:")
+	audioPart := genai.Blob{MIMEType: mimeType, Data: audioData}
+
+	resp, err := model.GenerateContent(ctx, prompt, audioPart)
+	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG][TranscribeAudio] Ошибка API Gemini: %v", err)
+		}
+		return "", fmt.Errorf("ошибка транскрибации аудио в Gemini: %w", err)
+	}
+
+	// Извлекаем текст из ответа
+	var transcript strings.Builder
+	if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
+		for _, part := range resp.Candidates[0].Content.Parts {
+			if textPart, ok := part.(genai.Text); ok {
+				transcript.WriteString(string(textPart))
+			}
+		}
+	} else {
+		if c.debug {
+			log.Println("[DEBUG][TranscribeAudio] Gemini не вернул валидный ответ или текст.")
+		}
+		return "", fmt.Errorf("Gemini не вернул текст транскрибации")
+	}
+
+	finalTranscript := transcript.String()
+	if c.debug {
+		log.Printf("[DEBUG][TranscribeAudio] Успешная транскрибация: %s...", truncateString(finalTranscript, 100))
+	}
+
+	return finalTranscript, nil
+}

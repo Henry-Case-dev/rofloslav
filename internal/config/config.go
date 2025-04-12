@@ -82,6 +82,8 @@ type Config struct {
 	AdminUsernames []string
 	// Промпт для приветствия
 	WelcomePrompt string
+	// Промпт для форматирования голоса
+	VoiceFormatPrompt string
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -141,9 +143,10 @@ func Load() (*Config, error) {
 	dbName := getEnvOrDefault("POSTGRESQL_DBNAME", "")       // Используем POSTGRESQL_DBNAME
 
 	// --- Загрузка прочих переменных ---
-	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypeMongo))) // По умолчанию Mongo
-	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight")                        // По умолчанию lightnight
-	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав.")              // Загрузка приветственного промпта
+	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypeMongo)))       // По умолчанию Mongo
+	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight")                              // По умолчанию lightnight
+	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав.")                    // Загрузка приветственного промпта
+	voiceFormatPrompt := getEnvOrDefault("VOICE_FORMAT_PROMPT", "Расставь знаки препинания и абзацы:") // Загрузка промпта для голоса
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
@@ -174,6 +177,7 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
 	log.Printf("[Config Load] DEBUG: %s", debugStr)
 	log.Printf("[Config Load] WELCOME_PROMPT: %s...", truncateString(welcomePrompt, 50))
+	log.Printf("[Config Load] VOICE_FORMAT_PROMPT: %s...", truncateString(voiceFormatPrompt, 50)) // Логируем новый промпт
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -274,7 +278,8 @@ func Load() (*Config, error) {
 		MongoDbMessagesCollection:     getEnvOrDefault("MONGODB_MESSAGES_COLLECTION", "chat_messages"),
 		MongoDbUserProfilesCollection: getEnvOrDefault("MONGODB_USER_PROFILES_COLLECTION", "user_profiles"),
 		SrachAnalysisEnabled:          srachEnabledStr == "true" || srachEnabledStr == "1" || srachEnabledStr == "yes",
-		WelcomePrompt:                 welcomePrompt, // Сохраняем приветственный промпт
+		WelcomePrompt:                 welcomePrompt,     // Сохраняем приветственный промпт
+		VoiceFormatPrompt:             voiceFormatPrompt, // Сохраняем промпт форматирования голоса
 	}
 
 	// Валидация и установка StorageType
