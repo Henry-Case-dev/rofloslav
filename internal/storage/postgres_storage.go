@@ -620,3 +620,205 @@ func (ps *PostgresStorage) GetStatus(chatID int64) string {
 	// Можно добавить проверку Ping() для статуса подключения, но это может быть медленно
 	return status
 }
+
+// GetChatSettings получает настройки чата из PostgreSQL
+func (ps *PostgresStorage) GetChatSettings(chatID int64) (*ChatSettings, error) {
+	var settings ChatSettings
+	settings.ChatID = chatID // Установим ID чата
+
+	query := `
+		SELECT
+			conversation_style, temperature, model, gemini_safety_threshold,
+			voice_transcription_enabled, direct_reply_limit_enabled,
+			direct_reply_limit_count, direct_reply_limit_duration_minutes
+		FROM chat_settings
+		WHERE chat_id = $1
+	`
+	row := ps.db.QueryRow(query, chatID)
+
+	// Используем Null* типы для сканирования, чтобы обработать NULL значения
+	var style sql.NullString
+	var temp sql.NullFloat64
+	var model sql.NullString
+	var safety sql.NullString
+	var voiceEnabled sql.NullBool
+	var limitEnabled sql.NullBool
+	var limitCount sql.NullInt64
+	var limitDuration sql.NullInt64
+
+	err := row.Scan(
+		&style, &temp, &model, &safety,
+		&voiceEnabled, &limitEnabled,
+		&limitCount, &limitDuration,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Настройки не найдены, возвращаем дефолтные (не сохраняя их в БД здесь)
+			log.Printf("[Postgres GetChatSettings DEBUG] Настройки для chatID %d не найдены. Возвращаю дефолтные.", chatID)
+			// Заполняем дефолтными значениями (из конфига, если он доступен, или стандартными)
+			// TODO: Нужна ссылка на config в PostgresStorage, чтобы брать дефолты оттуда!
+			// Пока что используем заглушки или пустые значения.
+			// settings.ConversationStyle = "default_style"
+			// settings.Temperature = 0.7
+			// settings.Model = "default_model"
+			// ... и так далее ...
+			return &settings, nil // Возвращаем пустые/дефолтные
+		} else {
+			log.Printf("[Postgres GetChatSettings ERROR] Ошибка получения настроек для chatID %d: %v", chatID, err)
+			return nil, err
+		}
+	}
+
+	// Заполняем структуру settings из полученных значений
+	if style.Valid {
+		settings.ConversationStyle = style.String
+	}
+	if temp.Valid {
+		settings.Temperature = &temp.Float64 // Сохраняем как указатель
+	}
+	if model.Valid {
+		settings.Model = model.String
+	}
+	if safety.Valid {
+		settings.GeminiSafetyThreshold = safety.String
+	}
+	if voiceEnabled.Valid {
+		settings.VoiceTranscriptionEnabled = &voiceEnabled.Bool // Указатель
+	}
+	if limitEnabled.Valid {
+		settings.DirectReplyLimitEnabled = &limitEnabled.Bool // Указатель
+	}
+	if limitCount.Valid {
+		count := int(limitCount.Int64)          // Конвертируем в int
+		settings.DirectReplyLimitCount = &count // Указатель
+	}
+	if limitDuration.Valid {
+		duration := int(limitDuration.Int64)          // Получаем минуты
+		settings.DirectReplyLimitDuration = &duration // Указатель
+	}
+
+	// TODO: Применить дефолты к nil полям, если config доступен.
+
+	if ps.debug {
+		log.Printf("[Postgres GetChatSettings DEBUG] Настройки для chatID %d успешно получены.", chatID)
+	}
+	return &settings, nil
+}
+
+// SetChatSettings сохраняет настройки чата в PostgreSQL (UPSERT)
+func (ps *PostgresStorage) SetChatSettings(settings *ChatSettings) error {
+	if settings == nil {
+		return fmt.Errorf("нельзя сохранить nil настройки")
+	}
+
+	query := `
+		INSERT INTO chat_settings (
+			chat_id, conversation_style, temperature, model, gemini_safety_threshold,
+			voice_transcription_enabled, direct_reply_limit_enabled,
+			direct_reply_limit_count, direct_reply_limit_duration_minutes
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (chat_id) DO UPDATE SET
+			conversation_style = EXCLUDED.conversation_style,
+			temperature = EXCLUDED.temperature,
+			model = EXCLUDED.model,
+			gemini_safety_threshold = EXCLUDED.gemini_safety_threshold,
+			voice_transcription_enabled = EXCLUDED.voice_transcription_enabled,
+			direct_reply_limit_enabled = EXCLUDED.direct_reply_limit_enabled,
+			direct_reply_limit_count = EXCLUDED.direct_reply_limit_count,
+			direct_reply_limit_duration_minutes = EXCLUDED.direct_reply_limit_duration_minutes
+	`
+
+	// Обрабатываем указатели - передаем Null* типы в Exec
+	var temp sql.NullFloat64
+	if settings.Temperature != nil {
+		temp.Float64 = *settings.Temperature
+		temp.Valid = true
+	}
+	var voiceEnabled sql.NullBool
+	if settings.VoiceTranscriptionEnabled != nil {
+		voiceEnabled.Bool = *settings.VoiceTranscriptionEnabled
+		voiceEnabled.Valid = true
+	}
+	var limitEnabled sql.NullBool
+	if settings.DirectReplyLimitEnabled != nil {
+		limitEnabled.Bool = *settings.DirectReplyLimitEnabled
+		limitEnabled.Valid = true
+	}
+	var limitCount sql.NullInt64
+	if settings.DirectReplyLimitCount != nil {
+		limitCount.Int64 = int64(*settings.DirectReplyLimitCount)
+		limitCount.Valid = true
+	}
+	var limitDuration sql.NullInt64
+	if settings.DirectReplyLimitDuration != nil {
+		limitDuration.Int64 = int64(*settings.DirectReplyLimitDuration)
+		limitDuration.Valid = true
+	}
+
+	_, err := ps.db.Exec(query,
+		settings.ChatID,
+		settings.ConversationStyle,     // string
+		temp,                           // *float64 -> NullFloat64
+		settings.Model,                 // string
+		settings.GeminiSafetyThreshold, // string
+		voiceEnabled,                   // *bool -> NullBool
+		limitEnabled,                   // *bool -> NullBool
+		limitCount,                     // *int -> NullInt64
+		limitDuration,                  // *int -> NullInt64
+	)
+
+	if err != nil {
+		log.Printf("[Postgres SetChatSettings ERROR] Ошибка сохранения настроек для chatID %d: %v", settings.ChatID, err)
+		return err
+	}
+
+	if ps.debug {
+		log.Printf("[Postgres SetChatSettings DEBUG] Настройки для chatID %d успешно сохранены (UPSERT).", settings.ChatID)
+	}
+	return nil
+}
+
+// --- Новые методы для обновления отдельных настроек лимитов ---
+
+func (ps *PostgresStorage) updateSingleSetting(chatID int64, columnName string, value interface{}) error {
+	query := fmt.Sprintf(`
+		INSERT INTO chat_settings (chat_id, %s)
+		VALUES ($1, $2)
+		ON CONFLICT (chat_id) DO UPDATE SET
+			%s = EXCLUDED.%s
+	`, columnName, columnName, columnName)
+
+	_, err := ps.db.Exec(query, chatID, value)
+	if err != nil {
+		log.Printf("[Postgres updateSingleSetting ERROR] Ошибка обновления '%s' для chatID %d: %v", columnName, chatID, err)
+		return fmt.Errorf("ошибка обновления настройки '%s': %w", columnName, err)
+	}
+	if ps.debug {
+		log.Printf("[Postgres updateSingleSetting DEBUG] Настройка '%s' для chatID %d успешно обновлена.", columnName, chatID)
+	}
+	return nil
+}
+
+// UpdateDirectLimitEnabled обновляет только поле direct_reply_limit_enabled
+func (ps *PostgresStorage) UpdateDirectLimitEnabled(chatID int64, enabled bool) error {
+	return ps.updateSingleSetting(chatID, "direct_reply_limit_enabled", enabled)
+}
+
+// UpdateDirectLimitCount обновляет только поле direct_reply_limit_count
+func (ps *PostgresStorage) UpdateDirectLimitCount(chatID int64, count int) error {
+	if count < 0 {
+		return fmt.Errorf("количество должно быть не отрицательным")
+	}
+	return ps.updateSingleSetting(chatID, "direct_reply_limit_count", int64(count))
+}
+
+// UpdateDirectLimitDuration обновляет только поле direct_reply_limit_duration_minutes
+func (ps *PostgresStorage) UpdateDirectLimitDuration(chatID int64, duration time.Duration) error {
+	if duration <= 0 {
+		return fmt.Errorf("длительность должна быть положительной")
+	}
+	durationMinutes := int(duration.Minutes()) // Сохраняем в минутах
+	return ps.updateSingleSetting(chatID, "direct_reply_limit_duration_minutes", int64(durationMinutes))
+}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,17 +20,19 @@ import (
 
 // Bot структура
 type Bot struct {
-	api                *tgbotapi.BotAPI
-	llm                llm.LLMClient
-	storage            storage.ChatHistoryStorage // Используем интерфейс
-	config             *config.Config
-	chatSettings       map[int64]*ChatSettings
-	settingsMutex      sync.RWMutex
-	stop               chan struct{}
-	summaryMutex       sync.RWMutex
-	lastSummaryRequest map[int64]time.Time
-	autoSummaryTicker  *time.Ticker // Оставляем для авто-саммари
-	randSource         *rand.Rand   // Источник случайных чисел
+	api                   *tgbotapi.BotAPI
+	llm                   llm.LLMClient
+	storage               storage.ChatHistoryStorage // Используем интерфейс
+	config                *config.Config
+	chatSettings          map[int64]*ChatSettings         // Настройки чатов (в памяти)
+	pendingSettings       map[int64]string                // Отслеживание ожидаемого ввода настроек [chatID]settingKey
+	directReplyTimestamps map[int64]map[int64][]time.Time // Временные метки прямых ответов [chatID][userID]timestamps
+	settingsMutex         sync.RWMutex
+	stop                  chan struct{}
+	summaryMutex          sync.RWMutex
+	lastSummaryRequest    map[int64]time.Time
+	autoSummaryTicker     *time.Ticker // Оставляем для авто-саммари
+	randSource            *rand.Rand   // Источник случайных чисел
 }
 
 // New создает и инициализирует новый экземпляр бота
@@ -68,11 +69,15 @@ func New(cfg *config.Config) (*Bot, error) {
 
 	// Инициализация хранилища
 	log.Printf("Инициализация хранилища: %s", cfg.StorageType)
-	var chatStorage storage.ChatHistoryStorage
+	var storageImpl storage.ChatHistoryStorage
+	var initErr error // Используем initErr для ошибок инициализации хранилища
 	switch cfg.StorageType {
+	case config.StorageTypeFile:
+		storageImpl = storage.NewFileStorage(cfg.ContextWindow, true) // Используем =
+		log.Println("Используется файловое хранилище")
 	case config.StorageTypePostgres:
-		log.Println("Попытка инициализации PostgreSQL хранилища...")
-		pgStorage, pgErr := storage.NewPostgresStorage(
+		// Используем = для storageImpl и initErr
+		storageImpl, initErr = storage.NewPostgresStorage(
 			cfg.PostgresqlHost,
 			cfg.PostgresqlPort,
 			cfg.PostgresqlUser,
@@ -81,63 +86,58 @@ func New(cfg *config.Config) (*Bot, error) {
 			cfg.ContextWindow,
 			cfg.Debug,
 		)
-		if pgErr != nil {
-			log.Printf("[WARN] Ошибка инициализации PostgreSQL хранилища: %v. Переключение на файловое хранилище.", pgErr)
-			// Fallback на файловое хранилище
-			chatStorage = storage.NewFileStorage(cfg.ContextWindow, true) // true для autoSave, т.к. это fallback
-			log.Println("Используется файловое хранилище (fallback).")
-		} else {
-			chatStorage = pgStorage
-			log.Println("Хранилище PostgreSQL успешно инициализировано.")
+		if initErr != nil {
+			return nil, fmt.Errorf("ошибка создания PostgreSQL хранилища: %w", initErr)
 		}
+		log.Println("Используется PostgreSQL хранилище")
 	case config.StorageTypeMongo:
 		log.Println("Попытка инициализации MongoDB хранилища...")
-		mongoStorage, mongoErr := storage.NewMongoStorage(
+		// Используем = для storageImpl и initErr
+		storageImpl, initErr = storage.NewMongoStorage(
 			cfg.MongoDbURI,
 			cfg.MongoDbName,
 			cfg.MongoDbMessagesCollection,
 			cfg.MongoDbUserProfilesCollection,
-			cfg,
+			cfg, // Передаем весь конфиг
 		)
-		if mongoErr != nil {
-			log.Printf("[WARN] Ошибка инициализации MongoDB хранилища: %v. Переключение на файловое хранилище.", mongoErr)
+		if initErr != nil {
+			log.Printf("[WARN] Ошибка инициализации MongoDB хранилища: %v. Переключение на файловое хранилище.", initErr)
 			// Fallback на файловое хранилище
-			chatStorage = storage.NewFileStorage(cfg.ContextWindow, true)
+			storageImpl = storage.NewFileStorage(cfg.ContextWindow, true)
 			log.Println("Используется файловое хранилище (fallback).")
 		} else {
-			chatStorage = mongoStorage
 			log.Println("Хранилище MongoDB успешно инициализировано.")
 		}
-	case config.StorageTypeFile:
-		log.Println("Используется файловое хранилище.")
-		chatStorage = storage.NewFileStorage(cfg.ContextWindow, true) // true для autoSave
 	default:
-		log.Printf("[WARN] Неизвестный тип хранилища '%s', используется файловое хранилище по умолчанию.", cfg.StorageType)
-		chatStorage = storage.NewFileStorage(cfg.ContextWindow, true) // true для autoSave
+		return nil, fmt.Errorf("неизвестный тип хранилища: %s", cfg.StorageType)
 	}
 
-	// Загрузка настроек чатов
-	chatSettings, loadErr := loadAllChatSettings()
-	if loadErr != nil {
-		// Не фатальная ошибка, просто начинаем с настройками по умолчанию
-		log.Printf("[WARN] Ошибка загрузки сохраненных настроек чатов: %v. Будут использоваться настройки по умолчанию.", loadErr)
-		chatSettings = make(map[int64]*ChatSettings)
-	}
-	log.Printf("Загружено %d наборов настроек чатов.", len(chatSettings))
+	// Инициализация источника случайных чисел
+	source := rand.NewSource(time.Now().UnixNano())
+	randGen := rand.New(source)
+
+	// Инициализация настроек в памяти
+	chatSettings := make(map[int64]*ChatSettings)
 
 	// Создание экземпляра бота
 	b := &Bot{
-		api:                api,
-		llm:                llmClient,
-		storage:            chatStorage, // Назначаем выбранное хранилище
-		config:             cfg,
-		chatSettings:       chatSettings,
-		settingsMutex:      sync.RWMutex{},
-		stop:               make(chan struct{}),
-		summaryMutex:       sync.RWMutex{},
-		lastSummaryRequest: make(map[int64]time.Time),
-		randSource:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		api:                   api,
+		llm:                   llmClient,
+		storage:               storageImpl, // Назначаем выбранное хранилище
+		config:                cfg,
+		chatSettings:          chatSettings,
+		pendingSettings:       make(map[int64]string),
+		directReplyTimestamps: make(map[int64]map[int64][]time.Time),
+		settingsMutex:         sync.RWMutex{},
+		stop:                  make(chan struct{}),
+		summaryMutex:          sync.RWMutex{},
+		lastSummaryRequest:    make(map[int64]time.Time),
+		autoSummaryTicker:     nil,
+		randSource:            randGen,
 	}
+
+	// Загрузка всех настроек чатов при старте
+	b.loadAllChatSettingsFromStorage()
 
 	log.Println("Инициализация бота завершена.")
 	return b, nil
@@ -254,142 +254,221 @@ func (b *Bot) Stop() {
 // Возвращает текущие настройки чата и флаг, был ли чат только что инициализирован.
 func (b *Bot) ensureChatInitializedAndWelcome(update tgbotapi.Update) (*ChatSettings, bool) {
 	var chatID int64
-	var chatName string
+	var msg *tgbotapi.Message
+
 	if update.Message != nil {
 		chatID = update.Message.Chat.ID
-		chatName = update.Message.Chat.Title
+		msg = update.Message
 	} else if update.CallbackQuery != nil {
 		chatID = update.CallbackQuery.Message.Chat.ID
-		chatName = update.CallbackQuery.Message.Chat.Title
 	} else {
-		// Неизвестный тип обновления, пропускаем инициализацию
+		// Неизвестный тип обновления, игнорируем
 		return nil, false
 	}
 
-	// Сначала проверяем с RLock для скорости
-	b.settingsMutex.RLock()
+	b.settingsMutex.Lock()
+	defer b.settingsMutex.Unlock()
+
 	settings, exists := b.chatSettings[chatID]
-	b.settingsMutex.RUnlock()
+	justInitialized := !exists
 
 	if !exists {
-		var settings *ChatSettings // Объявляем settings здесь
-		b.settingsMutex.Lock()     // Блокируем для проверки и возможного создания
+		log.Printf("Инициализация нового чата: %d", chatID)
 
-		// Повторно проверяем существование чата под полным мьютексом (Double-Checked Locking)
-		if _, exists := b.chatSettings[chatID]; exists {
-			settings, _ = b.chatSettings[chatID] // Присваиваем существующие настройки
-			b.settingsMutex.Unlock()
-			return settings, false // Другая горутина могла создать его
+		// Загружаем настройки из БД, чтобы получить специфичные для чата значения
+		dbSettings, err := b.storage.GetChatSettings(chatID)
+		if err != nil {
+			log.Printf("[ERROR][ensureChatInitialized] Ошибка получения настроек из DB для чата %d: %v. Будут использованы дефолты из config.", chatID, err)
+			dbSettings = &storage.ChatSettings{} // Используем пустые, чтобы не было паники
 		}
 
-		// --- Инициализация нового чата ---
-		log.Printf("Чат %d (%s) не найден. Инициализация настроек...", chatID, chatName)
-		// Создаем новые настройки для этого чата
-		newSettings := &ChatSettings{
+		// Создаем настройки в памяти, используя глобальные и загруженные из БД
+		r := b.randSource // Получаем источник случайных чисел
+		settings = &ChatSettings{
 			Active:               true,
 			MinMessages:          b.config.MinMessages,
 			MaxMessages:          b.config.MaxMessages,
-			MessageCount:         0,
 			DailyTakeTime:        b.config.DailyTakeTime,
 			SummaryIntervalHours: b.config.SummaryIntervalHours,
-			LastAutoSummaryTime:  time.Time{},                   // Инициализируем пустым временем
-			SrachAnalysisEnabled: b.config.SrachAnalysisEnabled, // Берем значение по умолчанию из конфига
+			MessageCount:         r.Intn(b.config.MaxMessages-b.config.MinMessages+1) + b.config.MinMessages, // Случайное значение
 			SrachState:           "none",
-			SrachMessages:        make([]string, 0),
+			SrachAnalysisEnabled: b.getSrachEnabledFromDbOrDefault(dbSettings), // Получаем из БД или дефолт конфига
 		}
-		b.chatSettings[chatID] = newSettings
-		isNewChat := true        // Устанавливаем флаг
-		b.settingsMutex.Unlock() // --- ОСВОБОЖДАЕМ МЬЮТЕКС ЗДЕСЬ ---
+		b.chatSettings[chatID] = settings
+		// Инициализируем map для лимитов этого чата
+		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
 
-		log.Printf("Чат %d (%s) успешно инициализирован.", chatID, chatName)
-
-		// --- Действия ПОСЛЕ освобождения мьютекса ---
-		if isNewChat {
-			// --- Динамическое приветствие --- (Вынесено из-под мьютекса)
-			welcomeText := ""
-			if b.config.WelcomePrompt != "" {
-				generatedWelcome, err := b.llm.GenerateArbitraryResponse(b.config.WelcomePrompt, "")
-				if err != nil {
-					log.Printf("[WARN][ensureChatInitialized] Chat %d: Ошибка генерации приветствия: %v. Использую стандартное.", chatID, err)
-					welcomeText = fmt.Sprintf("Привет, чат %s! Я Рофлослав. Теперь я с вами.", chatName)
-				} else {
-					welcomeText = generatedWelcome
-				}
-			} else {
-				welcomeText = fmt.Sprintf("Привет, чат %s! Я Рофлослав. Теперь я с вами.", chatName) // Стандартное, если промпт пуст
+		// Отправляем приветственное сообщение в новом чате
+		if msg != nil && msg.NewChatMembers != nil { // Только если добавили новых участников
+			welcomePrompt := b.config.WelcomePrompt
+			welcomeMsg, genErr := b.llm.GenerateArbitraryResponse(welcomePrompt, "")
+			if genErr != nil {
+				log.Printf("[ERROR][ensureChatInitialized] Ошибка генерации приветствия для чата %d: %v", chatID, genErr)
+				welcomeMsg = "Всем привет! Я Рофлослав, готов общаться."
 			}
-			b.sendReply(chatID, welcomeText) // Отправляем приветствие
-
-			// --- Загрузка истории (асинхронно) ---
-			go b.loadChatHistory(chatID)
-
-			// Отправляем главное меню после приветствия и начала загрузки истории
-			b.sendMainMenu(chatID, 0) // 0 т.к. нет старого меню для удаления
+			// Отправляем приветствие без сохранения в историю или обработки
+			b.sendReply(chatID, welcomeMsg)
 		}
-		return newSettings, isNewChat // Возвращаем созданные настройки и флаг нового чата
+
+		// Загружаем историю чата в фоне (после инициализации настроек)
+		go b.loadChatHistory(chatID)
 	}
 
-	return settings, false // Чат уже был инициализирован
+	return settings, justInitialized
+}
+
+// getSrachEnabledFromDbOrDefault возвращает значение SrachAnalysisEnabled из dbSettings или из config.
+func (b *Bot) getSrachEnabledFromDbOrDefault(dbSettings *storage.ChatSettings) bool {
+	// TODO: Когда SrachAnalysisEnabled будет в storage.ChatSettings, использовать его:
+	// if dbSettings != nil && dbSettings.SrachAnalysisEnabled != nil {
+	// 	 return *dbSettings.SrachAnalysisEnabled
+	// }
+	// Пока что всегда берем из config
+	return b.config.SrachAnalysisEnabled
 }
 
 // handleUpdate обрабатывает входящие обновления
 func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	startTime := time.Now()
 
-	// Проверяем инициализацию чата и отправляем приветствие/загружаем историю при необходимости
-	settings, initialized := b.ensureChatInitializedAndWelcome(update)
-	if settings == nil {
-		// Не удалось определить chatID или обработать обновление
-		return
-	}
-	if initialized {
-		// Если чат только что инициализирован, дальнейшая обработка этого обновления не нужна
-		return
-	}
-
-	// Проверяем, активен ли бот для этого чата (кроме команды /start)
-	b.settingsMutex.RLock()
-	isActive := settings.Active
-	b.settingsMutex.RUnlock()
-
-	isStartCommand := update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start"
-	isSettingsCallback := update.CallbackQuery != nil &&
-		(strings.HasPrefix(update.CallbackQuery.Data, "settings") ||
-			strings.HasPrefix(update.CallbackQuery.Data, "change_") ||
-			strings.HasPrefix(update.CallbackQuery.Data, "toggle_") ||
-			update.CallbackQuery.Data == "back_to_main")
-
-	if !isActive && !isStartCommand && !isSettingsCallback {
-		// Бот неактивен, и это не команда /start и не колбэк настроек - игнорируем
+	// Гарантируем, что для чата существуют настройки в памяти
+	_, justInitialized := b.ensureChatInitializedAndWelcome(update)
+	// Если чат только что инициализирован, вероятно, не нужно обрабатывать сообщение дальше
+	// (кроме CallbackQuery, которые могут прийти из старых сообщений)
+	if justInitialized && update.Message != nil && update.Message.NewChatMembers == nil {
+		chatID := update.Message.Chat.ID
+		if b.config.Debug {
+			log.Printf("[DEBUG][handleUpdate] Чат %d только что инициализирован, сообщение ID %d не обрабатывается (кроме приветствия).", chatID, update.Message.MessageID)
+		}
 		return
 	}
 
-	// Обработка разных типов обновлений
+	// Обработка CallbackQuery (нажатия кнопок)
+	if update.CallbackQuery != nil {
+		go b.handleCallback(update.CallbackQuery)
+		return // Выходим после обработки колбэка
+	}
+
+	// Обработка обычных сообщений
 	if update.Message != nil {
+		// Обработка команд
 		if update.Message.IsCommand() {
-			b.handleCommand(update.Message)
+			go b.handleCommand(update.Message)
 		} else {
-			b.handleMessage(update) // Передаем весь update в handleMessage
+			// Обработка обычных текстовых сообщений
+			go b.handleMessage(update) // handleMessage теперь принимает Update
 		}
-	} else if update.CallbackQuery != nil {
-		b.handleCallback(update.CallbackQuery)
+	} else if update.MyChatMember != nil {
+		// Обработка изменений статуса бота в чате (например, удаление)
+		go b.handleChatMemberUpdate(update.MyChatMember)
 	}
 
-	// Логируем время обработки, если включен Debug
-	if b.config.Debug {
-		duration := time.Since(startTime)
-		var updateType string
-		var updateID int
-		if update.Message != nil {
-			updateType = "Message"
-			updateID = update.Message.MessageID
-		} else if update.CallbackQuery != nil {
-			updateType = "Callback"
-			updateID = update.CallbackQuery.Message.MessageID // Используем ID исходного сообщения
-		} else {
-			updateType = "Unknown"
-			updateID = update.UpdateID
+	// Логирование времени обработки для не-CallbackQuery
+	if update.Message != nil {
+		processingTime := time.Since(startTime)
+		if b.config.Debug {
+			log.Printf("[DEBUG][Timing] Обработка Message (ID: %d) заняла %s", update.Message.MessageID, processingTime.Round(time.Millisecond))
 		}
-		log.Printf("[DEBUG][Timing] Обработка %s (ID: %d) заняла %s", updateType, updateID, formatDuration(duration))
+	}
+}
+
+// loadAllChatSettingsFromStorage загружает настройки для всех известных чатов из хранилища.
+func (b *Bot) loadAllChatSettingsFromStorage() {
+	chatIDs, err := b.storage.GetAllChatIDs()
+	if err != nil {
+		log.Printf("[ERROR][LoadAllSettings] Ошибка получения списка ChatID из хранилища: %v", err)
+		return
+	}
+
+	if len(chatIDs) == 0 {
+		log.Println("[LoadAllSettings] Не найдено чатов в хранилище для загрузки настроек.")
+		return
+	}
+
+	log.Printf("[LoadAllSettings] Загрузка настроек для %d чатов...", len(chatIDs))
+	loadedCount := 0
+	failedCount := 0
+
+	b.settingsMutex.Lock()
+	defer b.settingsMutex.Unlock()
+
+	for _, chatID := range chatIDs {
+		_, memoryExists := b.chatSettings[chatID]
+		if memoryExists {
+			if b.config.Debug {
+				log.Printf("[DEBUG][LoadAllSettings] Настройки для чата %d уже в памяти, пропускаем загрузку из хранилища.", chatID)
+			}
+			loadedCount++
+			continue
+		}
+
+		// Загружаем настройки из хранилища (не из памяти)
+		dbSettings, err := b.storage.GetChatSettings(chatID)
+		if err != nil {
+			log.Printf("[ERROR][LoadAllSettings] Ошибка загрузки настроек для чата %d из хранилища: %v", chatID, err)
+			failedCount++
+			continue
+		}
+
+		// Создаем ChatSettings в памяти на основе глобальных настроек и специфичных для чата из БД
+		r := b.randSource // Получаем источник случайных чисел
+		newSettings := &ChatSettings{
+			Active:               true, // Считаем активным по умолчанию при загрузке
+			MinMessages:          b.config.MinMessages,
+			MaxMessages:          b.config.MaxMessages,
+			DailyTakeTime:        b.config.DailyTakeTime,
+			SummaryIntervalHours: b.config.SummaryIntervalHours,
+			MessageCount:         r.Intn(b.config.MaxMessages-b.config.MinMessages+1) + b.config.MinMessages, // Случайное значение при инициализации
+			SrachState:           "none",
+			SrachAnalysisEnabled: b.getSrachEnabledFromDbOrDefault(dbSettings), // Получаем из БД или дефолт конфига
+			// ID сообщений (LastMenuMessageID и т.д.) инициализируются нулями
+		}
+
+		b.chatSettings[chatID] = newSettings
+		// Инициализируем map для лимитов этого чата
+		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
+		loadedCount++
+	}
+
+	log.Printf("[LoadAllSettings] Загрузка настроек завершена. Загружено: %d, Ошибок: %d", loadedCount, failedCount)
+}
+
+// handleChatMemberUpdate обрабатывает изменения статуса бота в чате
+func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
+	chatID := update.Chat.ID
+	myStatus := update.NewChatMember.Status
+	userName := update.From.UserName
+
+	if update.NewChatMember.User.ID == b.api.Self.ID {
+		log.Printf("Статус бота в чате %d изменен на '%s' пользователем @%s", chatID, myStatus, userName)
+		b.settingsMutex.Lock()
+		defer b.settingsMutex.Unlock()
+
+		if myStatus == "left" || myStatus == "kicked" {
+			// Бот удален или кикнут
+			log.Printf("Бот удален из чата %d. Удаляю настройки из памяти.", chatID)
+			delete(b.chatSettings, chatID)
+			delete(b.pendingSettings, chatID)
+			delete(b.directReplyTimestamps, chatID)
+			b.summaryMutex.Lock()
+			delete(b.lastSummaryRequest, chatID)
+			b.summaryMutex.Unlock()
+			// TODO: Опционально: Очистить историю в хранилище? Или оставить?
+			// err := b.storage.ClearChatHistory(chatID)
+			// if err != nil {
+			// 	 log.Printf("[WARN] Не удалось очистить историю для чата %d после удаления бота: %v", chatID, err)
+			// }
+		} else if myStatus == "member" {
+			// Бот добавлен или вернулся
+			log.Printf("Бот добавлен или вернулся в чат %d.", chatID)
+			// Настройки должны были быть созданы в ensureChatInitializedAndWelcome
+		}
+	} else {
+		// Изменение статуса другого пользователя (не бота)
+		if b.config.Debug {
+			log.Printf("[DEBUG] Статус пользователя %d (@%s) в чате %d изменен на '%s' пользователем @%s",
+				update.NewChatMember.User.ID, update.NewChatMember.User.UserName, chatID, myStatus, userName)
+		}
+		// TODO: Возможно, обновлять профиль пользователя (например, если он покинул чат)
 	}
 }

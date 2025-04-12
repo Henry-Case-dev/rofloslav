@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -190,4 +191,36 @@ func (fs *FileStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error
 	log.Printf("[LoadChatHistory OK] Чат %d: Успешно загружено %d сообщений из '%s'.", chatID, len(messages), fileName)
 
 	return messages, nil
+}
+
+// GetChatSettings возвращает пустые настройки, так как FileStorage их не хранит.
+func (fs *FileStorage) GetChatSettings(chatID int64) (*ChatSettings, error) {
+	log.Printf("[WARN][FileStorage] GetChatSettings вызван для chatID %d, но FileStorage не хранит настройки. Возвращены пустые.", chatID)
+	return &ChatSettings{ChatID: chatID}, nil // Возвращаем пустую структуру
+}
+
+// SetChatSettings ничего не делает, так как FileStorage не хранит настройки.
+func (fs *FileStorage) SetChatSettings(settings *ChatSettings) error {
+	log.Printf("[WARN][FileStorage] SetChatSettings вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", settings.ChatID)
+	return nil // Не ошибка, просто ничего не делаем
+}
+
+// --- Новые методы для обновления отдельных настроек лимитов (заглушки) ---
+
+// UpdateDirectLimitEnabled ничего не делает, так как FileStorage не хранит настройки чата.
+func (fs *FileStorage) UpdateDirectLimitEnabled(chatID int64, enabled bool) error {
+	log.Printf("[WARN][FileStorage] UpdateDirectLimitEnabled вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
+	return nil // FileStorage не хранит ChatSettings
+}
+
+// UpdateDirectLimitCount ничего не делает, так как FileStorage не хранит настройки чата.
+func (fs *FileStorage) UpdateDirectLimitCount(chatID int64, count int) error {
+	log.Printf("[WARN][FileStorage] UpdateDirectLimitCount вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
+	return nil // FileStorage не хранит ChatSettings
+}
+
+// UpdateDirectLimitDuration ничего не делает, так как FileStorage не хранит настройки чата.
+func (fs *FileStorage) UpdateDirectLimitDuration(chatID int64, duration time.Duration) error {
+	log.Printf("[WARN][FileStorage] UpdateDirectLimitDuration вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
+	return nil // FileStorage не хранит ChatSettings
 }

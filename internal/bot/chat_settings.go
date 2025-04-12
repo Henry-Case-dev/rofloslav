@@ -121,6 +121,35 @@ func getSettingsKeyboard(dbSettings *storage.ChatSettings, cfg *config.Config) t
 	}
 	rows = append(rows, voiceRow)
 
+	// --- Новые кнопки для лимита прямых обращений ---
+	limitEnabled := cfg.DirectReplyLimitEnabledDefault
+	if dbSettings.DirectReplyLimitEnabled != nil {
+		limitEnabled = *dbSettings.DirectReplyLimitEnabled
+	}
+	limitCount := cfg.DirectReplyLimitCountDefault
+	if dbSettings.DirectReplyLimitCount != nil {
+		limitCount = *dbSettings.DirectReplyLimitCount
+	}
+	limitDurationMinutes := int(cfg.DirectReplyLimitDurationDefault.Minutes())
+	if dbSettings.DirectReplyLimitDuration != nil {
+		limitDurationMinutes = *dbSettings.DirectReplyLimitDuration
+	}
+
+	limitToggleText, limitToggleCallback := formatEnabled("Лимит прямых обращений", "Лимит прямых обращений", limitEnabled, "toggle_direct_limit", "toggle_direct_limit")
+	limitToggleRow := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData(limitToggleText, limitToggleCallback),
+	)
+	rows = append(rows, limitToggleRow)
+
+	// Кнопки для изменения значений лимита (показываем только если лимит включен)
+	if limitEnabled {
+		limitValueText := fmt.Sprintf("%d за %d мин", limitCount, limitDurationMinutes)
+		limitValueRow := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("Значение: %s", limitValueText), "change_direct_limit_values"), // Общий коллбэк
+		)
+		rows = append(rows, limitValueRow)
+	}
+
 	// 6. Добавляем кнопку "Назад"
 	backRow := []tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "back_to_main"),

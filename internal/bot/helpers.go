@@ -396,7 +396,8 @@ func (b *Bot) findUserProfileByUsername(chatID int64, username string) (*storage
 
 // formatHistoryWithProfiles форматирует историю сообщений и профили пользователей в единый текст
 // ОПТИМИЗИРОВАННАЯ ВЕРСИЯ: Загружает профили один раз.
-func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store storage.ChatHistoryStorage, debug bool) string {
+// Добавлен параметр timeZone для корректного форматирования времени.
+func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store storage.ChatHistoryStorage, debug bool, timeZone string) string {
 	var contextBuilder strings.Builder
 
 	// 1. Получаем ВСЕ профили для чата ОДНИМ запросом
@@ -415,80 +416,95 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 			}
 		}
 		if debug && len(profilesMap) > 0 {
-			log.Printf("[DEBUG][FormatHistory] Чат %d: Создана карта профилей (%d записей).", chatID, len(profilesMap))
+			log.Printf("[DEBUG][FormatHistory] Чат %d: Загружено %d профилей в карту.", chatID, len(profilesMap))
 		}
 	}
 
-	// 3. Добавляем информацию о профилях в начало контекста (если они есть)
+	// 3. Загружаем локацию часового пояса
+	loc, err := time.LoadLocation(timeZone)
+	if err != nil {
+		log.Printf("[WARN][FormatHistory] Чат %d: Не удалось загрузить таймзону '%s', используем UTC: %v", chatID, timeZone, err)
+		loc = time.UTC // Используем UTC как fallback
+	}
+
+	// 4. Форматируем профили, если они есть
 	if len(profilesMap) > 0 {
-		contextBuilder.WriteString("=== Информация об участниках чата ===\n")
+		contextBuilder.WriteString("==== Профили Участников ====\n")
 		profileCount := 0
-		for _, p := range profilesMap { // Итерируемся по карте
-			profileInfo := fmt.Sprintf("- @%s:", p.Username)
-			details := []string{}
-			if p.Alias != "" {
-				details = append(details, fmt.Sprintf("Прозвище: %s", p.Alias))
-			}
-			if p.Gender != "" && p.Gender != "unknown" {
-				details = append(details, fmt.Sprintf("Пол: %s", p.Gender))
-			}
-			if p.RealName != "" {
-				details = append(details, fmt.Sprintf("Наст.имя: %s", p.RealName))
-			}
-			if p.Bio != "" {
-				details = append(details, fmt.Sprintf("Био: %s", p.Bio))
-			}
-			if len(details) > 0 {
-				profileInfo += " " + strings.Join(details, "; ")
-				contextBuilder.WriteString(profileInfo + "\n")
+		for userID, profile := range profilesMap {
+			if profile != nil {
+				// Формируем строку профиля
+				profileLine := fmt.Sprintf("User ID: %d", userID)
+				if profile.Username != "" {
+					profileLine += fmt.Sprintf(" (@%s)", profile.Username)
+				}
+				if profile.Alias != "" {
+					profileLine += fmt.Sprintf(", Alias: %s", profile.Alias)
+				}
+				if profile.Gender != "" {
+					profileLine += fmt.Sprintf(", Пол: %s", profile.Gender)
+				}
+				if profile.RealName != "" {
+					profileLine += fmt.Sprintf(", Наст. имя: %s", profile.RealName)
+				}
+				if profile.Bio != "" {
+					profileLine += fmt.Sprintf(", Био: %s", profile.Bio)
+				}
+				if !profile.LastSeen.IsZero() {
+					// Форматируем время последнего сообщения с учетом таймзоны
+					profileLine += fmt.Sprintf(", Последнее сообщение: %s", profile.LastSeen.In(loc).Format("2006-01-02 15:04 MST"))
+				}
+				contextBuilder.WriteString(profileLine + "\n")
 				profileCount++
 			}
 		}
-		if profileCount == 0 { // Если все профили оказались без деталей
-			contextBuilder.Reset() // Убираем заголовок
-			if debug {
-				log.Printf("[DEBUG][FormatHistory] Чат %d: Профили загружены, но без деталей для включения в контекст.", chatID)
-			}
-		} else {
-			contextBuilder.WriteString("=================================\n\n")
-			if debug {
-				log.Printf("[DEBUG][FormatHistory] Чат %d: Добавлено %d профилей в контекст.", chatID, profileCount)
-			}
+		contextBuilder.WriteString("=============================\n")
+		if debug {
+			log.Printf("[DEBUG][FormatHistory] Чат %d: Добавлено %d профилей в контекст.", chatID, profileCount)
 		}
-	} else if debug {
-		log.Printf("[DEBUG][FormatHistory] Чат %d: Профили пользователей не найдены или карта пуста.", chatID)
 	}
 
-	// 4. Добавляем историю сообщений, используя карту профилей
-	contextBuilder.WriteString("=== История сообщений ===\n")
+	// 5. Форматируем историю сообщений
+	contextBuilder.WriteString("==== История Сообщений ====\n")
 	processedMessages := 0
 	for _, msg := range messages {
 		if msg == nil || (msg.Text == "" && msg.Caption == "") {
-			continue
+			continue // Пропускаем nil или полностью пустые сообщения
+		}
+
+		userID := int64(0)
+		if msg.From != nil {
+			userID = msg.From.ID
 		}
 
 		var authorInfo string
-		if msg.From != nil {
-			username := msg.From.UserName
-			userID := msg.From.ID
-			// Ищем профиль в КАРТЕ
-			profile, exists := profilesMap[userID]
-			if exists && profile.Alias != "" {
-				authorInfo = fmt.Sprintf("[%s (%s, @%s)]", msg.Time().Format("15:04"), profile.Alias, username)
-			} else if username != "" {
-				authorInfo = fmt.Sprintf("[%s (@%s)]", msg.Time().Format("15:04"), username)
-			} else {
-				name := msg.From.FirstName
-				if name == "" {
-					name = fmt.Sprintf("User_%d", userID)
-				}
-				authorInfo = fmt.Sprintf("[%s (%s)]", msg.Time().Format("15:04"), name)
+		if profile, found := profilesMap[userID]; found && profile != nil {
+			name := profile.Alias
+			if name == "" {
+				name = profile.Username
 			}
+			if name == "" && profile.RealName != "" {
+				name = profile.RealName
+			}
+			if name == "" {
+				name = fmt.Sprintf("User_%d", userID)
+			}
+			// Форматируем время с учетом таймзоны
+			authorInfo = fmt.Sprintf("> %s (%s)", msg.Time().In(loc).Format("15:04"), name)
+		} else if msg.From != nil {
+			// Профиль не найден, используем данные из сообщения
+			name := msg.From.FirstName
+			if name == "" {
+				name = fmt.Sprintf("User_%d", userID)
+			}
+			// Форматируем время с учетом таймзоны
+			authorInfo = fmt.Sprintf("> %s (%s)", msg.Time().In(loc).Format("15:04"), name)
 		} else {
-			authorInfo = fmt.Sprintf("[%s (Unknown User)]", msg.Time().Format("15:04"))
+			// Форматируем время с учетом таймзоны
+			authorInfo = fmt.Sprintf("> %s (Unknown User)", msg.Time().In(loc).Format("15:04"))
 		}
 
-		// Добавляем текст или подпись
+		// (Остальная логика обработки текста и медиа остается прежней)
 		messageText := msg.Text
 		if messageText == "" && msg.Caption != "" {
 			messageText = fmt.Sprintf("[Медиа с подписью: %s]", msg.Caption)
@@ -504,11 +520,11 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 		processedMessages++
 	}
 
-	if processedMessages == 0 && contextBuilder.Len() < 50 {
+	if processedMessages == 0 && contextBuilder.Len() < 50 { // Учитываем заголовки
 		if debug {
 			log.Printf("[DEBUG][FormatHistory] Чат %d: История сообщений пуста или содержит только пустые сообщения.", chatID)
 		}
-		return ""
+		return "" // Возвращаем пустую строку, если нет ни профилей, ни сообщений
 	}
 
 	contextBuilder.WriteString("=========================\n")
@@ -517,4 +533,33 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 	}
 
 	return contextBuilder.String()
+}
+
+// escapeMarkdownV2 экранирует специальные символы для режима MarkdownV2 Telegram
+func escapeMarkdownV2(text string) string {
+	// Список символов для экранирования согласно документации Telegram:
+	// _ * [ ] ( ) ~ ` > # + - = | { } . !
+	// Важно: символ \ тоже нужно экранировать, но replacer сделает это автоматически, если он есть в old.
+	replacer := strings.NewReplacer(
+		"\\", "\\\\", // Экранируем сам обратный слеш первым!
+		"_", "\\_",
+		"*", "\\*",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"~", "\\~",
+		"`", "\\`",
+		">", "\\>",
+		"#", "\\#",
+		"+", "\\+",
+		"-", "\\-",
+		"=", "\\=",
+		"|", "\\|",
+		"{", "\\{",
+		"}", "\\}",
+		".", "\\.",
+		"!", "\\!",
+	)
+	return replacer.Replace(text)
 }

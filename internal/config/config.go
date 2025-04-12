@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -31,9 +32,13 @@ const (
 type Config struct {
 	TelegramToken string
 	// Общие настройки LLM
-	LLMProvider     LLMProvider
-	DefaultPrompt   string
-	DirectPrompt    string
+	LLMProvider   LLMProvider
+	DefaultPrompt string
+	DirectPrompt  string
+	// --- Новые промпты для классификации и серьезного ответа ---
+	ClassifyDirectMessagePrompt string
+	SeriousDirectPrompt         string
+	// --- Конец новых промптов ---
 	DailyTakePrompt string
 	SummaryPrompt   string
 	// --- Новые поля для настроек по умолчанию ---
@@ -93,6 +98,13 @@ type Config struct {
 	VoiceFormatPrompt string
 	// Включена ли авто-транскрипция голоса по умолчанию
 	VoiceTranscriptionEnabledDefault bool
+	// --- Настройки лимита прямых обращений (дефолтные) ---
+	DirectReplyLimitEnabledDefault  bool
+	DirectReplyLimitCountDefault    int
+	DirectReplyLimitDurationDefault time.Duration // Храним сразу как Duration
+	DirectReplyLimitPrompt          string
+	PromptEnterDirectLimitCount     string
+	PromptEnterDirectLimitDuration  string
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -139,6 +151,8 @@ func Load() (*Config, error) {
 	deepSeekBaseURL := getEnvOrDefault("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1") // Стандартный URL API v1
 
 	// --- Загрузка промптов для настроек и срачей ---
+	classifyDirectMessagePrompt := getEnvOrDefault("CLASSIFY_DIRECT_MESSAGE_PROMPT", "Классифицируй это сообщение: serious или casual?")
+	seriousDirectPrompt := getEnvOrDefault("SERIOUS_DIRECT_PROMPT", "Ответь серьезно.")
 	promptEnterMin := getEnvOrDefault("PROMPT_ENTER_MIN_MESSAGES", "Введите минимальный интервал:")
 	promptEnterMax := getEnvOrDefault("PROMPT_ENTER_MAX_MESSAGES", "Введите максимальный интервал:")
 	promptEnterDailyTime := getEnvOrDefault("PROMPT_ENTER_DAILY_TIME", "Введите час для темы дня (0-23):")
@@ -170,6 +184,12 @@ func Load() (*Config, error) {
 	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав, ваш новый повелитель сарказма. Погнали нахуй.")
 	voiceFormatPrompt := getEnvOrDefault("VOICE_FORMAT_PROMPT", "Format the following recognized text with punctuation and paragraphs:\n")
 	voiceTranscriptionEnabledDefaultStr := getEnvOrDefault("VOICE_TRANSCRIPTION_ENABLED_DEFAULT", "true")
+	directLimitEnabledStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_ENABLED_DEFAULT", "true")
+	directLimitCountStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_COUNT_DEFAULT", "2")
+	directLimitDurationStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT", "10")
+	directLimitPrompt := getEnvOrDefault("DIRECT_REPLY_LIMIT_PROMPT", "Хватит меня дергать.")
+	promptEnterDirectCount := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_COUNT", "Введи лимит обращений:")
+	promptEnterDirectDuration := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_DURATION", "Введи период лимита (мин):")
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
@@ -216,6 +236,15 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] WELCOME_PROMPT: %s...", truncateString(welcomePrompt, 50))
 	log.Printf("[Config Load] VOICE_FORMAT_PROMPT: %s...", truncateString(voiceFormatPrompt, 50))
 	log.Printf("[Config Load] VOICE_TRANSCRIPTION_ENABLED_DEFAULT: %s", voiceTranscriptionEnabledDefaultStr)
+	log.Printf("[Config Load] CLASSIFY_DIRECT_MESSAGE_PROMPT: %s...", truncateString(classifyDirectMessagePrompt, 50))
+	log.Printf("[Config Load] SERIOUS_DIRECT_PROMPT: %s...", truncateString(seriousDirectPrompt, 50))
+	log.Printf("[Config Load] --- Direct Reply Limit Settings ---")
+	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_ENABLED_DEFAULT: %s", directLimitEnabledStr)
+	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_COUNT_DEFAULT: %s", directLimitCountStr)
+	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT: %s", directLimitDurationStr)
+	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_PROMPT: %s...", truncateString(directLimitPrompt, 50))
+	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_COUNT: %s...", truncateString(promptEnterDirectCount, 50))
+	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_DURATION: %s...", truncateString(promptEnterDirectDuration, 50))
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -295,6 +324,20 @@ func Load() (*Config, error) {
 
 	debug := debugStr == "true" || debugStr == "1" || debugStr == "yes"
 
+	// --- Парсинг числовых значений для лимита прямых обращений ---
+	directLimitCount, err := strconv.Atoi(directLimitCountStr)
+	if err != nil || directLimitCount <= 0 {
+		log.Printf("Ошибка парсинга DIRECT_REPLY_LIMIT_COUNT_DEFAULT ('%s') или значение <= 0: %v, используем 2", directLimitCountStr, err)
+		directLimitCount = 2
+	}
+	directLimitDurationStr = getEnvOrDefault("DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT", "10")
+	directLimitDurationMinutes, err := strconv.Atoi(directLimitDurationStr)
+	if err != nil || directLimitDurationMinutes <= 0 {
+		log.Printf("Ошибка парсинга DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT ('%s') или значение <= 0: %v, используем 10", directLimitDurationStr, err)
+		directLimitDurationMinutes = 10
+	}
+	directLimitDuration := time.Duration(directLimitDurationMinutes) * time.Minute
+
 	cfg := Config{
 		TelegramToken: telegramToken,
 		LLMProvider:   llmProvider,
@@ -304,32 +347,34 @@ func Load() (*Config, error) {
 		DefaultModel:             defaultModel,
 		DefaultSafetyThreshold:   defaultSafety,
 		// --- Конец новых полей ---
-		GeminiAPIKey:               geminiAPIKey,
-		GeminiModelName:            geminiModelName,
-		DeepSeekAPIKey:             deepSeekAPIKey,
-		DeepSeekModelName:          deepSeekModelName,
-		DeepSeekBaseURL:            deepSeekBaseURL,
-		DefaultPrompt:              defaultPrompt,
-		DirectPrompt:               directPrompt,
-		DailyTakePrompt:            dailyTakePrompt,
-		SummaryPrompt:              summaryPrompt,
-		RateLimitStaticText:        getEnvOrDefault("RATE_LIMIT_STATIC_TEXT", "Слишком часто! Попробуйте позже."),
-		RateLimitPrompt:            getEnvOrDefault("RATE_LIMIT_PROMPT", "Скажи пользователю, что он слишком часто нажимает кнопку."),
-		PromptEnterMinMessages:     promptEnterMin,
-		PromptEnterMaxMessages:     promptEnterMax,
-		PromptEnterDailyTime:       promptEnterDailyTime,
-		PromptEnterSummaryInterval: promptEnterSummaryInterval,
-		SRACH_WARNING_PROMPT:       srachWarningPrompt,
-		SRACH_ANALYSIS_PROMPT:      srachAnalysisPrompt,
-		SRACH_CONFIRM_PROMPT:       srachConfirmPrompt,
-		SrachKeywords:              srachKeywordsList,
-		DailyTakeTime:              dailyTakeTime,
-		TimeZone:                   timeZone,
-		SummaryIntervalHours:       summaryIntervalHours,
-		MinMessages:                minMsg,
-		MaxMessages:                maxMsg,
-		ContextWindow:              contextWindow,
-		Debug:                      debug,
+		GeminiAPIKey:                geminiAPIKey,
+		GeminiModelName:             geminiModelName,
+		DeepSeekAPIKey:              deepSeekAPIKey,
+		DeepSeekModelName:           deepSeekModelName,
+		DeepSeekBaseURL:             deepSeekBaseURL,
+		DefaultPrompt:               defaultPrompt,
+		DirectPrompt:                directPrompt,
+		ClassifyDirectMessagePrompt: classifyDirectMessagePrompt,
+		SeriousDirectPrompt:         seriousDirectPrompt,
+		DailyTakePrompt:             dailyTakePrompt,
+		SummaryPrompt:               summaryPrompt,
+		RateLimitStaticText:         getEnvOrDefault("RATE_LIMIT_STATIC_TEXT", "Слишком часто! Попробуйте позже."),
+		RateLimitPrompt:             getEnvOrDefault("RATE_LIMIT_PROMPT", "Скажи пользователю, что он слишком часто нажимает кнопку."),
+		PromptEnterMinMessages:      promptEnterMin,
+		PromptEnterMaxMessages:      promptEnterMax,
+		PromptEnterDailyTime:        promptEnterDailyTime,
+		PromptEnterSummaryInterval:  promptEnterSummaryInterval,
+		SRACH_WARNING_PROMPT:        srachWarningPrompt,
+		SRACH_ANALYSIS_PROMPT:       srachAnalysisPrompt,
+		SRACH_CONFIRM_PROMPT:        srachConfirmPrompt,
+		SrachKeywords:               srachKeywordsList,
+		DailyTakeTime:               dailyTakeTime,
+		TimeZone:                    timeZone,
+		SummaryIntervalHours:        summaryIntervalHours,
+		MinMessages:                 minMsg,
+		MaxMessages:                 maxMsg,
+		ContextWindow:               contextWindow,
+		Debug:                       debug,
 		// Заполняем новые поля для БД с префиксом Postgresql
 		PostgresqlHost:     dbHost,
 		PostgresqlPort:     dbPort,
@@ -346,6 +391,13 @@ func Load() (*Config, error) {
 		WelcomePrompt:                    welcomePrompt,
 		VoiceFormatPrompt:                voiceFormatPrompt,
 		VoiceTranscriptionEnabledDefault: voiceTranscriptionEnabledDefaultStr == "true" || voiceTranscriptionEnabledDefaultStr == "1" || voiceTranscriptionEnabledDefaultStr == "yes",
+		// --- Настройки лимита прямых обращений (дефолтные) ---
+		DirectReplyLimitEnabledDefault:  directLimitEnabledStr == "true" || directLimitEnabledStr == "1" || directLimitEnabledStr == "yes",
+		DirectReplyLimitCountDefault:    directLimitCount,
+		DirectReplyLimitDurationDefault: directLimitDuration,
+		DirectReplyLimitPrompt:          directLimitPrompt,
+		PromptEnterDirectLimitCount:     promptEnterDirectCount,
+		PromptEnterDirectLimitDuration:  promptEnterDirectDuration,
 	}
 
 	// Валидация и установка StorageType
@@ -458,6 +510,8 @@ func logLoadedConfig(cfg *Config) {
 	log.Printf("LLM Provider: %s", cfg.LLMProvider)
 	log.Printf("  Default Prompt: %s...", truncateStringEnd(cfg.DefaultPrompt, 80))
 	log.Printf("  Direct Prompt: %s...", truncateStringEnd(cfg.DirectPrompt, 80))
+	log.Printf("  Classify Direct Prompt: %s...", truncateStringEnd(cfg.ClassifyDirectMessagePrompt, 80))
+	log.Printf("  Serious Direct Prompt: %s...", truncateStringEnd(cfg.SeriousDirectPrompt, 80))
 	log.Printf("  Daily Take Prompt: %s...", truncateStringEnd(cfg.DailyTakePrompt, 80))
 	log.Printf("  Summary Prompt: %s...", truncateStringEnd(cfg.SummaryPrompt, 80))
 	// --- Логирование новых дефолтных настроек ---
@@ -498,6 +552,13 @@ func logLoadedConfig(cfg *Config) {
 	log.Printf("Storage Type: %s", cfg.StorageType)
 	log.Printf(" - Voice Format Prompt: %s", truncateStringEnd(cfg.VoiceFormatPrompt, 100))
 	log.Printf(" - Voice Transcription Default: %t", cfg.VoiceTranscriptionEnabledDefault)
+	log.Printf("  --- Direct Reply Limit Defaults ---")
+	log.Printf("  Direct Limit Enabled Default: %t", cfg.DirectReplyLimitEnabledDefault)
+	log.Printf("  Direct Limit Count Default: %d", cfg.DirectReplyLimitCountDefault)
+	log.Printf("  Direct Limit Duration Default: %v", cfg.DirectReplyLimitDurationDefault)
+	log.Printf("  Direct Limit Prompt: %s...", truncateStringEnd(cfg.DirectReplyLimitPrompt, 80))
+	log.Printf("  Prompt Enter Direct Limit Count: %s...", truncateStringEnd(cfg.PromptEnterDirectLimitCount, 80))
+	log.Printf("  Prompt Enter Direct Limit Duration: %s...", truncateStringEnd(cfg.PromptEnterDirectLimitDuration, 80))
 
 	switch cfg.StorageType {
 	case StorageTypePostgres:
@@ -591,6 +652,13 @@ func ValidateConfig(cfg *Config) error {
 		if cfg.DeepSeekAPIKey == "" {
 			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
 		}
+		// Валидация новых промптов
+		if cfg.ClassifyDirectMessagePrompt == "" {
+			return fmt.Errorf("ошибка конфигурации: CLASSIFY_DIRECT_MESSAGE_PROMPT не должен быть пустым")
+		}
+		if cfg.SeriousDirectPrompt == "" {
+			return fmt.Errorf("ошибка конфигурации: SERIOUS_DIRECT_PROMPT не должен быть пустым")
+		}
 	default:
 		return fmt.Errorf("ошибка конфигурации: неизвестный LLM_PROVIDER '%s'", cfg.LLMProvider)
 	}
@@ -636,8 +704,6 @@ func ValidateConfig(cfg *Config) error {
 		if cfg.MongoDbSettingsCollection == "" {
 			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_SETTINGS_COLLECTION не установлен")
 		}
-	default:
-		return fmt.Errorf("ошибка конфигурации: неизвестный STORAGE_TYPE '%s'", cfg.StorageType)
 	}
 
 	// Валидация Администраторов
@@ -648,6 +714,19 @@ func ValidateConfig(cfg *Config) error {
 	// Валидация температуры
 	if cfg.DefaultTemperature < 0.0 || cfg.DefaultTemperature > 2.0 {
 		return fmt.Errorf("ошибка конфигурации: DEFAULT_TEMPERATURE (%.2f) должен быть в диапазоне [0.0, 2.0]", cfg.DefaultTemperature)
+	}
+
+	if cfg.SeriousDirectPrompt == "" {
+		return fmt.Errorf("ошибка конфигурации: SERIOUS_DIRECT_PROMPT не должен быть пустым")
+	}
+	if cfg.DirectReplyLimitPrompt == "" {
+		return fmt.Errorf("ошибка конфигурации: DIRECT_REPLY_LIMIT_PROMPT не должен быть пустым")
+	}
+	if cfg.PromptEnterDirectLimitCount == "" {
+		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_COUNT не должен быть пустым")
+	}
+	if cfg.PromptEnterDirectLimitDuration == "" {
+		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_DURATION не должен быть пустым")
 	}
 
 	return nil

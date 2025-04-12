@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config"
@@ -60,29 +61,17 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		return                                    // Выходим, дальнейшая обработка не нужна
 
 	case "summary": // Обработка кнопки саммари из основного меню
-		b.answerCallback(callback.ID, "Запрашиваю саммари...")
-		// Корректно имитируем сообщение с командой
-		// Создаем базовое сообщение, похожее на то, что пришло бы от пользователя
-		fakeMessage := &tgbotapi.Message{
-			MessageID: callback.Message.MessageID, // Можно использовать ID кнопки для контекста, но не обязательно
-			From:      callback.From,              // Кто нажал кнопку
-			Chat:      callback.Message.Chat,      // В каком чате
-			Date:      int(time.Now().Unix()),     // Текущее время
-			Text:      "/summary",                 // Текст команды
-			Entities: []tgbotapi.MessageEntity{ // Указываем, что это команда
-				{Type: "bot_command", Offset: 0, Length: len("/summary")},
-			},
-		}
-		b.handleCommand(fakeMessage) // Передаем имитированное сообщение
-		return                       // Выходим
+		b.handleSummaryCommand(chatID, callback.Message.MessageID)
+		b.answerCallback(callback.ID, "⏳ Запрос саммари отправлен...")
+		return
 
 	case "settings": // Обработка кнопки настроек из основного меню
 		// Удаляем сообщение с основным меню (его ID берем из callback)
 		lastMainMenuMsgID := callback.Message.MessageID
 		// Отправляем клавиатуру настроек, передавая ID старого главного меню
 		b.sendSettingsKeyboard(chatID, lastMainMenuMsgID) // ID нового меню сохранится внутри sendSettingsKeyboard
-		b.answerCallback(callback.ID, "")                 // Отвечаем на колбэк
-		return                                            // Выходим
+		b.answerCallback(callback.ID, "⚙️ Открываю настройки...")
+		return
 
 	case "stop": // Обработка кнопки паузы из основного меню
 		b.settingsMutex.Lock()
@@ -97,7 +86,7 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
 		b.answerCallback(callback.ID, "Бот остановлен")
 		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
-		return                             // Выходим
+		return
 
 	// Новые коллбэки для управления анализом срачей
 	case "toggle_srach_analysis": // Используем одно имя для переключения
@@ -185,6 +174,41 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		// Удаляем старое меню настроек перед запросом
 		b.deleteMessage(chatID, callback.Message.MessageID)
 
+	case "toggle_direct_limit":
+		log.Printf("[DEBUG][Callback] Chat %d: Получен коллбэк toggle_direct_limit", chatID)
+		dbSettings, err := b.storage.GetChatSettings(chatID)
+		if err != nil {
+			log.Printf("[ERROR][Callback] Chat %d: Ошибка получения настроек из DB для toggle_direct_limit: %v", chatID, err)
+			b.answerCallback(callback.ID, "Ошибка получения настроек")
+			return
+		}
+		currentState := b.config.DirectReplyLimitEnabledDefault
+		if dbSettings.DirectReplyLimitEnabled != nil {
+			currentState = *dbSettings.DirectReplyLimitEnabled
+		}
+		newState := !currentState
+		// dbSettings.DirectReplyLimitEnabled = &newState // Не меняем локальный объект
+		// Используем специализированный метод обновления
+		err = b.storage.UpdateDirectLimitEnabled(chatID, newState)
+		// err = b.storage.SetChatSettings(dbSettings) // УДАЛЕНО
+		if err != nil {
+			log.Printf("[ERROR][Callback] Chat %d: Ошибка сохранения настройки DirectLimitEnabled в DB: %v", chatID, err)
+			b.answerCallback(callback.ID, "Ошибка сохранения настройки")
+			return
+		}
+		statusText := getEnabledStatusText(newState)
+		b.answerCallback(callback.ID, fmt.Sprintf("Лимит прямых обращений: %s", statusText))
+		b.updateSettingsKeyboard(callback)
+		return
+
+	case "change_direct_limit_values":
+		log.Printf("[DEBUG][Callback] Chat %d: Получен коллбэк change_direct_limit_values", chatID)
+		settingToSet = "direct_limit_count" // Начинаем с запроса количества
+		promptText = b.config.PromptEnterDirectLimitCount
+		// Удаляем старое меню настроек перед запросом
+		b.deleteMessage(chatID, callback.Message.MessageID)
+		// Остальная логика обработки запроса ввода остается ниже
+
 	default:
 		log.Printf("Неизвестный callback data: %s от пользователя %d в чате %d", callback.Data, callback.From.ID, chatID)
 		b.answerCallback(callback.ID, "Неизвестное действие") // Сообщаем пользователю
@@ -245,4 +269,75 @@ func (b *Bot) getCurrentModelName() string {
 	default:
 		return "Неизвестная модель"
 	}
+}
+
+// handleSummaryCommand - логика для команды /summary (вынесена из command_handler)
+func (b *Bot) handleSummaryCommand(chatID int64, lastInfoMsgID int) {
+	now := time.Now()
+	b.summaryMutex.Lock() // Lock для lastSummaryRequest
+	lastReq, ok := b.lastSummaryRequest[chatID]
+	durationSinceLast := now.Sub(lastReq)
+	if ok && durationSinceLast < summaryRequestInterval {
+		remainingTime := summaryRequestInterval - durationSinceLast
+		log.Printf("[DEBUG] Чат %d: /summary отклонен из-за rate limit. Прошло: %v < %v. Осталось: %v", chatID, durationSinceLast, summaryRequestInterval, remainingTime)
+		b.summaryMutex.Unlock()
+
+		// Генерация динамической части сообщения...
+		dynamicPart := ""
+		if b.config.RateLimitPrompt != "" {
+			generatedText, err := b.llm.GenerateArbitraryResponse(b.config.RateLimitPrompt, "")
+			if err != nil {
+				log.Printf("[ERROR] Чат %d: Ошибка генерации динамической части сообщения о лимите: %v", chatID, err)
+			} else {
+				dynamicPart = strings.TrimSpace(generatedText)
+			}
+		}
+
+		// Формирование и отправка итогового сообщения...
+		fullMessage := fmt.Sprintf("%s %s\nПодожди еще: %s",
+			b.config.RateLimitStaticText,
+			dynamicPart,
+			formatRemainingTime(remainingTime),
+		)
+
+		if lastInfoMsgID != 0 {
+			b.deleteMessage(chatID, lastInfoMsgID)
+		}
+		msg := tgbotapi.NewMessage(chatID, fullMessage)
+		sentMsg, err := b.api.Send(msg)
+		if err == nil {
+			b.settingsMutex.Lock()
+			if set, ok := b.chatSettings[chatID]; ok {
+				set.LastInfoMessageID = sentMsg.MessageID
+			}
+			b.settingsMutex.Unlock()
+		}
+		return
+	}
+	// Update last request time
+	b.lastSummaryRequest[chatID] = now
+	b.summaryMutex.Unlock()
+
+	log.Printf("[DEBUG] Чат %d: /summary вызван. Последний запрос был: %v (ok=%t). Прошло: %v. Лимит: %v.",
+		chatID, lastReq, ok, durationSinceLast, summaryRequestInterval)
+
+	// Удаляем предыдущее инфо-сообщение...
+	if lastInfoMsgID != 0 {
+		b.deleteMessage(chatID, lastInfoMsgID)
+	}
+	// Отправляем сообщение о начале генерации и сохраняем его ID...
+	msg := tgbotapi.NewMessage(chatID, "Генерирую саммари, подождите...")
+	sentMsg, err := b.api.Send(msg)
+	if err == nil {
+		b.settingsMutex.Lock()
+		if set, ok := b.chatSettings[chatID]; ok {
+			set.LastInfoMessageID = sentMsg.MessageID
+		}
+		b.settingsMutex.Unlock()
+	} else {
+		log.Printf("[ERROR] Ошибка отправки сообщения 'Генерирую саммари...' в чат %d: %v", chatID, err)
+	}
+
+	// Запускаем генерацию в горутине
+	go b.createAndSendSummary(chatID)
 }

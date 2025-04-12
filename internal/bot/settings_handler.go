@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -26,32 +27,50 @@ func (b *Bot) sendSettingsKeyboard(chatID int64, lastSettingsMsgID int) {
 	}
 	b.settingsMutex.RUnlock() // Разблокируем после получения указателя на settings в памяти
 
-	// Загружаем настройки из БД для клавиатуры
+	// Загружаем настройки из БД для клавиатуры и текста
 	dbSettings, err := b.storage.GetChatSettings(chatID)
 	if err != nil {
 		log.Printf("[ERROR][sendSettingsKeyboard] Чат %d: Ошибка получения настроек из DB: %v", chatID, err)
-		// Продолжаем без dbSettings, клавиатура покажет дефолты
+		// Используем пустые dbSettings, чтобы избежать паники
+		dbSettings = &storage.ChatSettings{}
 	}
 
-	// Формируем текст сообщения (используем настройки из памяти, если они есть)
+	// Формируем текст сообщения
 	msgText := `⚙️ *Настройки чата:*`
-	if settings != nil {
-		msgText += fmt.Sprintf("\nИнтервал ответа: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages) // Предполагаем, что это берется из cfg, но settings хранит в памяти
+	if settings != nil { // Глобальные настройки из памяти/cfg
+		msgText += fmt.Sprintf("\nИнтервал ответа: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)
 		msgText += fmt.Sprintf("\nВремя 'темы дня': %02d:00", settings.DailyTakeTime)
 		msgText += fmt.Sprintf("\nИнтервал авто-саммари: %s", formatSummaryInterval(settings.SummaryIntervalHours))
 	} else {
-		msgText += "\n(Не удалось загрузить текущие настройки из памяти)"
+		msgText += "\n(Не удалось загрузить глобальные настройки из памяти)"
 	}
-	// Добавляем отображение настроек из dbSettings
-	// TODO: Добавить отображение SrachAnalysisEnabled из dbSettings, когда поле появится
-	voiceStatus := b.config.VoiceTranscriptionEnabledDefault // Используем b.config
-	if dbSettings != nil && dbSettings.VoiceTranscriptionEnabled != nil {
+
+	// Добавляем специфичные для чата настройки из dbSettings
+	voiceStatus := b.config.VoiceTranscriptionEnabledDefault
+	if dbSettings.VoiceTranscriptionEnabled != nil {
 		voiceStatus = *dbSettings.VoiceTranscriptionEnabled
 	}
 	msgText += fmt.Sprintf("\n🎤 Распознавание голоса: %s", getEnabledStatusText(voiceStatus))
 
-	// Получаем клавиатуру настроек, передавая dbSettings и cfg
-	keyboard := getSettingsKeyboard(dbSettings, b.config) // Передаем b.config
+	limitEnabled := b.config.DirectReplyLimitEnabledDefault
+	if dbSettings.DirectReplyLimitEnabled != nil {
+		limitEnabled = *dbSettings.DirectReplyLimitEnabled
+	}
+	limitCount := b.config.DirectReplyLimitCountDefault
+	if dbSettings.DirectReplyLimitCount != nil {
+		limitCount = *dbSettings.DirectReplyLimitCount
+	}
+	limitDurationMinutes := int(b.config.DirectReplyLimitDurationDefault.Minutes())
+	if dbSettings.DirectReplyLimitDuration != nil {
+		limitDurationMinutes = *dbSettings.DirectReplyLimitDuration
+	}
+	msgText += fmt.Sprintf("\n🚫 Лимит прямых обращений: %s (%d за %d мин)",
+		getEnabledStatusText(limitEnabled),
+		limitCount,
+		limitDurationMinutes)
+
+	// Получаем клавиатуру настроек
+	keyboard := getSettingsKeyboard(dbSettings, b.config)
 
 	// Отправляем новое сообщение с клавиатурой
 	msg := tgbotapi.NewMessage(chatID, msgText)
@@ -82,7 +101,7 @@ func (b *Bot) updateSettingsKeyboard(query *tgbotapi.CallbackQuery) {
 	chatID := query.Message.Chat.ID
 	messageID := query.Message.MessageID
 
-	// Получаем актуальные настройки
+	// Получаем актуальные настройки из памяти (для глобальных)
 	b.settingsMutex.RLock()
 	settings, exists := b.chatSettings[chatID]
 	if !exists {
@@ -91,43 +110,61 @@ func (b *Bot) updateSettingsKeyboard(query *tgbotapi.CallbackQuery) {
 		b.answerCallback(query.ID, "Ошибка: настройки чата не найдены.")
 		return
 	}
+	b.settingsMutex.RUnlock() // Разблокируем после чтения
 
-	// Важно: Мы под мьютексом RLock для settings (настройки в памяти)
-	// Нам нужны настройки из БД (dbSettings) для передачи в getSettingsKeyboard
+	// Нам нужны настройки из БД (dbSettings) для клавиатуры и текста
 	dbSettings, err := b.storage.GetChatSettings(chatID)
 	if err != nil {
 		log.Printf("[ERROR][updateSettingsKeyboard] Чат %d: Ошибка получения настроек из DB: %v", chatID, err)
-		// Продолжаем без dbSettings, клавиатура покажет дефолты
+		dbSettings = &storage.ChatSettings{}
 	}
 
-	// Формируем новый текст сообщения (используем settings из памяти, т.к. они могли только что обновиться)
+	// Формируем новый текст сообщения
 	msgText := `⚙️ *Настройки чата:*`
-	msgText += fmt.Sprintf("\nИнтервал ответа: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)
-	msgText += fmt.Sprintf("\nВремя 'темы дня': %02d:00", settings.DailyTakeTime)
-	msgText += fmt.Sprintf("\nИнтервал авто-саммари: %s", formatSummaryInterval(settings.SummaryIntervalHours))
-	// Добавляем отображение настроек из dbSettings
-	// TODO: Добавить отображение SrachAnalysisEnabled из dbSettings, когда поле появится
-	voiceStatus := b.config.VoiceTranscriptionEnabledDefault // Используем b.config
-	if dbSettings != nil && dbSettings.VoiceTranscriptionEnabled != nil {
-		voiceStatus = *dbSettings.VoiceTranscriptionEnabled // Получаем актуальное из БД
+	if settings != nil { // Глобальные настройки из памяти/cfg
+		msgText += fmt.Sprintf("\nИнтервал ответа: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)
+		msgText += fmt.Sprintf("\nВремя 'темы дня': %02d:00", settings.DailyTakeTime)
+		msgText += fmt.Sprintf("\nИнтервал авто-саммари: %s", formatSummaryInterval(settings.SummaryIntervalHours))
+	} else {
+		msgText += "\n(Не удалось загрузить глобальные настройки из памяти)"
+	}
+
+	// Добавляем специфичные для чата настройки из dbSettings
+	voiceStatus := b.config.VoiceTranscriptionEnabledDefault
+	if dbSettings.VoiceTranscriptionEnabled != nil {
+		voiceStatus = *dbSettings.VoiceTranscriptionEnabled
 	}
 	msgText += fmt.Sprintf("\n🎤 Распознавание голоса: %s", getEnabledStatusText(voiceStatus))
 
-	// Получаем обновленную клавиатуру, передавая dbSettings и cfg
-	keyboard := getSettingsKeyboard(dbSettings, b.config) // Передаем dbSettings и b.config
-	b.settingsMutex.RUnlock()                             // Теперь можно разблокировать
+	limitEnabled := b.config.DirectReplyLimitEnabledDefault
+	if dbSettings.DirectReplyLimitEnabled != nil {
+		limitEnabled = *dbSettings.DirectReplyLimitEnabled
+	}
+	limitCount := b.config.DirectReplyLimitCountDefault
+	if dbSettings.DirectReplyLimitCount != nil {
+		limitCount = *dbSettings.DirectReplyLimitCount
+	}
+	limitDurationMinutes := int(b.config.DirectReplyLimitDurationDefault.Minutes())
+	if dbSettings.DirectReplyLimitDuration != nil {
+		limitDurationMinutes = *dbSettings.DirectReplyLimitDuration
+	}
+	msgText += fmt.Sprintf("\n🚫 Лимит прямых обращений: %s (%d за %d мин)",
+		getEnabledStatusText(limitEnabled),
+		limitCount,
+		limitDurationMinutes)
+
+	// Получаем обновленную клавиатуру
+	keyboard := getSettingsKeyboard(dbSettings, b.config)
 
 	// Создаем конфиг для редактирования сообщения
 	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msgText)
 	editMsg.ReplyMarkup = &keyboard
 	editMsg.ParseMode = "Markdown"
 
-	_, err = b.api.Send(editMsg)
-	if err != nil {
-		log.Printf("Ошибка обновления клавиатуры настроек в чате %d: %v", chatID, err)
+	_, errSend := b.api.Send(editMsg)
+	if errSend != nil {
+		log.Printf("Ошибка обновления клавиатуры настроек в чате %d: %v", chatID, errSend)
 		b.answerCallback(query.ID, "Ошибка обновления настроек.")
-	} else {
-		b.answerCallback(query.ID, "Настройки обновлены.") // Отвечаем на колбэк
 	}
 }
 

@@ -105,21 +105,36 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		log.Printf("[DEBUG][VoiceHandler] Chat %d: Голосовое сообщение ID %d обработано. Текст: %s...", chatID, originalMessage.MessageID, truncateString(formattedText, 50))
 
 		// --- ОТПРАВКА РАСПОЗНАННОГО ТЕКСТА ---
-		// Отправляем распознанный текст как ответ на оригинальное голосовое сообщение
-		if formattedText != "" { // Убедимся, что текст не пустой
-			// Форматируем текст ответа
-			// Используем двойные подчеркивания для курсива в Telegram MarkdownV2
-			// Добавляем перенос строки после префикса и квадратные скобки вокруг текста
-			finalReplyText := fmt.Sprintf("🎤 Перевожу голосовуху:\n[__%s__]", formattedText)
-			replyMsg := tgbotapi.NewMessage(chatID, finalReplyText)
-			replyMsg.ReplyToMessageID = message.MessageID // Устанавливаем ReplyTo
-			// Указываем ParseMode как MarkdownV2 для поддержки двойных подчеркиваний
-			replyMsg.ParseMode = "MarkdownV2" // Используем MarkdownV2
-			_, replyErr := b.api.Send(replyMsg)
-			if replyErr != nil {
-				log.Printf("[ERROR][VoiceHandler] Чат %d: Ошибка отправки транскрибированного текста: %v", chatID, replyErr)
+		// Проверяем, включена ли отправка транскрипции в настройках чата
+		dbSettings, errSettings := b.storage.GetChatSettings(chatID)
+		sendTranscription := b.config.VoiceTranscriptionEnabledDefault // Значение по умолчанию
+		if errSettings == nil && dbSettings != nil && dbSettings.VoiceTranscriptionEnabled != nil {
+			sendTranscription = *dbSettings.VoiceTranscriptionEnabled // Используем значение из БД, если оно есть
+		} else if errSettings != nil {
+			log.Printf("[WARN][VoiceHandler] Chat %d: Ошибка получения настроек чата для проверки VoiceTranscriptionEnabled: %v. Используется дефолтное значение (%t).", chatID, errSettings, sendTranscription)
+		}
+
+		if sendTranscription {
+			if formattedText != "" { // Убедимся, что текст не пустой
+				// Форматируем текст ответа
+				// Экранируем сам текст перед вставкой в MarkdownV2
+				escapedFormattedText := escapeMarkdownV2(formattedText)
+				// Используем одинарные подчеркивания для курсива в MarkdownV2
+				finalReplyText := fmt.Sprintf("🎤 Перевожу голосовуху:\n_%s_", escapedFormattedText)
+				replyMsg := tgbotapi.NewMessage(chatID, finalReplyText)
+				replyMsg.ReplyToMessageID = message.MessageID // Устанавливаем ReplyTo
+				replyMsg.ParseMode = "MarkdownV2"             // Используем MarkdownV2
+				_, replyErr := b.api.Send(replyMsg)
+				if replyErr != nil {
+					log.Printf("[ERROR][VoiceHandler] Чат %d: Ошибка отправки транскрибированного текста: %v", chatID, replyErr)
+				}
 			}
-		} // --- КОНЕЦ ОТПРАВКИ ---
+		} else {
+			if b.config.Debug {
+				log.Printf("[DEBUG][VoiceHandler] Chat %d: Отправка транскрипции отключена в настройках.", chatID)
+			}
+		}
+		// --- КОНЕЦ ОТПРАВКИ ---
 
 	} else {
 		// Если это не голосовое, используем оригинальное сообщение
@@ -307,116 +322,60 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 				return
 			}
 
-			// Обработка конкретных ожидаемых настроек
-			var confirmationMessage string
-			var settingUpdated bool = false
+			// Handle pending setting input
+			log.Printf("[DEBUG][MH Pending] Chat %d: Handling pending setting '%s' with input: %s", chatID, localPendingSetting, message.Text)
 
-			log.Printf("[DEBUG][MH Pending Check] Chat %d: Before switch. Value: '%s'", chatID, localPendingSetting) // ADDED LOG
+			// Attempt to convert the input text to a number
+			valueInt, err := strconv.Atoi(message.Text)
+			if err != nil {
+				log.Printf("[WARN][MH Pending] Chat %d: Invalid input for %s: '%s' - not a number. Error: %v", chatID, localPendingSetting, message.Text, err)
+				b.sendReply(chatID, "🚫 Введите числовое значение.")
+				// Don't clear pending state here, let the user try again or cancel
+				return
+			}
+
+			// Define context for storage operations
+			// ctx := context.Background() // Or context.TODO() or pass from higher level
+
 			switch localPendingSetting {
-			case "min_messages":
-				if val, err := strconv.Atoi(message.Text); err == nil && val > 0 {
-					b.settingsMutex.Lock()
-					if settings, exists := b.chatSettings[chatID]; exists {
-						// Проверяем, что min не больше текущего max
-						if val <= settings.MaxMessages {
-							settings.MinMessages = val
-							settings.PendingSetting = "max_messages" // Сразу запрашиваем max
-							confirmationMessage = fmt.Sprintf("✅ Минимальное количество сообщений установлено: %d.", val)
-							settingUpdated = true // Помечаем, что часть настройки (min) обновлена
-							// Запрашиваем ввод MaxMessages
-							promptText := b.config.PromptEnterMaxMessages
-							b.settingsMutex.Unlock() // Разблокируем перед отправкой
-
-							// Удаляем старое сообщение с запросом (LastInfoMessageID) и сообщение пользователя
-							b.deleteMessage(chatID, settings.LastInfoMessageID) // ID взят до Unlock
-							b.deleteMessage(chatID, message.MessageID)
-
-							// Отправляем новый запрос
-							promptMsg := tgbotapi.NewMessage(chatID, promptText+"\n\nИли отправьте /cancel для отмены.")
-							sentMsg, err := b.api.Send(promptMsg)
-							if err != nil {
-								log.Printf("[ERROR][MH] Ошибка отправки промпта для max_messages в чат %d: %v", chatID, err)
-								// Сбрасываем PendingSetting обратно на min_messages, т.к. не смогли запросить max
-								b.settingsMutex.Lock()
-								if set, ok := b.chatSettings[chatID]; ok {
-									set.PendingSetting = "min_messages"
-								}
-								b.settingsMutex.Unlock()
-							} else {
-								// Сохраняем новый ID промпта
-								b.settingsMutex.Lock()
-								if set, ok := b.chatSettings[chatID]; ok {
-									set.LastInfoMessageID = sentMsg.MessageID
-								}
-								b.settingsMutex.Unlock()
-							}
-							return // Выходим, ждем ввода max_messages
-
-						} else {
-							confirmationMessage = fmt.Sprintf("❌ Ошибка: Минимальное значение (%d) не может быть больше максимального (%d).", val, settings.MaxMessages)
-						}
+			case "direct_limit_count":
+				if valueInt >= 0 { // 0 means unlimited
+					err = b.storage.UpdateDirectLimitCount(chatID, valueInt)
+					if err != nil {
+						log.Printf("[ERROR][MH Pending] User %d: Failed to save direct_limit_count %d: %v", chatID, valueInt, err)
+						b.sendReply(chatID, "🚫 Произошла ошибка при сохранении настройки лимита сообщений.")
+					} else {
+						log.Printf("User %d: Лимит прямых сообщений установлен: %d", chatID, valueInt)
+						b.sendReply(chatID, fmt.Sprintf("✅ Лимит прямых сообщений установлен: %d", valueInt))
+						// Optionally, update and resend the settings keyboard if applicable
+						// go b.sendSettingsKeyboard(chatID, 0) // Example if settings keyboard needs update
 					}
-					b.settingsMutex.Unlock()
+					delete(b.pendingSettings, chatID) // Clear pending state after attempt (success or handled error)
 				} else {
-					confirmationMessage = "❌ Неверный формат. Введите положительное число."
+					b.sendReply(chatID, "🚫 Ошибка: Количество сообщений должно быть 0 или больше.")
 				}
 
-			case "max_messages":
-				if val, err := strconv.Atoi(message.Text); err == nil && val > 0 {
-					b.settingsMutex.Lock()
-					if settings, exists := b.chatSettings[chatID]; exists {
-						// Проверяем, что max не меньше текущего min
-						if val >= settings.MinMessages {
-							settings.MaxMessages = val
-							settings.PendingSetting = "" // Завершили ввод интервала
-							confirmationMessage = fmt.Sprintf("✅ Максимальное количество сообщений установлено: %d.", val)
-							settingUpdated = true
-						} else {
-							confirmationMessage = fmt.Sprintf("❌ Ошибка: Максимальное значение (%d) не может быть меньше минимального (%d).", val, settings.MinMessages)
-						}
+			case "direct_limit_duration":
+				if valueInt > 0 { // Duration must be positive
+					duration := time.Duration(valueInt) * time.Minute
+					err = b.storage.UpdateDirectLimitDuration(chatID, duration)
+					if err != nil {
+						log.Printf("[ERROR][MH Pending] User %d: Failed to save direct_limit_duration %d mins: %v", chatID, valueInt, err)
+						b.sendReply(chatID, "🚫 Произошла ошибка при сохранении настройки периода лимита.")
+					} else {
+						log.Printf("User %d: Период лимита прямых сообщений установлен: %d минут", chatID, valueInt)
+						b.sendReply(chatID, fmt.Sprintf("✅ Период лимита прямых сообщений установлен: %d минут", valueInt))
+						// Optionally, update and resend the settings keyboard if applicable
+						// go b.sendSettingsKeyboard(chatID, 0) // Example if settings keyboard needs update
 					}
-					b.settingsMutex.Unlock()
+					delete(b.pendingSettings, chatID) // Clear pending state after attempt
 				} else {
-					confirmationMessage = "❌ Неверный формат. Введите положительное число."
-				}
-
-			case "daily_time":
-				if val, err := strconv.Atoi(message.Text); err == nil && val >= 0 && val <= 23 {
-					b.settingsMutex.Lock()
-					if settings, exists := b.chatSettings[chatID]; exists {
-						settings.DailyTakeTime = val
-						settings.PendingSetting = ""
-						confirmationMessage = fmt.Sprintf("✅ Время ежедневной темы установлено: %02d:00.", val)
-						settingUpdated = true
-					}
-					b.settingsMutex.Unlock()
-				} else {
-					confirmationMessage = "❌ Неверный формат. Введите час от 0 до 23."
-				}
-
-			case "summary_interval":
-				if val, err := strconv.Atoi(message.Text); err == nil && val >= 0 {
-					b.settingsMutex.Lock()
-					if settings, exists := b.chatSettings[chatID]; exists {
-						settings.SummaryIntervalHours = val
-						settings.PendingSetting = ""
-						if val == 0 {
-							confirmationMessage = "✅ Автоматическое саммари отключено."
-						} else {
-							confirmationMessage = fmt.Sprintf("✅ Интервал автоматического саммари установлен: %d ч.", val)
-						}
-						settingUpdated = true
-					}
-					b.settingsMutex.Unlock()
-				} else {
-					confirmationMessage = "❌ Неверный формат. Введите не отрицательное число (0 для отключения)."
+					b.sendReply(chatID, "🚫 Ошибка: Период должен быть больше 0 минут.")
 				}
 
 			default:
-				// Эта ветка не должна вызываться, если localPendingSetting не пустой,
-				// но на всякий случай оставим лог.
-				log.Printf("[WARN][MH] Chat %d: Получено сообщение '%s' при ожидании НЕИЗВЕСТНОЙ/НЕОБРАБОТАННОЙ настройки '%s'.", chatID, message.Text, localPendingSetting) // Modified Log slightly
-				confirmationMessage = fmt.Sprintf("Получено '%s', но я ожидал значение для '%s'. Настройка не изменена. Используйте /settings для повтора.", message.Text, localPendingSetting)
+				log.Printf("[WARN][MH Pending] Chat %d: Received input '%s' for unknown or unhandled pending setting '%s'", chatID, message.Text, localPendingSetting)
+				delete(b.pendingSettings, chatID) // Clear unknown pending state
 			}
 
 			// --- Постобработка после switch ---
@@ -429,7 +388,7 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			if settings, exists := b.chatSettings[chatID]; exists {
 				// Сохраняем ID перед сбросом, чтобы удалить сообщение вне зависимости от успеха обновления
 				lastInfoMsgIDToDelete = settings.LastInfoMessageID
-				if settingUpdated || strings.HasPrefix(confirmationMessage, "❌") {
+				if strings.HasPrefix(localPendingSetting, "❌") {
 					// Сбрасываем PendingSetting только если ввод завершен (успешно или с ошибкой, кроме случая запроса max_messages)
 					if settings.PendingSetting != "max_messages" {
 						settings.PendingSetting = ""
@@ -444,7 +403,7 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			}
 
 			// Отправляем подтверждение или сообщение об ошибке
-			b.sendReplyAndDeleteAfter(chatID, confirmationMessage, 10*time.Second) // Удаляем через 10 секунд
+			b.sendReplyAndDeleteAfter(chatID, localPendingSetting, 10*time.Second) // Удаляем через 10 секунд
 
 			// Если настройка была успешно обновлена И ввод завершен (не ждем max_messages),
 			// возвращаемся к клавиатуре настроек.
@@ -455,7 +414,7 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			}
 			b.settingsMutex.RUnlock()
 
-			if settingUpdated && pendingSettingAfterUpdate == "" {
+			if strings.HasPrefix(localPendingSetting, "❌") && pendingSettingAfterUpdate == "" {
 				// Отправляем обновленную клавиатуру настроек (удаляя старое инфо-сообщение, если оно было)
 				b.sendSettingsKeyboard(chatID, 0) // 0, т.к. инфо-сообщение уже удалено
 			}
@@ -591,21 +550,34 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			if b.config.Debug {
 				log.Printf("[DEBUG][MH] Chat %d: Message not handled by Srach logic. Proceeding to direct/AI response.", chatID)
 			}
-			// Check if the message is a reply to the bot or mentions the bot
-			isReplyToBot := message.ReplyToMessage != nil && message.ReplyToMessage.From.UserName == b.api.Self.UserName
-			mentionsBot := strings.Contains(message.Text, "@"+b.api.Self.UserName)
-
+			// Проверяем, является ли сообщение прямым ответом боту или упоминанием
+			isReplyToBot := message.ReplyToMessage != nil && message.ReplyToMessage.From.ID == b.api.Self.ID
+			mentionsBot := false
+			if message.Entities != nil {
+				for _, entity := range message.Entities {
+					if entity.Type == "mention" {
+						mentionText := message.Text[entity.Offset : entity.Offset+entity.Length]
+						if mentionText == "@"+b.api.Self.UserName {
+							mentionsBot = true
+							break
+						}
+					}
+				}
+			}
 			if b.config.Debug {
 				log.Printf("[DEBUG][MH] Chat %d: Checking for reply to bot or mention.", chatID)
 				log.Printf("[DEBUG][MH] Chat %d: IsReplyToBot: %t, MentionsBot: %t.", chatID, isReplyToBot, mentionsBot)
 			}
 
 			if isReplyToBot || mentionsBot {
-				// Send direct response
-				if b.config.Debug {
-					log.Printf("[DEBUG][MH] Chat %d: Sending direct response.", chatID)
+				// --- Проверка лимита прямых обращений ---
+				if b.checkDirectReplyLimit(chatID, message.From.ID) {
+					// Лимит превышен, отправляем специальный ответ
+					b.sendDirectLimitExceededReply(chatID, message.MessageID)
+				} else {
+					// Лимит не превышен, обрабатываем как обычно
+					b.sendDirectResponse(chatID, message)
 				}
-				b.sendDirectResponse(chatID, message)
 			} else {
 				// Increment counter and check conditions for AI response
 				if b.config.Debug {
@@ -690,24 +662,57 @@ func (b *Bot) sendReplyAndDeleteAfter(chatID int64, text string, delay time.Dura
 func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 	log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Handling direct response to message ID %d", chatID, message.MessageID)
 
-	// Используем DIRECT_PROMPT
-	directPrompt := b.config.DirectPrompt
-
-	// Генерируем ответ, передавая пустую историю и текущее сообщение
-	responseText, err := b.llm.GenerateResponse(directPrompt, nil, message) // Передаем nil для history
-	if err != nil {
-		log.Printf("Ошибка генерации прямого ответа для чата %d: %v", chatID, err)
+	// 1. Получаем текст сообщения
+	messageText := message.Text
+	if messageText == "" && message.Caption != "" {
+		messageText = message.Caption
+	}
+	if messageText == "" {
+		log.Printf("[WARN][MH][DirectResponse] Chat %d: Сообщение (ID %d) не содержит текста для анализа.", chatID, message.MessageID)
+		// Отвечаем стандартным сарказмом на пустое сообщение
+		b.sendReply(chatID, "И?")
 		return
 	}
 
-	// Отправляем ответ (возможно, как реплай на исходное сообщение)
+	// 2. Классифицируем сообщение (serious или casual)
+	classifyPrompt := b.config.ClassifyDirectMessagePrompt
+	classification, err := b.llm.GenerateArbitraryResponse(classifyPrompt, messageText)
+	if err != nil {
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка классификации сообщения: %v. Используем casual ответ.", chatID, err)
+		classification = "casual" // По умолчанию отвечаем саркастично при ошибке
+	}
+	classification = strings.TrimSpace(strings.ToLower(classification))
+
+	log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Сообщение ID %d классифицировано как '%s'.", chatID, message.MessageID, classification)
+
+	// 3. Выбираем промпт и генерируем ответ
+	var finalPrompt string
+	var contextForResponse string
+
+	if classification == "serious" {
+		finalPrompt = b.config.SeriousDirectPrompt
+		contextForResponse = messageText // Для серьезного ответа передаем текст вопроса
+	} else {
+		finalPrompt = b.config.DirectPrompt
+		contextForResponse = messageText // Для обычного ответа тоже можно передать текст, если LLM его использует
+	}
+
+	// Используем GenerateArbitraryResponse, т.к. история не нужна для прямых ответов
+	responseText, err := b.llm.GenerateArbitraryResponse(finalPrompt, contextForResponse)
+	if err != nil {
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка генерации ответа (тип '%s'): %v", chatID, classification, err)
+		// Можно отправить стандартный ответ при ошибке генерации
+		responseText = "Чет я завис."
+	}
+
+	// 4. Отправляем ответ (возможно, как реплай на исходное сообщение)
 	msg := tgbotapi.NewMessage(chatID, responseText)
 	msg.ReplyToMessageID = message.MessageID // Отвечаем на сообщение пользователя
-	msg.ParseMode = "Markdown"
+	// msg.ParseMode = "Markdown" // Убираем ParseMode, если не планируется использовать Markdown в ответах
 
 	_, err = b.api.Send(msg)
 	if err != nil {
-		log.Printf("Ошибка отправки прямого ответа в чат %d: %v", chatID, err)
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка отправки ответа: %v", chatID, err)
 	}
 }
 
@@ -725,7 +730,7 @@ func (b *Bot) sendAIResponse(chatID int64) {
 	}
 
 	// --- Форматирование контекста с профилями ---
-	contextText := formatHistoryWithProfiles(chatID, history, b.storage, b.config.Debug)
+	contextText := formatHistoryWithProfiles(chatID, history, b.storage, b.config.Debug, b.config.TimeZone)
 	if contextText == "" {
 		log.Printf("[WARN][sendAIResponse] Чат %d: Не удалось сформировать контекст для AI (возможно, нет сообщений или профилей).", chatID)
 		// Можно отправить сообщение об ошибке или просто ничего не делать
@@ -811,4 +816,259 @@ func downloadFile(url string) ([]byte, error) {
 		return nil, fmt.Errorf("ошибка чтения тела ответа: %w", err)
 	}
 	return body, nil
+}
+
+// handlePendingSettingInput обрабатывает ввод пользователя для ожидаемой настройки
+func (b *Bot) handlePendingSettingInput(chatID int64, userID int64, username string, pendingSettingKey string, inputText string) error {
+	var err error
+	var successMessage string
+	var nextPendingSetting string // Для цепочки ввода (например, лимиты)
+	var nextPrompt string         // Промпт для следующего шага
+
+	inputText = strings.TrimSpace(inputText)
+	valueInt := 0 // Для числовых значений
+
+	if pendingSettingKey == "direct_limit_count" || pendingSettingKey == "direct_limit_duration" {
+		valueInt, err = strconv.Atoi(inputText)
+		if err != nil {
+			b.sendReply(chatID, fmt.Sprintf("🚫 '%s' - это не число. Попробуйте еще раз.", inputText))
+			// Не сбрасываем PendingSetting, чтобы пользователь мог повторить ввод
+			return fmt.Errorf("некорректный ввод числа")
+		}
+	}
+
+	// Обработка конкретных ожидаемых настроек
+	switch pendingSettingKey {
+	case "profile_data":
+		// Логика парсинга и сохранения профиля
+		targetUsername, _, alias, gender, realName, bio, parseErr := parseProfileArgs(inputText)
+		if parseErr != nil {
+			b.sendReply(chatID, fmt.Sprintf("🚫 Ошибка парсинга данных профиля: %v", parseErr))
+			return parseErr
+		}
+
+		// Находим ID пользователя по имени
+		targetUserID, findErr := b.getUserIDByUsername(chatID, targetUsername)
+		if findErr != nil {
+			b.sendReply(chatID, fmt.Sprintf("🚫 Не удалось найти пользователя %s в недавней истории чата для сохранения профиля.", targetUsername))
+			return findErr
+		}
+
+		// Создаем или обновляем профиль
+		profile := &storage.UserProfile{
+			ChatID:    chatID,
+			UserID:    targetUserID,
+			Username:  strings.TrimPrefix(targetUsername, "@"),
+			Alias:     alias,
+			Gender:    gender,
+			RealName:  realName,
+			Bio:       bio,
+			CreatedAt: time.Now(), // Установим время создания при первом сохранении
+			UpdatedAt: time.Now(),
+		}
+
+		err = b.storage.SetUserProfile(profile)
+		if err != nil {
+			log.Printf("[ERROR][MH Pending] Admin %d: Failed to save profile for %s (%d): %v", userID, targetUsername, targetUserID, err)
+			b.sendReply(chatID, fmt.Sprintf("🚫 Произошла ошибка при сохранении профиля для %s.", targetUsername))
+			return err
+		}
+		successMessage = fmt.Sprintf("✅ Профиль для %s успешно сохранен.", targetUsername)
+
+	case "direct_limit_count":
+		if valueInt >= 0 { // 0 means unlimited
+			err = b.storage.UpdateDirectLimitCount(chatID, valueInt)
+			if err != nil {
+				log.Printf("[ERROR][MH Pending] Chat %d: Failed to save direct_limit_count %d: %v", chatID, valueInt, err)
+				b.sendReply(chatID, "🚫 Произошла ошибка при сохранении настройки лимита сообщений.")
+				return err
+			}
+			successMessage = fmt.Sprintf("✅ Лимит сообщений установлен: %d.", valueInt)
+			// Переходим к следующему шагу - ввод длительности
+			nextPendingSetting = "direct_limit_duration"
+			nextPrompt = b.config.PromptEnterDirectLimitDuration
+		} else {
+			b.sendReply(chatID, "🚫 Количество должно быть 0 или больше.")
+			return fmt.Errorf("некорректное значение лимита")
+		}
+
+	case "direct_limit_duration":
+		if valueInt > 0 { // Duration must be positive
+			duration := time.Duration(valueInt) * time.Minute
+			err = b.storage.UpdateDirectLimitDuration(chatID, duration)
+			if err != nil {
+				log.Printf("[ERROR][MH Pending] Chat %d: Failed to save direct_limit_duration %d mins: %v", chatID, valueInt, err)
+				b.sendReply(chatID, "🚫 Произошла ошибка при сохранении настройки периода лимита.")
+				return err
+			}
+			successMessage = fmt.Sprintf("✅ Период лимита установлен: %d минут.", valueInt)
+			// Цепочка ввода завершена, обновляем клавиатуру
+			// Вызываем обновление клавиатуры после успешного ввода
+			go func() {
+				// Небольшая задержка, чтобы сообщение об успехе успело отправиться
+				time.Sleep(1 * time.Second)
+				b.updateSettingsKeyboardAfterInput(chatID)
+			}()
+		} else {
+			b.sendReply(chatID, "🚫 Длительность должна быть больше 0.")
+			return fmt.Errorf("некорректное значение длительности")
+		}
+
+	default:
+		log.Printf("[WARN][MH Pending] Chat %d: Неизвестный pendingSettingKey: %s", chatID, pendingSettingKey)
+		b.sendReply(chatID, "🤔 Не понимаю, что вы пытаетесь настроить.")
+		// Сбрасываем неизвестный ключ
+		b.settingsMutex.Lock() // Lock нужен для записи
+		if currentSettings, exists := b.chatSettings[chatID]; exists {
+			currentSettings.PendingSetting = ""
+		}
+		b.settingsMutex.Unlock()
+		return fmt.Errorf("неизвестный pendingSettingKey")
+	}
+
+	// Если дошли сюда, значит ввод обработан успешно
+	// Отправляем сообщение об успехе (если есть)
+	if successMessage != "" {
+		// Отправляем и удаляем через 5 секунд
+		go func() {
+			sentSuccessMsg, sendErr := b.sendReplyReturnMsg(chatID, successMessage)
+			if sendErr == nil && sentSuccessMsg != nil {
+				time.Sleep(5 * time.Second)
+				b.deleteMessage(chatID, sentSuccessMsg.MessageID)
+			}
+		}()
+	}
+
+	// Обновляем PendingSetting и LastInfoMessageID (если есть следующий шаг)
+	b.settingsMutex.Lock()
+	if currentSettings, exists := b.chatSettings[chatID]; exists {
+		currentSettings.PendingSetting = nextPendingSetting // Устанавливаем следующий или сбрасываем
+		currentSettings.LastInfoMessageID = 0               // Сбрасываем ID инфо-сообщения
+		// Если есть следующий шаг, отправляем новый запрос ввода
+		if nextPendingSetting != "" && nextPrompt != "" {
+			sentPromptMsg, promptErr := b.sendReplyReturnMsg(chatID, nextPrompt)
+			if promptErr == nil && sentPromptMsg != nil {
+				currentSettings.LastInfoMessageID = sentPromptMsg.MessageID // Сохраняем ID нового запроса
+			} else {
+				log.Printf("[ERROR][MH Pending] Chat %d: Failed to send next prompt '%s': %v", chatID, nextPrompt, promptErr)
+				// Можно попробовать откатить pending setting?
+				currentSettings.PendingSetting = pendingSettingKey     // Возвращаем предыдущий
+				err = fmt.Errorf("ошибка отправки следующего запроса") // Возвращаем ошибку
+			}
+		}
+	}
+	b.settingsMutex.Unlock()
+
+	return err // Возвращаем nil или ошибку отправки следующего запроса
+}
+
+// updateSettingsKeyboardAfterInput обновляет клавиатуру настроек после завершения ввода
+// Вызывается асинхронно
+func (b *Bot) updateSettingsKeyboardAfterInput(chatID int64) {
+	b.settingsMutex.RLock()
+	settings, exists := b.chatSettings[chatID]
+	if !exists {
+		b.settingsMutex.RUnlock()
+		return
+	}
+	lastSettingsMsgID := settings.LastSettingsMessageID
+	b.settingsMutex.RUnlock()
+
+	if lastSettingsMsgID != 0 {
+		// Используем фиктивный CallbackQuery для вызова updateSettingsKeyboard
+		dummyMessage := tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}, MessageID: lastSettingsMsgID}
+		dummyQuery := tgbotapi.CallbackQuery{Message: &dummyMessage, From: &tgbotapi.User{}}
+		b.updateSettingsKeyboard(&dummyQuery) // Передаем фиктивный query
+	}
+}
+
+// --- Функции для лимита прямых обращений ---
+
+// checkDirectReplyLimit проверяет, превышен ли лимит для пользователя.
+// Возвращает true, если лимит превышен, иначе false.
+// Также добавляет текущую временную метку, если лимит не превышен.
+func (b *Bot) checkDirectReplyLimit(chatID int64, userID int64) bool {
+	b.settingsMutex.Lock() // Блокируем для чтения настроек и записи временных меток
+	defer b.settingsMutex.Unlock()
+
+	// Получаем настройки лимита из DB через storage
+	dbSettings, err := b.storage.GetChatSettings(chatID)
+	if err != nil {
+		log.Printf("[ERROR][DirectLimit] Чат %d: Ошибка получения настроек из DB: %v. Лимит не проверяется.", chatID, err)
+		return false // Если ошибка - лимит не применяем
+	}
+
+	// Проверяем, включен ли лимит
+	limitEnabled := b.config.DirectReplyLimitEnabledDefault
+	if dbSettings.DirectReplyLimitEnabled != nil {
+		limitEnabled = *dbSettings.DirectReplyLimitEnabled
+	}
+	if !limitEnabled {
+		if b.config.Debug {
+			log.Printf("[DEBUG][DirectLimit] Чат %d: Лимит прямых обращений выключен.", chatID)
+		}
+		return false
+	}
+
+	// Получаем значения лимита
+	limitCount := b.config.DirectReplyLimitCountDefault
+	if dbSettings.DirectReplyLimitCount != nil {
+		limitCount = *dbSettings.DirectReplyLimitCount
+	}
+	limitDuration := b.config.DirectReplyLimitDurationDefault
+	if dbSettings.DirectReplyLimitDuration != nil {
+		durationMinutes := *dbSettings.DirectReplyLimitDuration
+		limitDuration = time.Duration(durationMinutes) * time.Minute
+	}
+
+	// Проверяем метки
+	now := time.Now()
+	// Инициализируем map для чата, если его нет
+	if _, ok := b.directReplyTimestamps[chatID]; !ok {
+		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
+	}
+	userTimestamps := b.directReplyTimestamps[chatID][userID]
+	validTimestamps := []time.Time{}
+
+	// СНАЧАЛА добавляем новую метку
+	userTimestamps = append(userTimestamps, now)
+
+	// ТЕПЕРЬ удаляем старые метки
+	for _, ts := range userTimestamps {
+		if now.Sub(ts) < limitDuration {
+			validTimestamps = append(validTimestamps, ts)
+		}
+	}
+
+	// Обновляем метки для пользователя ПЕРЕД проверкой
+	b.directReplyTimestamps[chatID][userID] = validTimestamps
+
+	exceeded := len(validTimestamps) > limitCount // СТРОГО больше, т.к. мы уже добавили текущее
+
+	if b.config.Debug {
+		log.Printf("[DEBUG][DirectLimit] Чат %d, User %d: Проверка лимита (%d за %v). Метки после добавления/очистки: %d. Превышен: %t",
+			chatID, userID, limitCount, limitDuration, len(validTimestamps), exceeded)
+	}
+
+	return exceeded
+}
+
+// sendDirectLimitExceededReply отправляет сообщение о превышении лимита.
+func (b *Bot) sendDirectLimitExceededReply(chatID int64, replyToMessageID int) {
+	prompt := b.config.DirectReplyLimitPrompt
+	responseText, err := b.llm.GenerateArbitraryResponse(prompt, "")
+	if err != nil {
+		log.Printf("[ERROR][DirectLimit] Чат %d: Ошибка генерации ответа о превышении лимита: %v", chatID, err)
+		responseText = "Слишком часто пишешь, отдохни."
+	}
+
+	msg := tgbotapi.NewMessage(chatID, responseText)
+	msg.ReplyToMessageID = replyToMessageID
+	// Отправляем и сохраняем ответ бота
+	sentReply, errSend := b.api.Send(msg)
+	if errSend != nil {
+		log.Printf("[ERROR][DirectLimit] Чат %d: Ошибка отправки ответа о превышении лимита: %v", chatID, errSend)
+	} else {
+		go b.storage.AddMessage(chatID, &sentReply)
+	}
 }

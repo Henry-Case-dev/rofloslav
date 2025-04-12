@@ -5,6 +5,8 @@ import (
 	"errors" // Для проверки ошибок MongoDB
 	"fmt"
 	"log"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config" // Исправлен путь импорта конфига
@@ -712,4 +714,352 @@ func (ms *MongoStorage) GetStatus(chatID int64) string {
 	}
 
 	return status
+}
+
+// GetChatSettings получает настройки чата из MongoDB
+func (ms *MongoStorage) GetChatSettings(chatID int64) (*ChatSettings, error) {
+	var settings ChatSettings
+	// Исправлено: Используем поле структуры ms
+	collection := ms.settingsCollection
+	if collection == nil {
+		log.Printf("[ERROR][GetChatSettings] Коллекция настроек (ms.settingsCollection) равна nil для чата %d!", chatID)
+		// Возвращаем ошибку ИЛИ дефолтные настройки? Лучше ошибку, т.к. это проблема инициализации.
+		// Однако, для пользователя может быть лучше вернуть дефолтные. Пока вернем ошибку.
+		return nil, fmt.Errorf("внутренняя ошибка: коллекция настроек не инициализирована")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	err := collection.FindOne(ctx, filter).Decode(&settings)
+
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			// Настройки не найдены, создаем и возвращаем дефолтные
+			if ms.debug {
+				log.Printf("[DEBUG][GetChatSettings] Настройки для чата %d не найдены, создаю дефолтные.", chatID)
+			}
+			// Используем метод ensureChatSettings, который теперь использует ms.cfg
+			defaultSettings, createErr := ms.ensureChatSettings(ctx, chatID) // Передаем только chatID
+			if createErr != nil {
+				log.Printf("[ERROR][GetChatSettings] Ошибка при создании дефолтных настроек для чата %d: %v", chatID, createErr)
+				return nil, fmt.Errorf("ошибка создания настроек чата: %w", createErr)
+			}
+			return defaultSettings, nil
+		}
+		// Другая ошибка при поиске
+		log.Printf("[ERROR][GetChatSettings] Ошибка получения настроек для чата %d: %v", chatID, err)
+		return nil, fmt.Errorf("ошибка получения настроек чата: %w", err)
+	}
+
+	// Настройки найдены, проверяем и устанавливаем значения по умолчанию для отсутствующих полей
+	needsUpdate := ms.applyDefaultsToSettings(&settings) // Выносим логику в отдельный метод
+
+	// Если нужно обновить документ в базе с дефолтными значениями
+	if needsUpdate {
+		if ms.debug {
+			log.Printf("[DEBUG][GetChatSettings] Обновляю документ настроек для чата %d с дефолтными значениями.", chatID)
+		}
+		// Запускаем обновление в фоне, чтобы не блокировать основной поток
+		go func(s ChatSettings) { // Передаем копию настроек
+			if err := ms.SetChatSettings(&s); err != nil {
+				log.Printf("[WARN][GetChatSettings Background Update] Ошибка фонового обновления настроек для чата %d: %v", s.ChatID, err)
+			}
+		}(settings) // Передаем копию текущего состояния settings
+	}
+
+	if ms.debug {
+		log.Printf("[DEBUG][GetChatSettings] Настройки для чата %d успешно получены.", chatID)
+	}
+	return &settings, nil
+}
+
+// applyDefaultsToSettings проверяет и устанавливает значения по умолчанию для отсутствующих полей ChatSettings.
+// Возвращает true, если были применены какие-либо дефолтные значения.
+func (ms *MongoStorage) applyDefaultsToSettings(settings *ChatSettings) bool {
+	needsUpdate := false
+	if settings.ConversationStyle == "" {
+		settings.ConversationStyle = ms.cfg.DefaultConversationStyle
+		needsUpdate = true
+	}
+	if settings.Temperature == nil {
+		temp := ms.cfg.DefaultTemperature
+		settings.Temperature = &temp
+		needsUpdate = true
+	}
+	if settings.Model == "" {
+		settings.Model = ms.cfg.DefaultModel
+		needsUpdate = true
+	}
+	if settings.GeminiSafetyThreshold == "" {
+		settings.GeminiSafetyThreshold = ms.cfg.DefaultSafetyThreshold
+		needsUpdate = true
+	}
+	if settings.VoiceTranscriptionEnabled == nil {
+		enabled := ms.cfg.VoiceTranscriptionEnabledDefault
+		settings.VoiceTranscriptionEnabled = &enabled
+		needsUpdate = true
+	}
+	// --- Проверка дефолтов для лимита прямых обращений ---
+	if settings.DirectReplyLimitEnabled == nil {
+		enabled := ms.cfg.DirectReplyLimitEnabledDefault
+		settings.DirectReplyLimitEnabled = &enabled
+		needsUpdate = true
+	}
+	if settings.DirectReplyLimitCount == nil {
+		count := ms.cfg.DirectReplyLimitCountDefault
+		settings.DirectReplyLimitCount = &count
+		needsUpdate = true
+	}
+	if settings.DirectReplyLimitDuration == nil {
+		durationMinutes := int(ms.cfg.DirectReplyLimitDurationDefault.Minutes())
+		settings.DirectReplyLimitDuration = &durationMinutes
+		needsUpdate = true
+	}
+	return needsUpdate
+}
+
+// ensureChatSettings создает или получает настройки чата.
+// Вызывается из GetChatSettings, если документ не найден.
+// Теперь использует ms.cfg напрямую.
+func (ms *MongoStorage) ensureChatSettings(ctx context.Context, chatID int64) (*ChatSettings, error) {
+	// Исправлено: Используем правильный доступ к коллекции через поле структуры ms
+	collection := ms.settingsCollection
+	if collection == nil {
+		log.Printf("[ERROR][ensureChatSettings] Коллекция настроек (ms.settingsCollection) равна nil при попытке создать настройки для чата %d!", chatID)
+		return nil, fmt.Errorf("внутренняя ошибка: коллекция настроек не инициализирована")
+	}
+
+	// Создаем новый документ с дефолтными значениями из конфига ms.cfg
+	defaultTemp := ms.cfg.DefaultTemperature
+	defaultVoiceEnabled := ms.cfg.VoiceTranscriptionEnabledDefault
+	defaultDirectLimitEnabled := ms.cfg.DirectReplyLimitEnabledDefault
+	defaultDirectLimitCount := ms.cfg.DirectReplyLimitCountDefault
+	directLimitDurationMinutes := int(ms.cfg.DirectReplyLimitDurationDefault.Minutes())
+
+	newSettings := ChatSettings{
+		ChatID:                    chatID,
+		ConversationStyle:         ms.cfg.DefaultConversationStyle,
+		Temperature:               &defaultTemp,
+		Model:                     ms.cfg.DefaultModel,
+		GeminiSafetyThreshold:     ms.cfg.DefaultSafetyThreshold,
+		VoiceTranscriptionEnabled: &defaultVoiceEnabled,
+		// --- Добавляем дефолтные значения для лимита ---
+		DirectReplyLimitEnabled:  &defaultDirectLimitEnabled,
+		DirectReplyLimitCount:    &defaultDirectLimitCount,
+		DirectReplyLimitDuration: &directLimitDurationMinutes, // Сохраняем в БД как минуты
+	}
+
+	// Пытаемся вставить новый документ
+	_, insertErr := collection.InsertOne(ctx, newSettings)
+	if insertErr != nil {
+		// Проверяем, возможно, документ уже был создан другим потоком (ошибка дубликата)
+		if mongo.IsDuplicateKeyError(insertErr) {
+			if ms.debug {
+				log.Printf("[DEBUG][ensureChatSettings] Настройки для чата %d уже существуют (ошибка дубликата). Повторно запрашиваю.", chatID)
+			}
+			// Повторно запрашиваем существующие настройки
+			var existingSettings ChatSettings
+			filter := bson.M{"chat_id": chatID}
+			// Используем новый контекст для повторного запроса
+			findCtx, findCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer findCancel()
+			findErr := collection.FindOne(findCtx, filter).Decode(&existingSettings)
+			if findErr != nil {
+				log.Printf("[ERROR][ensureChatSettings] Ошибка повторного получения настроек для чата %d после ошибки дубликата: %v", chatID, findErr)
+				return nil, fmt.Errorf("ошибка повторного получения настроек: %w", findErr)
+			}
+			// Применяем дефолты к только что полученным настройкам на случай, если они неполные
+			_ = ms.applyDefaultsToSettings(&existingSettings) // Игнорируем needsUpdate здесь
+			return &existingSettings, nil
+		}
+		// Другая ошибка при вставке
+		log.Printf("[ERROR][ensureChatSettings] Ошибка вставки дефолтных настроек для чата %d: %v", chatID, insertErr)
+		return nil, fmt.Errorf("ошибка вставки настроек чата: %w", insertErr)
+	}
+
+	if ms.debug {
+		log.Printf("[DEBUG][ensureChatSettings] Дефолтные настройки для чата %d успешно созданы и вставлены.", chatID)
+	}
+	// Возвращаем только что созданные настройки
+	return &newSettings, nil
+}
+
+// SetChatSettings сохраняет настройки чата в MongoDB (UPSERT)
+func (ms *MongoStorage) SetChatSettings(settings *ChatSettings) error {
+	if settings == nil || settings.ChatID == 0 {
+		return fmt.Errorf("невалидные настройки для сохранения (nil или chat_id=0)")
+	}
+
+	// Исправлено: Используем правильный доступ к коллекции
+	collection := ms.settingsCollection
+	if collection == nil {
+		log.Printf("[ERROR][SetChatSettings] Коллекция настроек (ms.settingsCollection) равна nil для чата %d!", settings.ChatID)
+		return fmt.Errorf("внутренняя ошибка: коллекция настроек не инициализирована")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": settings.ChatID}
+
+	// Формируем обновление. Используем $set для всех полей, чтобы перезаписать их.
+	// Используем reflect для динамического добавления ненулевых полей в $set и $unset
+	updateDoc := bson.M{}
+	unsetDoc := bson.M{} // Документ для $unset
+	v := reflect.ValueOf(*settings)
+	t := v.Type()
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		fieldType := t.Field(i)
+		bsonTag := fieldType.Tag.Get("bson")
+		parts := strings.Split(bsonTag, ",") // Получаем имя поля из bson тега
+		if len(parts) > 0 && parts[0] != "" && parts[0] != "-" {
+			bsonFieldName := parts[0]
+			// Игнорируем chat_id, так как он в фильтре
+			if bsonFieldName != "chat_id" {
+				// Обработка указателей (Temperature, VoiceTranscriptionEnabled, DirectReplyLimit*)
+				if field.Kind() == reflect.Ptr {
+					if !field.IsNil() { // Добавляем в $set только если указатель не nil
+						updateDoc[bsonFieldName] = field.Elem().Interface() // Развертываем указатель
+					} else {
+						// Если указатель nil, добавляем его в $unset, чтобы удалить поле из документа
+						unsetDoc[bsonFieldName] = ""
+					}
+				} else if field.IsValid() && !field.IsZero() { // Добавляем ненулевые значения
+					updateDoc[bsonFieldName] = field.Interface()
+				} else if field.IsValid() && field.IsZero() {
+					// Обработка нулевых значений НЕ-указателей
+					// Для ConversationStyle, Model, GeminiSafetyThreshold пустая строка/0 - валидное значение,
+					// которое должно быть установлено.
+					// Для других полей (если появятся) может понадобиться другая логика.
+					updateDoc[bsonFieldName] = field.Interface()
+				}
+			}
+		}
+	}
+
+	// Собираем итоговый документ для update
+	update := bson.M{}
+	if len(updateDoc) > 0 {
+		update["$set"] = updateDoc
+	}
+	// Добавляем $unset, если он не пустой
+	if len(unsetDoc) > 0 {
+		update["$unset"] = unsetDoc
+	}
+
+	// Если нет ни $set, ни $unset, то обновлять нечего
+	if len(update) == 0 {
+		if ms.debug {
+			log.Printf("[DEBUG][SetChatSettings] Нет полей для обновления настроек чата %d.", settings.ChatID)
+		}
+		return nil // Не ошибка, просто нет изменений
+	}
+
+	opts := options.Update().SetUpsert(true)
+
+	result, err := collection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[ERROR][SetChatSettings] Ошибка сохранения настроек для чата %d: %v", settings.ChatID, err)
+		return fmt.Errorf("ошибка сохранения настроек чата: %w", err)
+	}
+
+	if ms.debug {
+		if result.UpsertedCount > 0 {
+			log.Printf("[DEBUG][SetChatSettings] Настройки для чата %d успешно созданы (UpsertedID: %v).", settings.ChatID, result.UpsertedID)
+		} else if result.ModifiedCount > 0 {
+			log.Printf("[DEBUG][SetChatSettings] Настройки для чата %d успешно обновлены.", settings.ChatID)
+		} else if result.MatchedCount > 0 {
+			log.Printf("[DEBUG][SetChatSettings] Настройки для чата %d не изменились (Matched: %d).", settings.ChatID, result.MatchedCount)
+		} else {
+			log.Printf("[DEBUG][SetChatSettings] Запрос UpdateOne для чата %d завершен без изменений (Upserted: %d, Modified: %d, Matched: %d).", settings.ChatID, result.UpsertedCount, result.ModifiedCount, result.MatchedCount)
+		}
+	}
+
+	return nil
+}
+
+// --- Новые методы для обновления отдельных настроек лимитов ---
+
+// UpdateDirectLimitEnabled обновляет только поле direct_reply_limit_enabled
+func (ms *MongoStorage) UpdateDirectLimitEnabled(chatID int64, enabled bool) error {
+	collection := ms.settingsCollection
+	if collection == nil {
+		return fmt.Errorf("коллекция настроек не инициализирована")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	update := bson.M{"$set": bson.M{"direct_reply_limit_enabled": enabled}}
+	opts := options.Update().SetUpsert(true) // Upsert на случай, если настроек еще нет
+
+	_, err := collection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[ERROR][UpdateDirectLimitEnabled] Ошибка обновления настройки для чата %d: %v", chatID, err)
+		return fmt.Errorf("ошибка обновления флага лимита: %w", err)
+	}
+	if ms.debug {
+		log.Printf("[DEBUG][UpdateDirectLimitEnabled] Настройка лимита для чата %d установлена в %t.", chatID, enabled)
+	}
+	return nil
+}
+
+// UpdateDirectLimitCount обновляет только поле direct_reply_limit_count
+func (ms *MongoStorage) UpdateDirectLimitCount(chatID int64, count int) error {
+	if count < 0 {
+		return fmt.Errorf("количество должно быть не отрицательным")
+	}
+	collection := ms.settingsCollection
+	if collection == nil {
+		return fmt.Errorf("коллекция настроек не инициализирована")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	update := bson.M{"$set": bson.M{"direct_reply_limit_count": count}}
+	opts := options.Update().SetUpsert(true) // Upsert на случай, если настроек еще нет
+
+	_, err := collection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[ERROR][UpdateDirectLimitCount] Ошибка обновления настройки для чата %d: %v", chatID, err)
+		return fmt.Errorf("ошибка обновления количества лимита: %w", err)
+	}
+	if ms.debug {
+		log.Printf("[DEBUG][UpdateDirectLimitCount] Количество лимита для чата %d установлено в %d.", chatID, count)
+	}
+	return nil
+}
+
+// UpdateDirectLimitDuration обновляет только поле direct_reply_limit_duration_minutes
+func (ms *MongoStorage) UpdateDirectLimitDuration(chatID int64, duration time.Duration) error {
+	if duration <= 0 {
+		return fmt.Errorf("длительность должна быть положительной")
+	}
+	durationMinutes := int(duration.Minutes()) // Сохраняем в минутах
+
+	collection := ms.settingsCollection
+	if collection == nil {
+		return fmt.Errorf("коллекция настроек не инициализирована")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	update := bson.M{"$set": bson.M{"direct_reply_limit_duration_minutes": durationMinutes}}
+	opts := options.Update().SetUpsert(true) // Upsert на случай, если настроек еще нет
+
+	_, err := collection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[ERROR][UpdateDirectLimitDuration] Ошибка обновления настройки для чата %d: %v", chatID, err)
+		return fmt.Errorf("ошибка обновления длительности лимита: %w", err)
+	}
+	if ms.debug {
+		log.Printf("[DEBUG][UpdateDirectLimitDuration] Длительность лимита для чата %d установлена в %d минут.", chatID, durationMinutes)
+	}
+	return nil
 }
