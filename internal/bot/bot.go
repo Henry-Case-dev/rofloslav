@@ -97,8 +97,7 @@ func New(cfg *config.Config) (*Bot, error) {
 			cfg.MongoDbName,
 			cfg.MongoDbMessagesCollection,
 			cfg.MongoDbUserProfilesCollection,
-			cfg.ContextWindow,
-			cfg.Debug,
+			cfg,
 		)
 		if mongoErr != nil {
 			log.Printf("[WARN] Ошибка инициализации MongoDB хранилища: %v. Переключение на файловое хранилище.", mongoErr)

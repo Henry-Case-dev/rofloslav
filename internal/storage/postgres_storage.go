@@ -594,17 +594,29 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 	return profiles, nil
 }
 
-// GetStatus для PostgresStorage
+// GetStatus для PostgresStorage (добавлена корректная реализация)
 func (ps *PostgresStorage) GetStatus(chatID int64) string {
 	status := "Хранилище: PostgreSQL. "
-	var count int64
-	err := ps.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_id = $1", chatID).Scan(&count)
-	if err != nil {
-		log.Printf("[Postgres GetStatus WARN] Чат %d: Ошибка получения количества сообщений: %v", chatID, err)
-		status += "Состояние: Ошибка подсчета сообщений."
+	var msgCount, profileCount int64
+
+	// Считаем сообщения
+	errMsgs := ps.db.QueryRow("SELECT COUNT(*) FROM chat_messages WHERE chat_id = $1", chatID).Scan(&msgCount)
+	if errMsgs != nil && errMsgs != sql.ErrNoRows {
+		log.Printf("[Postgres GetStatus WARN] Чат %d: Ошибка получения количества сообщений: %v", chatID, errMsgs)
+		status += "Ошибка подсчета сообщений. "
 	} else {
-		status += fmt.Sprintf("Сообщений в базе: %d", count)
+		status += fmt.Sprintf("Сообщений в базе: %d. ", msgCount)
 	}
+
+	// Считаем профили
+	errProfiles := ps.db.QueryRow("SELECT COUNT(*) FROM user_profiles WHERE chat_id = $1", chatID).Scan(&profileCount)
+	if errProfiles != nil && errProfiles != sql.ErrNoRows {
+		log.Printf("[Postgres GetStatus WARN] Чат %d: Ошибка получения количества профилей: %v", chatID, errProfiles)
+		status += "Ошибка подсчета профилей."
+	} else {
+		status += fmt.Sprintf("Профилей в базе: %d.", profileCount)
+	}
+
 	// Можно добавить проверку Ping() для статуса подключения, но это может быть медленно
 	return status
 }

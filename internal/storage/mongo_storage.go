@@ -7,6 +7,8 @@ import (
 	"log"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/config" // Исправлен путь импорта конфига
+
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -17,6 +19,9 @@ import (
 
 // Убедимся, что MongoStorage реализует интерфейс ChatHistoryStorage.
 var _ ChatHistoryStorage = (*MongoStorage)(nil)
+
+// Имя коллекции для настроек чата
+const settingsCollectionName = "chat_settings"
 
 // MongoMessage представляет структуру сообщения для хранения в MongoDB.
 type MongoMessage struct {
@@ -77,15 +82,19 @@ type MongoStorage struct {
 	database               *mongo.Database
 	messagesCollection     *mongo.Collection // Коллекция для сообщений
 	userProfilesCollection *mongo.Collection // Коллекция для профилей пользователей
-	contextWindow          int
-	debug                  bool
+	settingsCollection     *mongo.Collection // Коллекция для настроек чатов
+	cfg                    *config.Config    // Добавлена ссылка на конфиг
+	debug                  bool              // Сохраняем флаг debug из конфига
 }
 
 // NewMongoStorage создает новое хранилище MongoDB.
-// Добавляем имя коллекции для профилей.
-func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, contextWindow int, debug bool) (*MongoStorage, error) {
+// Принимает *config.Config вместо contextWindow и debug.
+func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, cfg *config.Config) (*MongoStorage, error) {
 	if mongoURI == "" || dbName == "" || messagesCollectionName == "" || userProfilesCollectionName == "" {
 		return nil, fmt.Errorf("URI MongoDB, имя БД и имена коллекций (сообщения, профили) должны быть указаны")
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("конфигурация (cfg) не должна быть nil")
 	}
 
 	// Увеличиваем таймаут подключения
@@ -113,17 +122,19 @@ func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesColle
 	database := client.Database(dbName)
 	messagesCollection := database.Collection(messagesCollectionName)
 	userProfilesCollection := database.Collection(userProfilesCollectionName)
+	settingsCollection := database.Collection(settingsCollectionName) // Инициализация коллекции настроек
 
 	ms := &MongoStorage{
 		client:                 client,
 		database:               database,
 		messagesCollection:     messagesCollection,
 		userProfilesCollection: userProfilesCollection, // Сохраняем коллекцию профилей
-		contextWindow:          contextWindow,
-		debug:                  debug,
+		settingsCollection:     settingsCollection,     // Сохраняем коллекцию настроек
+		cfg:                    cfg,                    // Сохраняем конфиг
+		debug:                  cfg.Debug,              // Используем debug из конфига
 	}
 
-	// Создаем индексы для обеих коллекций
+	// Создаем индексы для всех коллекций
 	if err := ms.ensureIndexes(); err != nil {
 		ms.Close() // Закрываем соединение в случае ошибки
 		return nil, fmt.Errorf("ошибка создания индексов MongoDB: %w", err)
@@ -164,6 +175,14 @@ func (ms *MongoStorage) ensureIndexes() error {
 			Options: options.Index().SetName("chat_id_last_seen_desc"),
 		},
 	}
+	// --- Индексы для коллекции настроек чатов ---
+	settingsIndexes := []mongo.IndexModel{
+		{ // Индекс для быстрого поиска настроек по chat_id
+			Keys:    bson.D{{Key: "chat_id", Value: 1}},
+			Options: options.Index().SetName("chat_id_unique").SetUnique(true),
+		},
+	}
+
 	// Создаем индексы для сообщений
 	_, err := ms.messagesCollection.Indexes().CreateMany(ctx, messagesIndexes)
 	if err != nil {
@@ -218,6 +237,32 @@ func (ms *MongoStorage) ensureIndexes() error {
 		}
 	}
 	log.Println("Индексы для коллекции профилей MongoDB проверены/созданы.")
+
+	// Создаем индексы для настроек
+	_, err = ms.settingsCollection.Indexes().CreateMany(ctx, settingsIndexes)
+	if err != nil {
+		// Аналогичная проверка на ошибки конфликта/дубликата
+		cmdErr, ok := err.(mongo.CommandError)
+		if !ok || !cmdErr.HasErrorCode(85) {
+			writeErr, okWrite := err.(mongo.WriteException)
+			alreadyExists := false
+			if okWrite {
+				for _, we := range writeErr.WriteErrors {
+					if we.Code == 11000 {
+						alreadyExists = true
+						break
+					}
+				}
+			}
+			if !alreadyExists {
+				return fmt.Errorf("ошибка создания индексов для коллекции настроек: %w", err)
+			}
+		}
+		if ms.debug {
+			log.Printf("[DEBUG] Индексы для настроек: конфликт или уже существуют (%v)", err)
+		}
+	}
+	log.Println("Индексы для коллекции настроек MongoDB проверены/созданы.")
 
 	return nil
 }
@@ -340,8 +385,8 @@ func (ms *MongoStorage) GetMessages(chatID int64) []*tgbotapi.Message {
 
 	filter := bson.M{"chat_id": chatID}
 	findOptions := options.Find().
-		SetSort(bson.D{{"date", -1}}). // Сортируем по дате, новые первыми
-		SetLimit(int64(ms.contextWindow))
+		SetSort(bson.D{{"date", -1}}).        // Сортируем по дате, новые первыми
+		SetLimit(int64(ms.cfg.ContextWindow)) // Используем cfg.ContextWindow
 
 	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
 	if err != nil {

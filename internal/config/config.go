@@ -36,6 +36,12 @@ type Config struct {
 	DirectPrompt    string
 	DailyTakePrompt string
 	SummaryPrompt   string
+	// --- Новые поля для настроек по умолчанию ---
+	DefaultConversationStyle string  // Стиль общения по умолчанию
+	DefaultTemperature       float64 // Температура по умолчанию
+	DefaultModel             string  // Модель LLM по умолчанию
+	DefaultSafetyThreshold   string  // Уровень безопасности Gemini по умолчанию
+	// --- Конец новых полей ---
 	// Настройки Gemini
 	GeminiAPIKey    string
 	GeminiModelName string
@@ -76,6 +82,7 @@ type Config struct {
 	MongoDbName                   string // Имя базы данных MongoDB
 	MongoDbMessagesCollection     string // Имя коллекции для сообщений MongoDB
 	MongoDbUserProfilesCollection string // Имя коллекции для профилей MongoDB
+	MongoDbSettingsCollection     string // Имя коллекции для настроек чатов MongoDB
 	// Тип хранилища ("file", "postgres" или "mongo")
 	StorageType StorageType
 	// Список администраторов бота (через запятую)
@@ -84,6 +91,8 @@ type Config struct {
 	WelcomePrompt string
 	// Промпт для форматирования голоса
 	VoiceFormatPrompt string
+	// Включена ли авто-транскрипция голоса по умолчанию
+	VoiceTranscriptionEnabledDefault bool
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -114,9 +123,15 @@ func Load() (*Config, error) {
 	contextWindowStr := getEnvOrDefault("CONTEXT_WINDOW", "1000")
 	debugStr := getEnvOrDefault("DEBUG", "false")
 
+	// --- Загрузка новых переменных для настроек по умолчанию ---
+	defaultConvStyle := getEnvOrDefault("DEFAULT_CONVERSATION_STYLE", "balanced") // Например, "balanced", "creative", "precise"
+	defaultTempStr := getEnvOrDefault("DEFAULT_TEMPERATURE", "0.7")
+	defaultModel := getEnvOrDefault("DEFAULT_MODEL", "") // Пусто по умолчанию, будет определен ниже на основе провайдера
+	defaultSafety := getEnvOrDefault("DEFAULT_SAFETY_THRESHOLD", "BLOCK_MEDIUM_AND_ABOVE")
+
 	// --- Загрузка переменных Gemini ---
 	geminiAPIKey := getEnvOrDefault("GEMINI_API_KEY", "")
-	geminiModelName := getEnvOrDefault("GEMINI_MODEL_NAME", "gemini-2.0-flash")
+	geminiModelName := getEnvOrDefault("GEMINI_MODEL_NAME", "gemini-1.5-flash-latest")
 
 	// --- Загрузка переменных DeepSeek ---
 	deepSeekAPIKey := getEnvOrDefault("DEEPSEEK_API_KEY", "")
@@ -142,11 +157,19 @@ func Load() (*Config, error) {
 	dbPassword := getEnvOrDefault("POSTGRESQL_PASSWORD", "") // Используем POSTGRESQL_
 	dbName := getEnvOrDefault("POSTGRESQL_DBNAME", "")       // Используем POSTGRESQL_DBNAME
 
+	// --- Загрузка переменных MongoDB ---
+	mongoURI := getEnvOrDefault("MONGODB_URI", "")
+	mongoDbName := getEnvOrDefault("MONGODB_DBNAME", "rofloslav_history")
+	mongoMessagesCollection := getEnvOrDefault("MONGODB_MESSAGES_COLLECTION", "chat_messages")
+	mongoUserProfilesCollection := getEnvOrDefault("MONGODB_USER_PROFILES_COLLECTION", "user_profiles")
+	mongoSettingsCollection := getEnvOrDefault("MONGODB_SETTINGS_COLLECTION", "chat_settings") // Новая переменная
+
 	// --- Загрузка прочих переменных ---
-	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypeMongo)))       // По умолчанию Mongo
-	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight")                              // По умолчанию lightnight
-	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав.")                    // Загрузка приветственного промпта
-	voiceFormatPrompt := getEnvOrDefault("VOICE_FORMAT_PROMPT", "Расставь знаки препинания и абзацы:") // Загрузка промпта для голоса
+	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypeMongo))) // По умолчанию Mongo
+	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight")                        // По умолчанию lightnight
+	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав, ваш новый повелитель сарказма. Погнали нахуй.")
+	voiceFormatPrompt := getEnvOrDefault("VOICE_FORMAT_PROMPT", "Format the following recognized text with punctuation and paragraphs:\n")
+	voiceTranscriptionEnabledDefaultStr := getEnvOrDefault("VOICE_TRANSCRIPTION_ENABLED_DEFAULT", "true")
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
@@ -159,11 +182,19 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] DEEPSEEK_MODEL_NAME: %s", deepSeekModelName)
 	log.Printf("[Config Load] DEEPSEEK_BASE_URL: %s", deepSeekBaseURL)
 	log.Printf("[Config Load] --- Database Settings ---")
+	log.Printf("[Config Load] STORAGE_TYPE: %s", storageTypeStr) // Логируем тип хранилища
+	// Логирование PostgreSQL
 	log.Printf("[Config Load] POSTGRESQL_HOST: %s", dbHost)
 	log.Printf("[Config Load] POSTGRESQL_PORT: %s", dbPort)
 	log.Printf("[Config Load] POSTGRESQL_USER: %s", dbUser)
 	log.Printf("[Config Load] POSTGRESQL_PASSWORD: ...%s (len %d)", truncateStringEnd(dbPassword, 3), len(dbPassword))
 	log.Printf("[Config Load] POSTGRESQL_DBNAME: %s", dbName)
+	// Логирование MongoDB
+	log.Printf("[Config Load] MONGODB_URI: %s", maskSecretURI(mongoURI))
+	log.Printf("[Config Load] MONGODB_DBNAME: %s", mongoDbName)
+	log.Printf("[Config Load] MONGODB_MESSAGES_COLLECTION: %s", mongoMessagesCollection)
+	log.Printf("[Config Load] MONGODB_USER_PROFILES_COLLECTION: %s", mongoUserProfilesCollection)
+	log.Printf("[Config Load] MONGODB_SETTINGS_COLLECTION: %s", mongoSettingsCollection) // Логируем новую коллекцию
 	log.Printf("[Config Load] --- Prompts & Behavior ---")
 	log.Printf("[Config Load] DEFAULT_PROMPT: %s...", truncateString(defaultPrompt, 50))
 	log.Printf("[Config Load] DIRECT_PROMPT: %s...", truncateString(directPrompt, 50))
@@ -173,11 +204,18 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] SRACH_WARNING_PROMPT: %s...", truncateString(srachWarningPrompt, 50))
 	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
 	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", truncateString(srachConfirmPrompt, 50))
+	// --- Логирование новых дефолтных настроек ---
+	log.Printf("[Config Load] DEFAULT_CONVERSATION_STYLE: %s", defaultConvStyle)
+	log.Printf("[Config Load] DEFAULT_TEMPERATURE: %s", defaultTempStr)
+	log.Printf("[Config Load] DEFAULT_MODEL (pre-provider): %s", defaultModel)
+	log.Printf("[Config Load] DEFAULT_SAFETY_THRESHOLD: %s", defaultSafety)
+	// --- Конец логирования дефолтных настроек ---
 	log.Printf("[Config Load] --- Timing & Limits ---")
 	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
 	log.Printf("[Config Load] DEBUG: %s", debugStr)
 	log.Printf("[Config Load] WELCOME_PROMPT: %s...", truncateString(welcomePrompt, 50))
-	log.Printf("[Config Load] VOICE_FORMAT_PROMPT: %s...", truncateString(voiceFormatPrompt, 50)) // Логируем новый промпт
+	log.Printf("[Config Load] VOICE_FORMAT_PROMPT: %s...", truncateString(voiceFormatPrompt, 50))
+	log.Printf("[Config Load] VOICE_TRANSCRIPTION_ENABLED_DEFAULT: %s", voiceTranscriptionEnabledDefaultStr)
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -185,12 +223,22 @@ func Load() (*Config, error) {
 	switch strings.ToLower(llmProviderStr) {
 	case string(ProviderGemini):
 		llmProvider = ProviderGemini
+		if defaultModel == "" {
+			defaultModel = geminiModelName // Используем модель Gemini по умолчанию
+		}
 	case string(ProviderDeepSeek):
 		llmProvider = ProviderDeepSeek
+		if defaultModel == "" {
+			defaultModel = deepSeekModelName // Используем модель DeepSeek по умолчанию
+		}
 	default:
 		log.Printf("[Config Load WARN] Неизвестный LLM_PROVIDER '%s'. Используется '%s'.", llmProviderStr, ProviderGemini)
 		llmProvider = ProviderGemini
+		if defaultModel == "" {
+			defaultModel = geminiModelName // Используем модель Gemini по умолчанию
+		}
 	}
+	log.Printf("[Config Load] DEFAULT_MODEL (post-provider): %s", defaultModel) // Логируем итоговую дефолтную модель
 
 	// --- Парсинг ключевых слов ---
 	var srachKeywordsList []string
@@ -235,12 +283,27 @@ func Load() (*Config, error) {
 		log.Printf("Интервал саммари не может быть отрицательным, используем 2")
 		summaryIntervalHours = 2
 	}
+	// Парсинг новой переменной - температуры
+	defaultTemp, err := strconv.ParseFloat(defaultTempStr, 64)
+	if err != nil {
+		log.Printf("Ошибка парсинга DEFAULT_TEMPERATURE: %v, используем 0.7", err)
+		defaultTemp = 0.7
+	} else if defaultTemp < 0.0 || defaultTemp > 2.0 {
+		log.Printf("DEFAULT_TEMPERATURE (%f) вне диапазона [0.0, 2.0], используем 0.7", defaultTemp)
+		defaultTemp = 0.7
+	}
 
 	debug := debugStr == "true" || debugStr == "1" || debugStr == "yes"
 
 	cfg := Config{
-		TelegramToken:              telegramToken,
-		LLMProvider:                llmProvider,
+		TelegramToken: telegramToken,
+		LLMProvider:   llmProvider,
+		// --- Новые поля ---
+		DefaultConversationStyle: defaultConvStyle,
+		DefaultTemperature:       defaultTemp,
+		DefaultModel:             defaultModel,
+		DefaultSafetyThreshold:   defaultSafety,
+		// --- Конец новых полей ---
 		GeminiAPIKey:               geminiAPIKey,
 		GeminiModelName:            geminiModelName,
 		DeepSeekAPIKey:             deepSeekAPIKey,
@@ -268,18 +331,21 @@ func Load() (*Config, error) {
 		ContextWindow:              contextWindow,
 		Debug:                      debug,
 		// Заполняем новые поля для БД с префиксом Postgresql
-		PostgresqlHost:                dbHost,
-		PostgresqlPort:                dbPort,
-		PostgresqlUser:                dbUser,
-		PostgresqlPassword:            dbPassword,
-		PostgresqlDbname:              dbName,
-		MongoDbURI:                    getEnvOrDefault("MONGODB_URI", ""),
-		MongoDbName:                   getEnvOrDefault("MONGODB_DBNAME", "rofloslav_history"),
-		MongoDbMessagesCollection:     getEnvOrDefault("MONGODB_MESSAGES_COLLECTION", "chat_messages"),
-		MongoDbUserProfilesCollection: getEnvOrDefault("MONGODB_USER_PROFILES_COLLECTION", "user_profiles"),
-		SrachAnalysisEnabled:          srachEnabledStr == "true" || srachEnabledStr == "1" || srachEnabledStr == "yes",
-		WelcomePrompt:                 welcomePrompt,     // Сохраняем приветственный промпт
-		VoiceFormatPrompt:             voiceFormatPrompt, // Сохраняем промпт форматирования голоса
+		PostgresqlHost:     dbHost,
+		PostgresqlPort:     dbPort,
+		PostgresqlUser:     dbUser,
+		PostgresqlPassword: dbPassword,
+		PostgresqlDbname:   dbName,
+		// Заполняем поля MongoDB
+		MongoDbURI:                       mongoURI,
+		MongoDbName:                      mongoDbName,
+		MongoDbMessagesCollection:        mongoMessagesCollection,
+		MongoDbUserProfilesCollection:    mongoUserProfilesCollection,
+		MongoDbSettingsCollection:        mongoSettingsCollection, // Новое поле
+		SrachAnalysisEnabled:             srachEnabledStr == "true" || srachEnabledStr == "1" || srachEnabledStr == "yes",
+		WelcomePrompt:                    welcomePrompt,
+		VoiceFormatPrompt:                voiceFormatPrompt,
+		VoiceTranscriptionEnabledDefault: voiceTranscriptionEnabledDefaultStr == "true" || voiceTranscriptionEnabledDefaultStr == "1" || voiceTranscriptionEnabledDefaultStr == "yes",
 	}
 
 	// Валидация и установка StorageType
@@ -291,51 +357,52 @@ func Load() (*Config, error) {
 	case StorageTypeMongo:
 		cfg.StorageType = StorageTypeMongo
 	default:
-		log.Printf("Предупреждение: Неизвестный STORAGE_TYPE '%s'. Используется PostgreSQL по умолчанию.", storageTypeStr)
-		cfg.StorageType = StorageTypePostgres // Устанавливаем значение по умолчанию
+		log.Printf("Предупреждение: Неизвестный STORAGE_TYPE '%s'. Используется MongoDB по умолчанию.", storageTypeStr)
+		cfg.StorageType = StorageTypeMongo // Устанавливаем значение по умолчанию
 	}
 
-	// Валидация LLM провайдера
-	llmProviderStr = strings.ToLower(string(cfg.LLMProvider)) // Преобразуем к строке для switch
-	switch LLMProvider(llmProviderStr) {                      // Сравниваем как LLMProvider
+	// Валидация LLM провайдера и ключей
+	// llmProviderStr = strings.ToLower(string(cfg.LLMProvider)) // Преобразуем к строке для switch
+	// Используем уже определенную переменную llmProvider
+	switch cfg.LLMProvider {
 	case ProviderGemini:
-		cfg.LLMProvider = ProviderGemini
+		// cfg.LLMProvider = ProviderGemini // Уже установлено
 		if cfg.GeminiAPIKey == "" {
 			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_API_KEY не установлен")
 		}
+		// Установка DefaultModel уже произошла выше, если он был пуст
 	case ProviderDeepSeek:
-		cfg.LLMProvider = ProviderDeepSeek
+		// cfg.LLMProvider = ProviderDeepSeek // Уже установлено
 		if cfg.DeepSeekAPIKey == "" {
 			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
 		}
-	default:
-		log.Printf("Предупреждение: Неизвестный LLM_PROVIDER '%s'. Используется Gemini по умолчанию.", llmProviderStr)
-		cfg.LLMProvider = ProviderGemini // Устанавливаем значение по умолчанию
-		if cfg.GeminiAPIKey == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: Используется Gemini по умолчанию, но GEMINI_API_KEY не установлен")
-		}
+		// Установка DefaultModel уже произошла выше, если он был пуст
+	default: // Этот кейс не должен достигаться из-за валидации выше, но на всякий случай
+		log.Printf("[Config Load CRITICAL] Неожиданное значение LLMProvider '%s'.", cfg.LLMProvider)
+		// Возвращаем ошибку, т.к. состояние неопределенное
+		return nil, fmt.Errorf("неожиданная ошибка конфигурации LLM провайдера")
 	}
 
 	// Валидация интервалов
 	if dailyTakeTime < 0 || dailyTakeTime > 23 {
 		log.Printf("Интервал для темы дня должен быть в диапазоне 0-23, используем 19")
-		dailyTakeTime = 19
+		cfg.DailyTakeTime = 19 // Обновляем значение в cfg
 	}
 	if minMsg < 1 || minMsg > 100 {
 		log.Printf("Минимальное количество сообщений должно быть в диапазоне 1-100, используем 10")
-		minMsg = 10
+		cfg.MinMessages = 10 // Обновляем значение в cfg
 	}
 	if maxMsg < 1 || maxMsg > 100 {
 		log.Printf("Максимальное количество сообщений должно быть в диапазоне 1-100, используем 30")
-		maxMsg = 30
+		cfg.MaxMessages = 30 // Обновляем значение в cfg
 	}
-	if contextWindow < 1 || contextWindow > 1000 {
-		log.Printf("Контекстное окно должно быть в диапазоне 1-1000, используем 1000")
-		contextWindow = 1000
+	if contextWindow < 1 { // Убираем верхний предел для окна контекста, т.к. Gemini может больше
+		log.Printf("Контекстное окно должно быть > 0, используем 1000")
+		cfg.ContextWindow = 1000 // Обновляем значение в cfg
 	}
 	if summaryIntervalHours < 0 || summaryIntervalHours > 24 {
 		log.Printf("Интервал авто-саммари должен быть в диапазоне 0-24, используем 2")
-		summaryIntervalHours = 2
+		cfg.SummaryIntervalHours = 2 // Обновляем значение в cfg
 	}
 
 	// Валидация настроек хранилища
@@ -356,6 +423,9 @@ func Load() (*Config, error) {
 		}
 		if cfg.MongoDbUserProfilesCollection == "" {
 			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_USER_PROFILES_COLLECTION не установлен")
+		}
+		if cfg.MongoDbSettingsCollection == "" { // Проверяем новую коллекцию
+			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_SETTINGS_COLLECTION не установлен")
 		}
 	}
 
@@ -390,6 +460,12 @@ func logLoadedConfig(cfg *Config) {
 	log.Printf("  Direct Prompt: %s...", truncateStringEnd(cfg.DirectPrompt, 80))
 	log.Printf("  Daily Take Prompt: %s...", truncateStringEnd(cfg.DailyTakePrompt, 80))
 	log.Printf("  Summary Prompt: %s...", truncateStringEnd(cfg.SummaryPrompt, 80))
+	// --- Логирование новых дефолтных настроек ---
+	log.Printf("  Default Conversation Style: %s", cfg.DefaultConversationStyle)
+	log.Printf("  Default Temperature: %.2f", cfg.DefaultTemperature)
+	log.Printf("  Default Model: %s", cfg.DefaultModel)
+	log.Printf("  Default Safety Threshold: %s", cfg.DefaultSafetyThreshold)
+	// --- Конец логирования новых дефолтных настроек ---
 
 	switch cfg.LLMProvider {
 	case ProviderGemini:
@@ -420,6 +496,8 @@ func logLoadedConfig(cfg *Config) {
 	log.Printf("Context Window: %d", cfg.ContextWindow)
 	log.Printf("Debug Mode: %t", cfg.Debug)
 	log.Printf("Storage Type: %s", cfg.StorageType)
+	log.Printf(" - Voice Format Prompt: %s", truncateStringEnd(cfg.VoiceFormatPrompt, 100))
+	log.Printf(" - Voice Transcription Default: %t", cfg.VoiceTranscriptionEnabledDefault)
 
 	switch cfg.StorageType {
 	case StorageTypePostgres:
@@ -433,9 +511,11 @@ func logLoadedConfig(cfg *Config) {
 		log.Printf("  MongoDB DB Name: %s", cfg.MongoDbName)
 		log.Printf("  MongoDB Messages Collection: %s", cfg.MongoDbMessagesCollection)
 		log.Printf("  MongoDB User Profiles Collection: %s", cfg.MongoDbUserProfilesCollection)
+		log.Printf("  MongoDB Settings Collection: %s", cfg.MongoDbSettingsCollection) // Логируем новую коллекцию
 	case StorageTypeFile:
 		log.Printf("  File Storage Path: /data/chat_*.json")
 	}
+	log.Printf("Admin Usernames: %v", cfg.AdminUsernames) // Логируем администраторов
 	log.Println("---------------------------------")
 }
 
@@ -445,11 +525,11 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return value
 	}
 	if defaultValue != "" { // Логируем только если значение не пустое
-		// Уменьшил уровень детализации для значений по умолчанию БД
-		if !strings.HasPrefix(key, "POSTGRESQL_") || key == "POSTGRESQL_PORT" {
+		// Уменьшил уровень детализации для значений по умолчанию БД и секретов
+		if !strings.HasPrefix(key, "POSTGRESQL_") && !strings.HasPrefix(key, "MONGODB_") && key != "GEMINI_API_KEY" && key != "DEEPSEEK_API_KEY" {
 			log.Printf("Переменная окружения %s не установлена, используется значение по умолчанию: %s", key, defaultValue)
-		} else if key == "POSTGRESQL_PASSWORD" {
-			log.Printf("Переменная окружения %s не установлена.", key) // Не логируем пароль по умолчанию
+		} else if key == "POSTGRESQL_PASSWORD" || key == "GEMINI_API_KEY" || key == "DEEPSEEK_API_KEY" || key == "MONGODB_URI" {
+			log.Printf("Переменная окружения %s не установлена.", key) // Не логируем секретные значения по умолчанию
 		} else {
 			// Не логируем хост, юзера, имя БД если они пустые по умолчанию
 		}
@@ -480,10 +560,95 @@ func maskSecret(s string) string {
 	return "****"
 }
 
-// maskSecretURI маскирует строку секретного URI
-func maskSecretURI(s string) string {
-	if len(s) > 4 {
-		return "****" + s[len(s)-4:]
+// maskSecretURI маскирует строку секретного URI, скрывая пароль и хост
+func maskSecretURI(uri string) string {
+	// Простой вариант: если строка содержит "@", скрыть часть до "@"
+	if idx := strings.Index(uri, "@"); idx != -1 {
+		if startIdx := strings.Index(uri, "://"); startIdx != -1 {
+			return uri[:startIdx+3] + "****" + uri[idx:]
+		}
 	}
-	return "****"
+	// Если "@" нет, но строка длинная, скрыть часть
+	if len(uri) > 15 {
+		return uri[:8] + "****" + uri[len(uri)-4:]
+	}
+	// Иначе вернуть как есть или просто "****"
+	if len(uri) > 0 {
+		return "****"
+	}
+	return ""
+}
+
+// ValidateConfig проверяет корректность загруженной конфигурации
+func ValidateConfig(cfg *Config) error {
+	// Валидация LLM Provider и ключей
+	switch cfg.LLMProvider {
+	case ProviderGemini:
+		if cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_API_KEY не установлен")
+		}
+	case ProviderDeepSeek:
+		if cfg.DeepSeekAPIKey == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
+		}
+	default:
+		return fmt.Errorf("ошибка конфигурации: неизвестный LLM_PROVIDER '%s'", cfg.LLMProvider)
+	}
+
+	// Валидация интервалов
+	if cfg.DailyTakeTime < 0 || cfg.DailyTakeTime > 23 {
+		return fmt.Errorf("ошибка конфигурации: DAILY_TAKE_TIME (%d) должен быть в диапазоне 0-23", cfg.DailyTakeTime)
+	}
+	if cfg.MinMessages < 1 || cfg.MinMessages > cfg.MaxMessages {
+		return fmt.Errorf("ошибка конфигурации: MIN_MESSAGES (%d) должен быть >= 1 и <= MAX_MESSAGES (%d)", cfg.MinMessages, cfg.MaxMessages)
+	}
+	if cfg.MaxMessages < 1 {
+		return fmt.Errorf("ошибка конфигурации: MAX_MESSAGES (%d) должен быть >= 1", cfg.MaxMessages)
+	}
+	if cfg.ContextWindow < 1 {
+		return fmt.Errorf("ошибка конфигурации: CONTEXT_WINDOW (%d) должен быть >= 1", cfg.ContextWindow)
+	}
+	if cfg.SummaryIntervalHours < 0 || cfg.SummaryIntervalHours > 24 {
+		return fmt.Errorf("ошибка конфигурации: SUMMARY_INTERVAL_HOURS (%d) должен быть в диапазоне 0-24", cfg.SummaryIntervalHours)
+	}
+
+	// Валидация настроек хранилища
+	switch cfg.StorageType {
+	case StorageTypeFile:
+		// Дополнительных проверок для файла пока нет
+	case StorageTypePostgres:
+		if cfg.PostgresqlHost == "" || cfg.PostgresqlUser == "" || cfg.PostgresqlDbname == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='postgres', но не все POSTGRESQL_* переменные установлены (HOST, USER, DBNAME)")
+		}
+	case StorageTypeMongo:
+		if cfg.MongoDbURI == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_URI не установлен")
+		}
+		if cfg.MongoDbName == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_DBNAME не установлен")
+		}
+		if cfg.MongoDbMessagesCollection == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_MESSAGES_COLLECTION не установлен")
+		}
+		if cfg.MongoDbUserProfilesCollection == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_USER_PROFILES_COLLECTION не установлен")
+		}
+		if cfg.MongoDbSettingsCollection == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_SETTINGS_COLLECTION не установлен")
+		}
+	default:
+		return fmt.Errorf("ошибка конфигурации: неизвестный STORAGE_TYPE '%s'", cfg.StorageType)
+	}
+
+	// Валидация Администраторов
+	if len(cfg.AdminUsernames) == 0 {
+		return fmt.Errorf("ошибка конфигурации: список ADMIN_USERNAMES не должен быть пустым")
+	}
+
+	// Валидация температуры
+	if cfg.DefaultTemperature < 0.0 || cfg.DefaultTemperature > 2.0 {
+		return fmt.Errorf("ошибка конфигурации: DEFAULT_TEMPERATURE (%.2f) должен быть в диапазоне [0.0, 2.0]", cfg.DefaultTemperature)
+	}
+
+	return nil
 }
