@@ -104,6 +104,20 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		}
 		log.Printf("[DEBUG][VoiceHandler] Chat %d: Голосовое сообщение ID %d обработано. Текст: %s...", chatID, originalMessage.MessageID, truncateString(formattedText, 50))
 
+		// --- ОТПРАВКА РАСПОЗНАННОГО ТЕКСТА ---
+		// Отправляем распознанный текст как ответ на оригинальное голосовое сообщение
+		if formattedText != "" { // Убедимся, что текст не пустой
+			// Форматируем текст ответа
+			finalReplyText := fmt.Sprintf("🎤 Перевожу голосовуху: [_%s_]", formattedText)
+			replyMsg := tgbotapi.NewMessage(chatID, finalReplyText)
+			replyMsg.ReplyToMessageID = message.MessageID // Устанавливаем ReplyTo
+			replyMsg.ParseMode = "Markdown"               // Устанавливаем режим Markdown для курсива
+			_, replyErr := b.api.Send(replyMsg)
+			if replyErr != nil {
+				log.Printf("[ERROR][VoiceHandler] Чат %d: Ошибка отправки транскрибированного текста: %v", chatID, replyErr)
+			}
+		} // --- КОНЕЦ ОТПРАВКИ ---
+
 	} else {
 		// Если это не голосовое, используем оригинальное сообщение
 		textMessage = originalMessage

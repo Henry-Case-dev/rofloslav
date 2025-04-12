@@ -116,6 +116,43 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
 		return
 
+	// Переключение транскрипции голоса
+	case "toggle_voice_transcription":
+		log.Printf("[DEBUG][Callback] Chat %d: Получен коллбэк toggle_voice_transcription", chatID)
+		// 1. Получаем текущие настройки из хранилища
+		dbSettings, err := b.storage.GetChatSettings(chatID)
+		if err != nil {
+			log.Printf("[ERROR][Callback] Chat %d: Ошибка получения настроек из DB для toggle_voice_transcription: %v", chatID, err)
+			b.answerCallback(callback.ID, "Ошибка получения настроек")
+			return
+		}
+
+		// 2. Определяем текущее состояние (учитывая nil и дефолт)
+		currentState := b.config.VoiceTranscriptionEnabledDefault // Значение по умолчанию
+		if dbSettings.VoiceTranscriptionEnabled != nil {          // Если значение не nil, используем его
+			currentState = *dbSettings.VoiceTranscriptionEnabled
+		}
+		log.Printf("[DEBUG][Callback] Chat %d: Текущее состояние VoiceTranscriptionEnabled: %t", chatID, currentState)
+
+		// 3. Переключаем состояние
+		newState := !currentState
+		dbSettings.VoiceTranscriptionEnabled = &newState // Обновляем указатель в настройках
+		log.Printf("[DEBUG][Callback] Chat %d: Новое состояние VoiceTranscriptionEnabled: %t", chatID, newState)
+
+		// 4. Сохраняем обновленные настройки
+		err = b.storage.SetChatSettings(dbSettings)
+		if err != nil {
+			log.Printf("[ERROR][Callback] Chat %d: Ошибка сохранения настроек в DB для toggle_voice_transcription: %v", chatID, err)
+			b.answerCallback(callback.ID, "Ошибка сохранения настроек")
+			return
+		}
+
+		// 5. Отвечаем и обновляем клавиатуру
+		statusText := getEnabledStatusText(newState)
+		b.answerCallback(callback.ID, fmt.Sprintf("Транскрипция голоса: %s", statusText))
+		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
+		return
+
 	// --- Восстановленные/Добавленные обработчики кнопок настроек ---
 	case "toggle_active": // Вкл/Выкл бота (оставляем логику на случай, если кнопка вернется, но из меню уберем)
 		b.settingsMutex.Lock()

@@ -2,34 +2,37 @@ package bot
 
 import (
 	"fmt"
+	"log"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// ChatSettings содержит настройки для каждого чата
+// ChatSettings содержит настройки для каждого чата (в памяти)
 // Используем оригинальные имена полей для совместимости с bot.go
 type ChatSettings struct {
-	Active               bool
-	CustomPrompt         string
-	MinMessages          int
-	MaxMessages          int
-	MessageCount         int
-	LastMessageID        int
-	DailyTakeTime        int
-	PendingSetting       string
-	SummaryIntervalHours int
-	LastAutoSummaryTime  time.Time
+	Active bool
+	// CustomPrompt string // Пока не используется
+	MinMessages          int       // Минимальное количество сообщений (из config)
+	MaxMessages          int       // Максимальное количество сообщений (из config)
+	MessageCount         int       // Текущий счетчик сообщений
+	LastMessageID        int       // ID последнего сообщения (для определения таргета)
+	DailyTakeTime        int       // Время для "темы дня" (из config)
+	PendingSetting       string    // Какую настройку ожидаем ввести
+	SummaryIntervalHours int       // Интервал авто-саммари (из config)
+	LastAutoSummaryTime  time.Time // Время последнего авто-саммари
 
-	// New fields for Srach Analysis
-	SrachAnalysisEnabled bool      `json:"srach_analysis_enabled"`  // Включен ли анализ срачей
+	// Поля, связанные с анализом срачей (хранятся в памяти)
+	SrachAnalysisEnabled bool      `json:"srach_analysis_enabled"`  // Включен ли анализ срачей (это поле теперь в storage.ChatSettings)
 	SrachState           string    `json:"srach_state"`             // Текущее состояние срача ("none", "detected", "analyzing")
 	SrachStartTime       time.Time `json:"srach_start_time"`        // Время начала обнаруженного срача
 	SrachMessages        []string  `json:"srach_messages"`          // Сообщения, собранные во время срача для анализа
 	LastSrachTriggerTime time.Time `json:"last_srach_trigger_time"` // Время последнего триггерного сообщения для таймера завершения
 	SrachLlmCheckCounter int       `json:"srach_llm_check_counter"` // Счетчик сообщений для LLM проверки срача
 
-	// IDs for deletable messages
+	// IDs for deletable messages (в памяти)
 	LastMenuMessageID     int `json:"last_menu_message_id,omitempty"`     // ID последнего сообщения с главным меню
 	LastSettingsMessageID int `json:"last_settings_message_id,omitempty"` // ID последнего сообщения с меню настроек
 	LastInfoMessageID     int `json:"last_info_message_id,omitempty"`     // ID последнего информационного сообщения (запроса ввода)
@@ -44,7 +47,6 @@ func formatSummaryInterval(intervalHours int) string {
 }
 
 // formatEnabled форматирует текст и callback кнопки в зависимости от статуса (включено/выключено)
-// Используем IsEnabled для совместимости с getSettingsKeyboard ниже
 func formatEnabled(textEnabled, textDisabled string, isEnabled bool, callbackEnabled, callbackDisabled string) (string, string) {
 	if isEnabled {
 		return fmt.Sprintf("%s: Вкл ✅", textEnabled), callbackEnabled
@@ -61,49 +63,65 @@ func getEnabledStatusText(enabled bool) string {
 }
 
 // getSettingsKeyboard создает клавиатуру с текущими настройками чата
-// Используем актуальные имена полей из структуры ChatSettings выше
-func getSettingsKeyboard(settings *ChatSettings) tgbotapi.InlineKeyboardMarkup {
+// Принимает *storage.ChatSettings (из БД) и *config.Config для дефолтов
+func getSettingsKeyboard(dbSettings *storage.ChatSettings, cfg *config.Config) tgbotapi.InlineKeyboardMarkup {
 	rows := [][]tgbotapi.InlineKeyboardButton{}
 
-	// 1. Статус бота (Вкл/Выкл) - Используем поле Active
-	// УБИРАЕМ ЭТУ КНОПКУ ИЗ НАСТРОЕК
-	/*
-		statusText, statusCallback := formatEnabled("Бот", "Бот", settings.Active, "toggle_active", "toggle_active")
-		statusRow := []tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData(statusText, statusCallback),
-		}
-		rows = append(rows, statusRow)
-	*/
+	// Если dbSettings nil (например, ошибка загрузки), создаем пустой, чтобы не было паники
+	if dbSettings == nil {
+		dbSettings = &storage.ChatSettings{}
+		log.Println("[WARN][getSettingsKeyboard] dbSettings был nil, используются пустые значения.")
+	}
+	// Если cfg nil, тоже создаем пустой (хотя это маловероятно)
+	if cfg == nil {
+		cfg = &config.Config{}
+		log.Println("[WARN][getSettingsKeyboard] cfg был nil, используются пустые значения.")
+	}
 
-	// 2. Интервал сообщений - Используем MinMessages и MaxMessages
-	intervalText := fmt.Sprintf("Интервал: %d-%d сообщ.", settings.MinMessages, settings.MaxMessages)
+	// 1. Интервал сообщений - Глобальная настройка из cfg
+	intervalText := fmt.Sprintf("Интервал: %d-%d сообщ.", cfg.MinMessages, cfg.MaxMessages)
 	intervalRow := []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData(intervalText, "change_interval"),
+		tgbotapi.NewInlineKeyboardButtonData(intervalText, "change_interval"), // TODO: Убедиться, что это действительно глобальная настройка
 	}
 	rows = append(rows, intervalRow)
 
-	// 3. Время темы дня
-	dailyTakeText := fmt.Sprintf("Тема дня: %02d:00", settings.DailyTakeTime)
+	// 2. Время темы дня - Глобальная настройка из cfg
+	dailyTakeText := fmt.Sprintf("Тема дня: %02d:00", cfg.DailyTakeTime)
 	dailyTakeRow := []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData(dailyTakeText, "change_daily_time"),
+		tgbotapi.NewInlineKeyboardButtonData(dailyTakeText, "change_daily_time"), // TODO: Убедиться, что это действительно глобальная настройка
 	}
 	rows = append(rows, dailyTakeRow)
 
-	// 4. Интервал авто-саммари
-	summaryIntervalText := fmt.Sprintf("Авто-саммари: %s", formatSummaryInterval(settings.SummaryIntervalHours))
+	// 3. Интервал авто-саммари - Глобальная настройка из cfg
+	summaryIntervalText := fmt.Sprintf("Авто-саммари: %s", formatSummaryInterval(cfg.SummaryIntervalHours))
 	summaryIntervalRow := []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData(summaryIntervalText, "change_summary_interval"),
+		tgbotapi.NewInlineKeyboardButtonData(summaryIntervalText, "change_summary_interval"), // TODO: Убедиться, что это действительно глобальная настройка
 	}
 	rows = append(rows, summaryIntervalRow)
 
-	// 5. Анализ срачей (Вкл/Выкл)
-	srachText, srachCallback := formatEnabled("Анализ срачей", "Анализ срачей", settings.SrachAnalysisEnabled, "toggle_srach_analysis", "toggle_srach_analysis")
+	// 4. Анализ срачей (Вкл/Выкл) - Настройка чата из dbSettings (пока заглушка)
+	srachEnabled := false // ЗАГЛУШКА
+	// srachEnabled := cfg.SrachAnalysisEnabled // ЗАГЛУШКА, НУЖНО БРАТЬ ИЗ dbSettings
+	// TODO: Реализовать получение SrachAnalysisEnabled из dbSettings, когда оно там появится.
+	// if dbSettings.SrachAnalysisEnabled != nil { srachEnabled = *dbSettings.SrachAnalysisEnabled }
+	srachText, srachCallback := formatEnabled("Анализ срачей", "Анализ срачей", srachEnabled, "toggle_srach_analysis", "toggle_srach_analysis")
 	srachRow := []tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData(srachText, srachCallback),
 	}
 	rows = append(rows, srachRow)
 
-	// Добавляем кнопку "Назад"
+	// 5. Транскрипция голоса (Вкл/Выкл) - Настройка чата из dbSettings
+	voiceEnabled := cfg.VoiceTranscriptionEnabledDefault // Дефолтное значение из конфига
+	if dbSettings.VoiceTranscriptionEnabled != nil {     // Если в БД есть значение (не nil)
+		voiceEnabled = *dbSettings.VoiceTranscriptionEnabled // Используем его
+	}
+	voiceText, voiceCallback := formatEnabled("🎤 Распознавание голоса", "🎤 Распознавание голоса", voiceEnabled, "toggle_voice_transcription", "toggle_voice_transcription")
+	voiceRow := []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData(voiceText, voiceCallback),
+	}
+	rows = append(rows, voiceRow)
+
+	// 6. Добавляем кнопку "Назад"
 	backRow := []tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "back_to_main"),
 	}
