@@ -5,6 +5,9 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // loadChatHistory загружает историю сообщений для указанного чата
@@ -13,57 +16,101 @@ func (b *Bot) loadChatHistory(chatID int64) {
 		log.Printf("[DEBUG][Load History] Чат %d: Начинаю загрузку истории.", chatID)
 	}
 
+	// 1. Отправляем ПЕРВОЕ сообщение и сохраняем его ID
 	initialStatus := b.storage.GetStatus(chatID) // Получаем статус ДО загрузки
-	b.sendReply(chatID, fmt.Sprintf("⏳ Загружаю историю чата...\nСтатус хранилища: %s", initialStatus))
-
-	// Загружаем историю из файла
-	history, err := b.storage.LoadChatHistory(chatID)
-	if err != nil {
-		// Логируем ошибку, но не останавливаемся, просто начинаем без истории
-		log.Printf("[ERROR][Load History] Чат %d: Ошибка загрузки истории: %v", chatID, err)
-		finalStatus := b.storage.GetStatus(chatID) // Статус ПОСЛЕ ошибки
-		b.sendReply(chatID, fmt.Sprintf("⚠️ Не удалось загрузить историю чата.\nСтатус хранилища: %s", finalStatus))
-		// Убедимся, что старая история в памяти очищена, если была ошибка загрузки
-		_ = b.storage.ClearChatHistory(chatID) // Используем существующий метод, игнорируем ошибку тут
-		return
+	initialMsgText := fmt.Sprintf("⏳ Загружаю историю чата...\nСтатус хранилища: %s", initialStatus)
+	initialMsg, errInit := b.sendReplyReturnMsg(chatID, initialMsgText)
+	var initialMsgID int
+	if errInit != nil {
+		log.Printf("[WARN][Load History] Чат %d: Не удалось отправить начальное сообщение: %v", chatID, errInit)
+	} else if initialMsg != nil {
+		initialMsgID = initialMsg.MessageID
 	}
 
+	// 2. Загружаем историю (специфично для FileStorage)
+	var history []*tgbotapi.Message
+	var loadErr error
+	if b.config.StorageType == config.StorageTypeFile {
+		history, loadErr = b.storage.LoadChatHistory(chatID)
+		if loadErr != nil {
+			// Логируем ошибку, но не останавливаемся, просто начинаем без истории
+			log.Printf("[ERROR][Load History] Чат %d: Ошибка загрузки истории из файла: %v", chatID, loadErr)
+			finalStatus := b.storage.GetStatus(chatID) // Статус ПОСЛЕ ошибки
+			finalMsgText := fmt.Sprintf("⚠️ Не удалось загрузить историю чата из файла.\nСтатус хранилища: %s", finalStatus)
+			// Отправляем финальное сообщение и удаляем начальное
+			b.sendReplyAndDeleteInitial(chatID, finalMsgText, initialMsgID)
+			_ = b.storage.ClearChatHistory(chatID) // Очищаем память на всякий случай
+			return
+		}
+	}
+
+	// 3. Формируем итоговый текст сообщения
+	finalMsgText := ""
 	loadedCount := 0
-	messageText := ""
 
-	if history == nil { // LoadChatHistory теперь возвращает nil, nil если файла нет
-		if b.config.Debug {
-			log.Printf("[DEBUG][Load History] Чат %d: История не найдена или файл не существует.", chatID)
+	if b.config.StorageType == config.StorageTypeFile {
+		// Логика для FileStorage (как раньше)
+		if history == nil { // Файл не найден
+			if b.config.Debug {
+				log.Printf("[DEBUG][Load History] Чат %d: История не найдена или файл не существует.", chatID)
+			}
+			finalMsgText = "✅ История чата не найдена в файле."
+		} else if len(history) == 0 { // Файл пуст
+			if b.config.Debug {
+				log.Printf("[DEBUG][Load History] Чат %d: Загружена пустая история (файл был пуст или содержал []).", chatID)
+			}
+			finalMsgText = "✅ История чата в файле пуста."
+		} else { // История из файла загружена
+			loadCount := len(history)
+			if loadCount > b.config.ContextWindow {
+				log.Printf("[DEBUG][Load History] Чат %d: История из файла (%d) длиннее окна (%d), обрезаю.", chatID, loadCount, b.config.ContextWindow)
+				history = history[loadCount-b.config.ContextWindow:]
+				loadCount = len(history)
+			}
+			log.Printf("[DEBUG][Load History] Чат %d: Добавляю %d загруженных сообщений из файла в контекст.", chatID, loadCount)
+			b.storage.AddMessagesToContext(chatID, history)
+			loadedCount = loadCount
+			finalMsgText = fmt.Sprintf("✅ Контекст загружен из файла: %d сообщений.", loadedCount)
 		}
-		messageText = "✅ История чата не найдена."
-	} else if len(history) == 0 {
-		if b.config.Debug {
-			log.Printf("[DEBUG][Load History] Чат %d: Загружена пустая история (файл был пуст или содержал []).", chatID)
-		}
-		messageText = "✅ История чата пуста."
 	} else {
-		// Определяем, сколько сообщений загружать (берем последние N)
-		loadCount := len(history)
-		if loadCount > b.config.ContextWindow {
-			log.Printf("[DEBUG][Load History] Чат %d: История (%d) длиннее окна (%d), обрезаю.", chatID, loadCount, b.config.ContextWindow)
-			history = history[loadCount-b.config.ContextWindow:]
-			loadCount = len(history) // Обновляем количество после обрезки
-		}
-
-		// Добавляем сообщения в хранилище (в память)
-		log.Printf("[DEBUG][Load History] Чат %d: Добавляю %d загруженных сообщений в контекст.", chatID, loadCount)
-		b.storage.AddMessagesToContext(chatID, history) // Этот метод не должен вызывать автосохранение
-		loadedCount = loadCount
-		messageText = fmt.Sprintf("✅ Контекст загружен: %d сообщений.", loadedCount)
-
+		// Логика для MongoDB/PostgreSQL
+		// История всегда "найдена", если есть подключение.
+		// Просто выводим актуальный статус хранилища.
+		finalMsgText = "✅ Инициализация хранилища завершена."
+		// Загрузка последних N сообщений в память не требуется для БД,
+		// но можно запросить текущие GetMessages для логов
 		if b.config.Debug {
-			log.Printf("[DEBUG][Load History] Чат %d: Загружено и добавлено в контекст %d сообщений.", chatID, loadedCount)
+			currentMsgs := b.storage.GetMessages(chatID) // Запросим для лога
+			log.Printf("[DEBUG][Load History] Чат %d: Хранилище (%s) инициализировано. Текущий контекст (из GetMessages): %d сообщ.", chatID, b.config.StorageType, len(currentMsgs))
 		}
 	}
 
-	// Отправляем итоговое сообщение со статусом
-	finalStatus := b.storage.GetStatus(chatID) // Статус ПОСЛЕ загрузки
-	b.sendReply(chatID, fmt.Sprintf("%s\nСтатус хранилища: %s", messageText, finalStatus))
+	// 4. Отправляем итоговое сообщение со статусом и удаляем начальное
+	finalStatus := b.storage.GetStatus(chatID) // Статус ПОСЛЕ загрузки/инициализации
+	b.sendReplyAndDeleteInitial(chatID, fmt.Sprintf("%s\nСтатус хранилища: %s", finalMsgText, finalStatus), initialMsgID)
+}
+
+// sendReplyReturnMsg - вспомогательная функция для отправки сообщения и возврата его объекта
+func (b *Bot) sendReplyReturnMsg(chatID int64, text string) (*tgbotapi.Message, error) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown" // Можно убрать, если тут не нужен Markdown
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("Ошибка отправки сообщения в чат %d: %v", chatID, err)
+		return nil, err
+	}
+	return &sentMsg, nil
+}
+
+// sendReplyAndDeleteInitial - отправляет итоговое сообщение и удаляет исходное
+func (b *Bot) sendReplyAndDeleteInitial(chatID int64, finalMsgText string, initialMsgID int) {
+	// Отправляем итоговое сообщение
+	b.sendReply(chatID, finalMsgText) // sendReply уже существует
+
+	// Удаляем начальное сообщение, если его ID был сохранен
+	if initialMsgID != 0 {
+		b.deleteMessage(chatID, initialMsgID)
+	}
 }
 
 // scheduleHistorySaving запускает планировщик для периодического сохранения истории

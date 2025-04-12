@@ -108,10 +108,13 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		// Отправляем распознанный текст как ответ на оригинальное голосовое сообщение
 		if formattedText != "" { // Убедимся, что текст не пустой
 			// Форматируем текст ответа
-			finalReplyText := fmt.Sprintf("🎤 Перевожу голосовуху: [_%s_]", formattedText)
+			// Используем двойные подчеркивания для курсива в Telegram MarkdownV2
+			// Добавляем перенос строки после префикса и квадратные скобки вокруг текста
+			finalReplyText := fmt.Sprintf("🎤 Перевожу голосовуху:\n[__%s__]", formattedText)
 			replyMsg := tgbotapi.NewMessage(chatID, finalReplyText)
 			replyMsg.ReplyToMessageID = message.MessageID // Устанавливаем ReplyTo
-			replyMsg.ParseMode = "Markdown"               // Устанавливаем режим Markdown для курсива
+			// Указываем ParseMode как MarkdownV2 для поддержки двойных подчеркиваний
+			replyMsg.ParseMode = "MarkdownV2" // Используем MarkdownV2
 			_, replyErr := b.api.Send(replyMsg)
 			if replyErr != nil {
 				log.Printf("[ERROR][VoiceHandler] Чат %d: Ошибка отправки транскрибированного текста: %v", chatID, replyErr)
