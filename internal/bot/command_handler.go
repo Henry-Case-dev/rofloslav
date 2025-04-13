@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -155,6 +156,26 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 
 		log.Printf("[ADMIN CMD] Пользователь %s (%d) инициировал команду /profile_set в чате %d. Ожидание ввода данных.", username, userID, chatID)
 		// Выходим, основная логика будет в handleMessage при получении следующего сообщения
+
+	// --- Admin Command: /backfill_embeddings ---
+	case "backfill_embeddings":
+		if !isUserAdmin {
+			b.sendReply(chatID, "🚫 У вас нет прав для выполнения этой команды.")
+			return
+		}
+		if b.config.StorageType != config.StorageTypeMongo {
+			b.sendReply(chatID, "🚫 Команда доступна только при использовании MongoDB.")
+			return
+		}
+		if !b.config.LongTermMemoryEnabled {
+			b.sendReply(chatID, "🚫 Долгосрочная память (векторный поиск) выключена в настройках.")
+			return
+		}
+
+		log.Printf("[ADMIN CMD] Пользователь %s (%d) инициировал команду /backfill_embeddings в чате %d.", username, userID, chatID)
+		// Запускаем бэкфилл в отдельной горутине, чтобы не блокировать бота
+		go b.runBackfillEmbeddings(chatID)
+		b.sendReply(chatID, "⏳ Запускаю процесс заполнения векторных представлений для сообщений в этом чате. Это может занять много времени...")
 
 	default:
 		// Проверяем, не админская ли это команда, чтобы не писать "Неизвестная команда" админам

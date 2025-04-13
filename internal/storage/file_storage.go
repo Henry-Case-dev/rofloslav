@@ -224,3 +224,10 @@ func (fs *FileStorage) UpdateDirectLimitDuration(chatID int64, duration time.Dur
 	log.Printf("[WARN][FileStorage] UpdateDirectLimitDuration вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
 	return nil // FileStorage не хранит ChatSettings
 }
+
+// SearchRelevantMessages (Заглушка для FileStorage)
+// FileStorage не поддерживает векторный поиск.
+func (fs *FileStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
+	log.Printf("[WARN][FileStorage] SearchRelevantMessages вызван для chatID %d, но FileStorage не поддерживает векторный поиск. Возвращен пустой результат.", chatID)
+	return []*tgbotapi.Message{}, nil
+}

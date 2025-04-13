@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors" // Для проверки ошибок MongoDB
 	"fmt"
 	"log"
@@ -10,13 +11,13 @@ import (
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config" // Исправлен путь импорта конфига
+	"github.com/Henry-Case-dev/rofloslav/internal/llm"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 // Убедимся, что MongoStorage реализует интерфейс ChatHistoryStorage.
@@ -87,62 +88,54 @@ type MongoStorage struct {
 	settingsCollection     *mongo.Collection // Коллекция для настроек чатов
 	cfg                    *config.Config    // Добавлена ссылка на конфиг
 	debug                  bool              // Сохраняем флаг debug из конфига
+	llmClient              llm.LLMClient     // Клиент LLM для генерации эмбеддингов
 }
 
-// NewMongoStorage создает новое хранилище MongoDB.
-// Принимает *config.Config вместо contextWindow и debug.
-func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, cfg *config.Config) (*MongoStorage, error) {
-	if mongoURI == "" || dbName == "" || messagesCollectionName == "" || userProfilesCollectionName == "" {
-		return nil, fmt.Errorf("URI MongoDB, имя БД и имена коллекций (сообщения, профили) должны быть указаны")
+// NewMongoStorage создает новый экземпляр MongoStorage.
+// Принимает URI, имя БД, имена коллекций, конфиг и LLM клиент.
+func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, cfg *config.Config, llmClient llm.LLMClient) (*MongoStorage, error) {
+	if mongoURI == "" || dbName == "" || messagesCollectionName == "" || userProfilesCollectionName == "" || cfg.MongoDbSettingsCollection == "" {
+		return nil, fmt.Errorf("необходимо указать MongoDB URI, имя БД и имена всех коллекций (messages, userProfiles, settings)")
 	}
-	if cfg == nil {
-		return nil, fmt.Errorf("конфигурация (cfg) не должна быть nil")
+	if llmClient == nil {
+		return nil, fmt.Errorf("необходимо передать инициализированный LLM клиент в MongoStorage")
 	}
 
-	// Увеличиваем таймаут подключения
-	ctxConnect, cancelConnect := context.WithTimeout(context.Background(), 30*time.Second) // Было 10*time.Second
-	defer cancelConnect()
-
+	log.Println("Подключение к MongoDB...")
 	clientOptions := options.Client().ApplyURI(mongoURI)
-	client, err := mongo.Connect(ctxConnect, clientOptions)
+	client, err := mongo.Connect(context.Background(), clientOptions)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка подключения к MongoDB: %w", err)
 	}
 
-	// Проверяем соединение с увеличенным таймаутом
-	ctxPing, cancelPing := context.WithTimeout(context.Background(), 30*time.Second) // Было 10*time.Second
-	defer cancelPing()
-	err = client.Ping(ctxPing, readpref.Primary())
+	// Проверка подключения
+	err = client.Ping(context.Background(), nil)
 	if err != nil {
-		// Закрываем клиент, если пинг не прошел
-		_ = client.Disconnect(context.Background()) // Используем новый контекст для Disconnect
-		return nil, fmt.Errorf("ошибка проверки соединения с MongoDB (Ping): %w", err)
+		return nil, fmt.Errorf("ошибка пинга MongoDB: %w", err)
 	}
-
 	log.Println("Успешно подключено к MongoDB.")
 
-	database := client.Database(dbName)
-	messagesCollection := database.Collection(messagesCollectionName)
-	userProfilesCollection := database.Collection(userProfilesCollectionName)
-	settingsCollection := database.Collection(settingsCollectionName) // Инициализация коллекции настроек
+	db := client.Database(dbName)
+	messagesColl := db.Collection(messagesCollectionName)
+	userProfilesColl := db.Collection(userProfilesCollectionName)
+	settingsColl := db.Collection(cfg.MongoDbSettingsCollection)
 
 	ms := &MongoStorage{
 		client:                 client,
-		database:               database,
-		messagesCollection:     messagesCollection,
-		userProfilesCollection: userProfilesCollection, // Сохраняем коллекцию профилей
-		settingsCollection:     settingsCollection,     // Сохраняем коллекцию настроек
-		cfg:                    cfg,                    // Сохраняем конфиг
-		debug:                  cfg.Debug,              // Используем debug из конфига
+		database:               db,
+		messagesCollection:     messagesColl,
+		userProfilesCollection: userProfilesColl,
+		settingsCollection:     settingsColl,
+		cfg:                    cfg,
+		debug:                  cfg.Debug, // Берем из конфига
+		llmClient:              llmClient, // Сохраняем LLM клиент
 	}
 
-	// Создаем индексы для всех коллекций
+	// Создание индексов при инициализации
 	if err := ms.ensureIndexes(); err != nil {
-		ms.Close() // Закрываем соединение в случае ошибки
-		return nil, fmt.Errorf("ошибка создания индексов MongoDB: %w", err)
+		// Логируем ошибку, но не прерываем запуск, возможно, индексы уже есть
+		log.Printf("[WARN] Ошибка при создании индексов в MongoDB: %v", err)
 	}
-
-	log.Println("Хранилище MongoDB успешно инициализировано.")
 
 	return ms, nil
 }
@@ -1061,5 +1054,173 @@ func (ms *MongoStorage) UpdateDirectLimitDuration(chatID int64, duration time.Du
 	if ms.debug {
 		log.Printf("[DEBUG][UpdateDirectLimitDuration] Длительность лимита для чата %d установлена в %d минут.", chatID, durationMinutes)
 	}
+	return nil
+}
+
+// SearchRelevantMessages ищет сообщения, семантически близкие к queryText,
+// используя MongoDB Atlas Vector Search.
+func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
+	if ms.llmClient == nil {
+		return nil, fmt.Errorf("LLM клиент не инициализирован в MongoStorage для поиска эмбеддингов")
+	}
+	if ms.cfg.MongoVectorIndexName == "" {
+		return nil, fmt.Errorf("имя векторного индекса (MONGO_VECTOR_INDEX_NAME) не задано в конфигурации")
+	}
+	if queryText == "" {
+		return []*tgbotapi.Message{}, nil // Если запрос пустой, возвращаем пустой результат без ошибки
+	}
+
+	if ms.debug {
+		// Упрощаем лог, убирая truncateString
+		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Запрос поиска %d релевантных сообщений для текста, начинающегося с: '%s...'", chatID, k, queryText[:min(len(queryText), 50)])
+	}
+
+	// 1. Генерируем вектор для запроса
+	queryVector, err := ms.llmClient.EmbedContent(queryText)
+	if err != nil {
+		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка генерации эмбеддинга для запроса: %v", chatID, err)
+		return nil, fmt.Errorf("ошибка генерации эмбеддинга запроса: %w", err)
+	}
+	if len(queryVector) == 0 {
+		log.Printf("[WARN][Mongo Vector Search] Chat %d: Получен пустой эмбеддинг для запроса.", chatID)
+		return []*tgbotapi.Message{}, nil // Пустой эмбеддинг - нет результата
+	}
+
+	if ms.debug {
+		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Эмбеддинг запроса сгенерирован (размерность %d).", chatID, len(queryVector))
+	}
+
+	// 2. Формируем pipeline для $vectorSearch
+	// Используем официальную документацию: https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-stage/
+	pipeline := mongo.Pipeline{
+		{
+			{"$vectorSearch", bson.D{
+				{"index", ms.cfg.MongoVectorIndexName},
+				{"queryVector", queryVector},
+				{"path", "message_vector"},       // Поле, содержащее векторы в документах
+				{"numCandidates", int64(k * 10)}, // Искать среди большего числа кандидатов для точности (можно настроить)
+				{"limit", int64(k)},              // Вернуть только top K результатов
+				// Добавляем фильтр по chat_id, чтобы искать только в текущем чате
+				{"filter", bson.D{{"chat_id", chatID}}},
+			}},
+		},
+		// Опционально: добавляем $project для исключения поля message_vector из результата
+		// (чтобы не передавать большие векторы обратно)
+		{
+			{"$project", bson.D{
+				{"message_vector", 0}, // Исключаем поле message_vector
+				{"score", 0},          // Также исключаем поле score, если оно не нужно
+			}},
+		},
+	}
+
+	if ms.debug {
+		// Логируем pipeline (может быть полезно для отладки)
+		pipelineBytes, _ := json.MarshalIndent(pipeline, "", "  ")
+		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Pipeline:\n%s", chatID, string(pipelineBytes))
+	}
+
+	// 3. Выполняем агрегацию
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Увеличим таймаут для поиска
+	defer cancel()
+
+	cursor, err := ms.messagesCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка выполнения Aggregate: %v", chatID, err)
+		return nil, fmt.Errorf("ошибка выполнения векторного поиска: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	// 4. Декодируем результаты
+	var mongoResults []MongoMessage
+	if err = cursor.All(ctx, &mongoResults); err != nil {
+		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка декодирования результатов: %v", chatID, err)
+		return nil, fmt.Errorf("ошибка декодирования результатов поиска: %w", err)
+	}
+
+	if ms.debug {
+		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Найдено %d релевантных сообщений.", chatID, len(mongoResults))
+	}
+
+	// 5. Конвертируем в tgbotapi.Message
+	apiResults := make([]*tgbotapi.Message, 0, len(mongoResults))
+	for i := range mongoResults { // Используем индекс для взятия адреса
+		apiMsg := convertMongoToAPIMessage(&mongoResults[i])
+		if apiMsg != nil {
+			apiResults = append(apiResults, apiMsg)
+		}
+	}
+
+	return apiResults, nil
+}
+
+// --- Вспомогательные методы для бэкфилла эмбеддингов ---
+
+// GetTotalMessagesCount возвращает примерное общее количество сообщений в чате.
+func (ms *MongoStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
+	filter := bson.M{"chat_id": chatID}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	count, err := ms.messagesCollection.EstimatedDocumentCount(ctx, options.EstimatedDocumentCount().SetMaxTime(5*time.Second))
+	if err != nil {
+		// Попробуем CountDocuments как fallback (может быть медленнее)
+		count, err = ms.messagesCollection.CountDocuments(ctx, filter)
+		if err != nil {
+			return -1, fmt.Errorf("ошибка подсчета документов: %w", err)
+		}
+	}
+	return count, nil
+}
+
+// FindMessagesWithoutEmbedding ищет пакет сообщений в чате, у которых отсутствует поле message_vector.
+func (ms *MongoStorage) FindMessagesWithoutEmbedding(chatID int64, limit int) ([]MongoMessage, error) {
+	filter := bson.M{
+		"chat_id":        chatID,
+		"message_vector": bson.M{"$exists": false}, // Ищем документы, где поле отсутствует
+		"$or": []bson.M{ // И добавляем условие, что текст или подпись не пустые
+			{"text": bson.M{"$ne": ""}},
+			{"caption": bson.M{"$ne": ""}},
+		},
+	}
+	findOptions := options.Find().SetLimit(int64(limit)).SetSort(bson.D{{"date", 1}}) // Сортируем по дате (от старых к новым)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second) // Таймаут на поиск
+	defer cancel()
+
+	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка поиска сообщений без эмбеддинга: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var results []MongoMessage // Возвращаем MongoMessage напрямую
+	if err = cursor.All(ctx, &results); err != nil {
+		return nil, fmt.Errorf("ошибка декодирования сообщений без эмбеддинга: %w", err)
+	}
+
+	return results, nil
+}
+
+// UpdateMessageEmbedding обновляет поле message_vector для конкретного сообщения.
+func (ms *MongoStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
+	filter := bson.M{"chat_id": chatID, "message_id": messageID}
+	update := bson.M{"$set": bson.M{"message_vector": vector}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Короткий таймаут на обновление
+	defer cancel()
+
+	result, err := ms.messagesCollection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return fmt.Errorf("ошибка выполнения UpdateOne: %w", err)
+	}
+
+	if result.MatchedCount == 0 {
+		log.Printf("[WARN][UpdateEmbedding] Chat %d, Msg %d: Сообщение не найдено для обновления эмбеддинга.", chatID, messageID)
+		// Не возвращаем ошибку, просто логируем
+	} else if result.ModifiedCount == 0 {
+		log.Printf("[WARN][UpdateEmbedding] Chat %d, Msg %d: Эмбеддинг не был изменен (возможно, уже установлен?).", chatID, messageID)
+	}
+
 	return nil
 }

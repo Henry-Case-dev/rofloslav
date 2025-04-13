@@ -36,6 +36,7 @@ type UserProfile struct {
 }
 
 // ChatHistoryStorage определяет общий интерфейс для хранения истории сообщений и профилей пользователей.
+// Включает методы для работы с настройками чата и долгосрочной памятью.
 type ChatHistoryStorage interface {
 	// === Методы для истории сообщений ===
 	AddMessage(chatID int64, message *tgbotapi.Message)
@@ -75,6 +76,11 @@ type ChatHistoryStorage interface {
 
 	// GetStatus возвращает строку с текущим статусом хранилища (тип, подключение, кол-во сообщений и т.д.)
 	GetStatus(chatID int64) string
+
+	// === Методы для долгосрочной памяти ===
+	// SearchRelevantMessages ищет сообщения, семантически близкие к queryText, используя векторный поиск.
+	// Возвращает до k наиболее релевантных сообщений.
+	SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error)
 }
 
 // FileStorage реализует ChatHistoryStorage с использованием файлов.

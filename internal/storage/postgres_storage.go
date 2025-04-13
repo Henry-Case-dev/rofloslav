@@ -822,3 +822,10 @@ func (ps *PostgresStorage) UpdateDirectLimitDuration(chatID int64, duration time
 	durationMinutes := int(duration.Minutes()) // Сохраняем в минутах
 	return ps.updateSingleSetting(chatID, "direct_reply_limit_duration_minutes", int64(durationMinutes))
 }
+
+// SearchRelevantMessages (Заглушка для PostgresStorage)
+// PostgresStorage в текущей реализации не поддерживает векторный поиск.
+func (ps *PostgresStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
+	log.Printf("[WARN][PostgresStorage] SearchRelevantMessages вызван для chatID %d, но PostgresStorage не поддерживает векторный поиск. Возвращен пустой результат.", chatID)
+	return []*tgbotapi.Message{}, nil
+}

@@ -261,3 +261,9 @@ func truncateString(s string, maxLen int) string {
 func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, error) {
 	return "", fmt.Errorf("транскрибация аудио не поддерживается DeepSeek API")
 }
+
+// EmbedContent (Заглушка для DeepSeek)
+// DeepSeek API не предоставляет стандартного метода для генерации эмбеддингов.
+func (c *Client) EmbedContent(text string) ([]float32, error) {
+	return nil, fmt.Errorf("генерация эмбеддингов не поддерживается DeepSeek API")
+}

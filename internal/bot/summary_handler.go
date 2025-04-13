@@ -56,7 +56,8 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	summaryPrompt := b.config.SummaryPrompt
 
 	// --- Формирование контекста с профилями ---
-	contextText := formatHistoryWithProfiles(chatID, messages, b.storage, b.config.Debug, b.config.TimeZone)
+	// Передаем cfg и llmClient для возможного использования долгосрочной памяти при генерации саммари (хотя пока не используется)
+	contextText := formatHistoryWithProfiles(chatID, messages, b.storage, b.config, b.llm, b.config.Debug, b.config.TimeZone)
 	if contextText == "" {
 		log.Printf("[WARN][createAndSendSummary] Чат %d: Отформатированный контекст для саммари пуст.", chatID)
 		editText = "Не удалось подготовить данные для саммари (контекст пуст)."

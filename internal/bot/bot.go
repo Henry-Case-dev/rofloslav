@@ -56,7 +56,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	var llmClient llm.LLMClient
 	switch cfg.LLMProvider {
 	case config.ProviderGemini:
-		llmClient, err = gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.Debug)
+		llmClient, err = gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.GeminiEmbeddingModelName, cfg.Debug)
 	case config.ProviderDeepSeek:
 		llmClient, err = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekModelName, cfg.DeepSeekBaseURL, cfg.Debug)
 	default:
@@ -98,7 +98,8 @@ func New(cfg *config.Config) (*Bot, error) {
 			cfg.MongoDbName,
 			cfg.MongoDbMessagesCollection,
 			cfg.MongoDbUserProfilesCollection,
-			cfg, // Передаем весь конфиг
+			cfg,       // Передаем весь конфиг
+			llmClient, // Передаем LLM клиент
 		)
 		if initErr != nil {
 			log.Printf("[WARN] Ошибка инициализации MongoDB хранилища: %v. Переключение на файловое хранилище.", initErr)

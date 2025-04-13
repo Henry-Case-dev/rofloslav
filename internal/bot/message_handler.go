@@ -730,7 +730,8 @@ func (b *Bot) sendAIResponse(chatID int64) {
 	}
 
 	// --- Форматирование контекста с профилями ---
-	contextText := formatHistoryWithProfiles(chatID, history, b.storage, b.config.Debug, b.config.TimeZone)
+	// Передаем cfg и llmClient для работы долгосрочной памяти
+	contextText := formatHistoryWithProfiles(chatID, history, b.storage, b.config, b.llm, b.config.Debug, b.config.TimeZone)
 	if contextText == "" {
 		log.Printf("[WARN][sendAIResponse] Чат %d: Не удалось сформировать контекст для AI (возможно, нет сообщений или профилей).", chatID)
 		// Можно отправить сообщение об ошибке или просто ничего не делать
@@ -1071,4 +1072,32 @@ func (b *Bot) sendDirectLimitExceededReply(chatID int64, replyToMessageID int) {
 	} else {
 		go b.storage.AddMessage(chatID, &sentReply)
 	}
+}
+
+// escapeMarkdownV2 экранирует специальные символы для MarkdownV2
+// Копипаста из helpers.go
+var markdownV2Escaper = strings.NewReplacer(
+	"\\", "\\\\",
+	"_", "\\_",
+	"*", "\\*",
+	"[", "\\[",
+	"]", "\\]",
+	"(", "\\(",
+	")", "\\)",
+	"~", "\\~",
+	"`", "\\`",
+	">", "\\>",
+	"#", "\\#",
+	"+", "\\+",
+	"-", "\\-",
+	"=", "\\=",
+	"|", "\\|",
+	"{", "\\{",
+	"}", "\\}",
+	".", "\\.",
+	"!", "\\!",
+)
+
+func escapeMarkdownV2(text string) string {
+	return markdownV2Escaper.Replace(text)
 }

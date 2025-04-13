@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,13 +19,15 @@ var botUserID int64
 
 // Client для взаимодействия с Gemini API
 type Client struct {
-	genaiClient *genai.Client
-	modelName   string
-	debug       bool
+	genaiClient        *genai.Client
+	modelName          string
+	embeddingModelName string
+	debug              bool
 }
 
-// New создает нового клиента Gemini
-func New(apiKey, modelName string, debug bool) (*Client, error) {
+// New создает и инициализирует новый клиент Gemini.
+// Принимает API ключ, имя основной модели, имя модели для эмбеддингов и флаг отладки.
+func New(apiKey, modelName, embeddingModelName string, debug bool) (*Client, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("API ключ Gemini не предоставлен")
 	}
@@ -55,9 +58,10 @@ func New(apiKey, modelName string, debug bool) (*Client, error) {
 	log.Printf("Клиент Gemini инициализирован для модели: %s", modelName)
 
 	return &Client{
-		genaiClient: genaiClient,
-		modelName:   modelName,
-		debug:       debug,
+		genaiClient:        genaiClient,
+		modelName:          modelName,
+		embeddingModelName: embeddingModelName,
+		debug:              debug,
 	}, nil
 }
 
@@ -449,4 +453,47 @@ func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, err
 	}
 
 	return finalTranscript, nil
+}
+
+// EmbedContent генерирует векторное представление (эмбеддинг) для текста с использованием Gemini API.
+func (c *Client) EmbedContent(text string) ([]float32, error) {
+	ctx := context.Background()
+	em := c.genaiClient.EmbeddingModel(c.embeddingModelName) // Используем модель из конфига
+	if em == nil {
+		return nil, fmt.Errorf("модель эмбеддингов '%s' не найдена или не инициализирована", c.embeddingModelName)
+	}
+
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Embed Запрос: Модель %s, Текст: %s...", c.embeddingModelName, truncateString(text, 50))
+	}
+
+	res, err := em.EmbedContent(ctx, genai.Text(text))
+	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Embed Ошибка API: %v", err)
+		}
+		// Попытка извлечь более детальную ошибку из googleapi.Error
+		var gerr *googleapi.Error
+		if errors.As(err, &gerr) {
+			// Если ошибка связана с квотой (429 Too Many Requests)
+			if gerr.Code == 429 {
+				log.Printf("[WARN] Gemini Embed API: Достигнут лимит запросов (429 Too Many Requests) для модели %s.", c.embeddingModelName)
+				return nil, fmt.Errorf("ошибка API Gemini (лимит запросов): %w", err)
+			}
+		}
+		return nil, fmt.Errorf("ошибка API Gemini при генерации эмбеддинга: %w", err)
+	}
+
+	if res.Embedding == nil || len(res.Embedding.Values) == 0 {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Embed Ответ: Получен пустой эмбеддинг.")
+		}
+		return nil, fmt.Errorf("API Gemini вернул пустой эмбеддинг")
+	}
+
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Embed Ответ: Получен эмбеддинг размерности %d", len(res.Embedding.Values))
+	}
+
+	return res.Embedding.Values, nil
 }

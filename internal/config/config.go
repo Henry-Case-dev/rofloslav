@@ -105,6 +105,14 @@ type Config struct {
 	DirectReplyLimitPrompt          string
 	PromptEnterDirectLimitCount     string
 	PromptEnterDirectLimitDuration  string
+	// --- Настройки долгосрочной памяти ---
+	LongTermMemoryEnabled    bool   // Включить/выключить долгосрочную память
+	GeminiEmbeddingModelName string // Модель Gemini для создания эмбеддингов
+	MongoVectorIndexName     string // Имя векторного индекса в MongoDB Atlas
+	LongTermMemoryFetchK     int    // Сколько релевантных сообщений извлекать
+	// --- Настройки бэкфилла эмбеддингов ---
+	BackfillBatchSize         int           // Размер пакета для бэкфилла
+	BackfillBatchDelaySeconds time.Duration // Задержка между пакетами бэкфилла
 }
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
@@ -188,8 +196,8 @@ func Load() (*Config, error) {
 	directLimitCountStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_COUNT_DEFAULT", "2")
 	directLimitDurationStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT", "10")
 	directLimitPrompt := getEnvOrDefault("DIRECT_REPLY_LIMIT_PROMPT", "Хватит меня дергать.")
-	promptEnterDirectCount := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_COUNT", "Введи лимит обращений:")
-	promptEnterDirectDuration := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_DURATION", "Введи период лимита (мин):")
+	promptEnterDirectCount := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_COUNT", "Введите макс. кол-во обращений за период:")
+	promptEnterDirectDuration := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_DURATION", "Введите период лимита в минутах:")
 
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
@@ -336,7 +344,29 @@ func Load() (*Config, error) {
 		log.Printf("Ошибка парсинга DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT ('%s') или значение <= 0: %v, используем 10", directLimitDurationStr, err)
 		directLimitDurationMinutes = 10
 	}
-	directLimitDuration := time.Duration(directLimitDurationMinutes) * time.Minute
+	directReplyLimitDurationDefault := time.Duration(directLimitDurationMinutes) * time.Minute
+
+	// Загружаем настройки лимита прямых обращений
+	directReplyLimitEnabledDefault, _ := strconv.ParseBool(getEnvOrDefault("DIRECT_REPLY_LIMIT_ENABLED_DEFAULT", "true"))
+	directReplyLimitCountDefault, _ := strconv.Atoi(getEnvOrDefault("DIRECT_REPLY_LIMIT_COUNT_DEFAULT", "3"))
+	directReplyLimitPrompt := getEnvOrDefault("DIRECT_REPLY_LIMIT_PROMPT", "Слишком часто обращаешься, отдохни.")
+	promptEnterDirectLimitCount := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_COUNT", "Введите макс. кол-во обращений за период:")
+	promptEnterDirectLimitDuration := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_DURATION", "Введите период лимита в минутах:")
+
+	// Загружаем настройки долгосрочной памяти
+	longTermMemoryEnabledStr := getEnvOrDefault("LONG_TERM_MEMORY_ENABLED", "false")
+	longTermMemoryEnabled := longTermMemoryEnabledStr == "true" || longTermMemoryEnabledStr == "1" || longTermMemoryEnabledStr == "yes"
+	geminiEmbeddingModelName := getEnvOrDefault("GEMINI_EMBEDDING_MODEL_NAME", "embedding-001")
+	mongoVectorIndexName := getEnvOrDefault("MONGO_VECTOR_INDEX_NAME", "vector_index_messages")
+	longTermMemoryFetchKStr := getEnvOrDefault("LONG_TERM_MEMORY_FETCH_K", "3")
+	longTermMemoryFetchK, _ := strconv.Atoi(longTermMemoryFetchKStr)
+
+	// Загружаем настройки бэкфилла
+	backfillBatchSizeStr := getEnvOrDefault("BACKFILL_BATCH_SIZE", "50")
+	backfillBatchSize, _ := strconv.Atoi(backfillBatchSizeStr)
+	backfillDelaySecStr := getEnvOrDefault("BACKFILL_BATCH_DELAY_SECONDS", "65")
+	backfillDelaySec, _ := strconv.Atoi(backfillDelaySecStr)
+	backfillBatchDelaySeconds := time.Duration(backfillDelaySec) * time.Second
 
 	cfg := Config{
 		TelegramToken: telegramToken,
@@ -392,12 +422,20 @@ func Load() (*Config, error) {
 		VoiceFormatPrompt:                voiceFormatPrompt,
 		VoiceTranscriptionEnabledDefault: voiceTranscriptionEnabledDefaultStr == "true" || voiceTranscriptionEnabledDefaultStr == "1" || voiceTranscriptionEnabledDefaultStr == "yes",
 		// --- Настройки лимита прямых обращений (дефолтные) ---
-		DirectReplyLimitEnabledDefault:  directLimitEnabledStr == "true" || directLimitEnabledStr == "1" || directLimitEnabledStr == "yes",
-		DirectReplyLimitCountDefault:    directLimitCount,
-		DirectReplyLimitDurationDefault: directLimitDuration,
-		DirectReplyLimitPrompt:          directLimitPrompt,
-		PromptEnterDirectLimitCount:     promptEnterDirectCount,
-		PromptEnterDirectLimitDuration:  promptEnterDirectDuration,
+		DirectReplyLimitEnabledDefault:  directReplyLimitEnabledDefault,
+		DirectReplyLimitCountDefault:    directReplyLimitCountDefault,
+		DirectReplyLimitDurationDefault: directReplyLimitDurationDefault,
+		DirectReplyLimitPrompt:          directReplyLimitPrompt,
+		PromptEnterDirectLimitCount:     promptEnterDirectLimitCount,
+		PromptEnterDirectLimitDuration:  promptEnterDirectLimitDuration,
+		// --- Настройки долгосрочной памяти ---
+		LongTermMemoryEnabled:    longTermMemoryEnabled,
+		GeminiEmbeddingModelName: geminiEmbeddingModelName,
+		MongoVectorIndexName:     mongoVectorIndexName,
+		LongTermMemoryFetchK:     longTermMemoryFetchK,
+		// --- Настройки бэкфилла эмбеддингов ---
+		BackfillBatchSize:         backfillBatchSize,
+		BackfillBatchDelaySeconds: backfillBatchDelaySeconds,
 	}
 
 	// Валидация и установка StorageType
@@ -559,6 +597,10 @@ func logLoadedConfig(cfg *Config) {
 	log.Printf("  Direct Limit Prompt: %s...", truncateStringEnd(cfg.DirectReplyLimitPrompt, 80))
 	log.Printf("  Prompt Enter Direct Limit Count: %s...", truncateStringEnd(cfg.PromptEnterDirectLimitCount, 80))
 	log.Printf("  Prompt Enter Direct Limit Duration: %s...", truncateStringEnd(cfg.PromptEnterDirectLimitDuration, 80))
+	log.Printf("  Direct Reply Limit: Enabled=%t, Count=%d, Duration=%v", cfg.DirectReplyLimitEnabledDefault, cfg.DirectReplyLimitCountDefault, cfg.DirectReplyLimitDurationDefault)
+	log.Printf("  Long-Term Memory: Enabled=%t, EmbeddingModel=%s, VectorIndex=%s, FetchK=%d", cfg.LongTermMemoryEnabled, cfg.GeminiEmbeddingModelName, cfg.MongoVectorIndexName, cfg.LongTermMemoryFetchK)
+	log.Printf("  Backfill Settings: BatchSize=%d, BatchDelay=%v", cfg.BackfillBatchSize, cfg.BackfillBatchDelaySeconds)
+	log.Println("--- End Loaded Config ---")
 
 	switch cfg.StorageType {
 	case StorageTypePostgres:

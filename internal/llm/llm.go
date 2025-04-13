@@ -24,6 +24,9 @@ type LLMClient interface {
 	// Возвращает распознанный текст и ошибку.
 	TranscribeAudio(audioData []byte, mimeType string) (string, error)
 
+	// EmbedContent генерирует векторное представление (эмбеддинг) для заданного текста.
+	EmbedContent(text string) ([]float32, error)
+
 	// Close освобождает ресурсы, связанные с клиентом (если необходимо).
 	Close() error
 }
