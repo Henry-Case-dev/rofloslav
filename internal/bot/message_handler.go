@@ -451,35 +451,38 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			log.Printf("[WARN][MH] Chat %d: originalMessage is nil, cannot add to storage.", chatID)
 		}
 
-		// Обновляем профиль пользователя (используем From из textMessage/originalMessage)
-		if message.From != nil {
-			go func(chatID int64, user *tgbotapi.User) {
-				// Получаем текущий профиль (если есть) или создаем новый
-				profile, err := b.storage.GetUserProfile(chatID, user.ID)
-				if err != nil {
-					log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка получения профиля: %v", chatID, user.ID, err)
-					return // Не удалось получить, не обновляем
-				}
-				if profile == nil {
-					profile = &storage.UserProfile{
-						ChatID: chatID,
-						UserID: user.ID,
+		/*
+			// Обновляем профиль пользователя (используем From из textMessage/originalMessage)
+			// КОММЕНТИРУЕМ ЭТОТ БЛОК, ЧТОБЫ ЗАПРЕТИТЬ АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ ПРОФИЛЕЙ
+			if message.From != nil {
+				go func(chatID int64, user *tgbotapi.User) {
+					// Получаем текущий профиль (если есть) или создаем новый
+					profile, err := b.storage.GetUserProfile(chatID, user.ID)
+					if err != nil {
+						log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка получения профиля: %v", chatID, user.ID, err)
+						return // Не удалось получить, не обновляем
 					}
-				}
-				// Обновляем данные
-				profile.Username = user.UserName
-				profile.LastSeen = time.Unix(int64(message.Date), 0)
-				// Устанавливаем Alias из FirstName при первом создании, если Alias пуст
-				if profile.Alias == "" && user.FirstName != "" {
-					profile.Alias = user.FirstName
-				}
-				// Сохраняем
-				err = b.storage.SetUserProfile(profile)
-				if err != nil {
-					log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка сохранения профиля: %v", chatID, user.ID, err)
-				}
-			}(message.Chat.ID, message.From) // Передаем chatID и user в горутину
-		}
+					if profile == nil {
+						profile = &storage.UserProfile{
+							ChatID: chatID,
+							UserID: user.ID,
+						}
+					}
+					// Обновляем данные
+					profile.Username = user.UserName
+					profile.LastSeen = time.Unix(int64(message.Date), 0)
+					// Устанавливаем Alias из FirstName при первом создании, если Alias пуст
+					if profile.Alias == "" && user.FirstName != "" {
+						profile.Alias = user.FirstName
+					}
+					// Сохраняем
+					err = b.storage.SetUserProfile(profile)
+					if err != nil {
+						log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка сохранения профиля: %v", chatID, user.ID, err)
+					}
+				}(message.Chat.ID, message.From) // Передаем chatID и user в горутину
+			}
+		*/
 
 		// --- Srach Analysis ---
 		srachHandled := false  // Flag that message was handled by srach logic
@@ -662,57 +665,97 @@ func (b *Bot) sendReplyAndDeleteAfter(chatID int64, text string, delay time.Dura
 func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 	log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Handling direct response to message ID %d", chatID, message.MessageID)
 
-	// 1. Получаем текст сообщения
+	// 1. Получаем текст текущего сообщения
 	messageText := message.Text
 	if messageText == "" && message.Caption != "" {
 		messageText = message.Caption
 	}
 	if messageText == "" {
-		log.Printf("[WARN][MH][DirectResponse] Chat %d: Сообщение (ID %d) не содержит текста для анализа.", chatID, message.MessageID)
-		// Отвечаем стандартным сарказмом на пустое сообщение
+		log.Printf("[WARN][MH][DirectResponse] Chat %d: Сообщение (ID %d) не содержит текста для ответа.", chatID, message.MessageID)
 		b.sendReply(chatID, "И?")
 		return
 	}
 
 	// 2. Классифицируем сообщение (serious или casual)
 	classifyPrompt := b.config.ClassifyDirectMessagePrompt
-	classification, err := b.llm.GenerateArbitraryResponse(classifyPrompt, messageText)
-	if err != nil {
-		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка классификации сообщения: %v. Используем casual ответ.", chatID, err)
-		classification = "casual" // По умолчанию отвечаем саркастично при ошибке
+	classification, errClassify := b.llm.GenerateArbitraryResponse(classifyPrompt, messageText)
+	if errClassify != nil {
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка классификации сообщения: %v. Используем casual ответ.", chatID, errClassify)
+		classification = "casual"
 	}
 	classification = strings.TrimSpace(strings.ToLower(classification))
-
 	log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Сообщение ID %d классифицировано как '%s'.", chatID, message.MessageID, classification)
 
-	// 3. Выбираем промпт и генерируем ответ
-	var finalPrompt string
-	var contextForResponse string
+	// 3. Собираем контекст для ответа
+	// 3.1 Получаем историю из краткосрочной памяти
+	history := b.storage.GetMessages(chatID)
+	// Ограничиваем историю
+	if len(history) > b.config.ContextWindow {
+		history = history[len(history)-b.config.ContextWindow:]
+	}
 
+	// 3.2 Получаем релевантные сообщения из долгосрочной памяти (если включено)
+	var relevantMessages []*tgbotapi.Message
+	if b.config.LongTermMemoryEnabled {
+		relMsgs, errSearch := b.storage.SearchRelevantMessages(chatID, messageText, b.config.LongTermMemoryFetchK)
+		if errSearch != nil {
+			log.Printf("[WARN][MH][DirectResponse] Chat %d: Ошибка поиска в долгосрочной памяти: %v", chatID, errSearch)
+		} else {
+			relevantMessages = relMsgs
+			if b.config.Debug && len(relevantMessages) > 0 {
+				log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Найдено %d релевантных сообщений в долгосрочной памяти.", chatID, len(relevantMessages))
+			}
+		}
+	}
+
+	// 3.3 Объединяем и форматируем всю историю для LLM
+	// Сначала добавляем релевантные из долгосрочной памяти (если есть)
+	combinedHistory := make([]*tgbotapi.Message, 0, len(relevantMessages)+len(history))
+	combinedHistory = append(combinedHistory, relevantMessages...)
+	// Затем добавляем историю из краткосрочной (избегая дубликатов, хотя SearchRelevantMessages должен сам их отсеивать от недавних)
+	seenIDs := make(map[int]bool)
+	for _, msg := range relevantMessages {
+		seenIDs[msg.MessageID] = true
+	}
+	for _, msg := range history {
+		if !seenIDs[msg.MessageID] {
+			combinedHistory = append(combinedHistory, msg)
+			seenIDs[msg.MessageID] = true
+		}
+	}
+	// НЕ добавляем текущее message в combinedHistory, оно будет частью contextText
+
+	contextText := formatHistoryWithProfiles(chatID, combinedHistory, b.storage, b.config, b.llm, b.config.Debug, b.config.TimeZone)
+	// Добавляем текущее сообщение в конец сформированного контекста
+	formattedCurrentMsg := formatSingleMessage(message, nil, time.Local) // Форматируем без профилей, т.к. они уже в contextText
+	contextText += "\n" + formattedCurrentMsg                            // Добавляем текущее сообщение
+
+	// 4. Выбираем промпт
+	var finalPrompt string
 	if classification == "serious" {
 		finalPrompt = b.config.SeriousDirectPrompt
-		contextForResponse = messageText // Для серьезного ответа передаем текст вопроса
 	} else {
 		finalPrompt = b.config.DirectPrompt
-		contextForResponse = messageText // Для обычного ответа тоже можно передать текст, если LLM его использует
 	}
 
-	// Используем GenerateArbitraryResponse, т.к. история не нужна для прямых ответов
-	responseText, err := b.llm.GenerateArbitraryResponse(finalPrompt, contextForResponse)
-	if err != nil {
-		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка генерации ответа (тип '%s'): %v", chatID, classification, err)
-		// Можно отправить стандартный ответ при ошибке генерации
-		responseText = "Чет я завис."
+	// 5. Генерируем ответ, используя GenerateResponseFromTextContext
+	responseText, errGen := b.llm.GenerateResponseFromTextContext(finalPrompt, contextText)
+	if errGen != nil {
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка генерации ответа (тип '%s'): %v", chatID, classification, errGen)
+		if responseText == "[Лимит]" || responseText == "[Заблокировано]" {
+			// Ошибка уже залогирована, просто используем текст ошибки
+		} else {
+			responseText = "Чет я завис."
+		}
 	}
 
-	// 4. Отправляем ответ (возможно, как реплай на исходное сообщение)
+	// 6. Отправляем ответ
 	msg := tgbotapi.NewMessage(chatID, responseText)
-	msg.ReplyToMessageID = message.MessageID // Отвечаем на сообщение пользователя
-	// msg.ParseMode = "Markdown" // Убираем ParseMode, если не планируется использовать Markdown в ответах
+	msg.ReplyToMessageID = message.MessageID
 
-	_, err = b.api.Send(msg)
-	if err != nil {
-		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка отправки ответа: %v", chatID, err)
+	_, errSend := b.api.Send(msg)
+	if errSend != nil {
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка отправки ответа: %v", chatID, errSend)
 	}
 }
 
@@ -882,12 +925,13 @@ func (b *Bot) handlePendingSettingInput(chatID int64, userID int64, username str
 			if err != nil {
 				log.Printf("[ERROR][MH Pending] Chat %d: Failed to save direct_limit_count %d: %v", chatID, valueInt, err)
 				b.sendReply(chatID, "🚫 Произошла ошибка при сохранении настройки лимита сообщений.")
-				return err
+			} else {
+				log.Printf("User %d: Лимит прямых сообщений установлен: %d", chatID, valueInt)
+				b.sendReply(chatID, fmt.Sprintf("✅ Лимит прямых сообщений установлен: %d", valueInt))
+				// Переходим к следующему шагу - ввод длительности
+				nextPendingSetting = "direct_limit_duration"
+				nextPrompt = b.config.PromptEnterDirectLimitDuration
 			}
-			successMessage = fmt.Sprintf("✅ Лимит сообщений установлен: %d.", valueInt)
-			// Переходим к следующему шагу - ввод длительности
-			nextPendingSetting = "direct_limit_duration"
-			nextPrompt = b.config.PromptEnterDirectLimitDuration
 		} else {
 			b.sendReply(chatID, "🚫 Количество должно быть 0 или больше.")
 			return fmt.Errorf("некорректное значение лимита")
@@ -900,16 +944,17 @@ func (b *Bot) handlePendingSettingInput(chatID int64, userID int64, username str
 			if err != nil {
 				log.Printf("[ERROR][MH Pending] Chat %d: Failed to save direct_limit_duration %d mins: %v", chatID, valueInt, err)
 				b.sendReply(chatID, "🚫 Произошла ошибка при сохранении настройки периода лимита.")
-				return err
+			} else {
+				log.Printf("User %d: Период лимита установлен: %d минут.", valueInt)
+				b.sendReply(chatID, fmt.Sprintf("✅ Период лимита установлен: %d минут.", valueInt))
+				// Цепочка ввода завершена, обновляем клавиатуру
+				// Вызываем обновление клавиатуры после успешного ввода
+				go func() {
+					// Небольшая задержка, чтобы сообщение об успехе успело отправиться
+					time.Sleep(1 * time.Second)
+					b.updateSettingsKeyboardAfterInput(chatID)
+				}()
 			}
-			successMessage = fmt.Sprintf("✅ Период лимита установлен: %d минут.", valueInt)
-			// Цепочка ввода завершена, обновляем клавиатуру
-			// Вызываем обновление клавиатуры после успешного ввода
-			go func() {
-				// Небольшая задержка, чтобы сообщение об успехе успело отправиться
-				time.Sleep(1 * time.Second)
-				b.updateSettingsKeyboardAfterInput(chatID)
-			}()
 		} else {
 			b.sendReply(chatID, "🚫 Длительность должна быть больше 0.")
 			return fmt.Errorf("некорректное значение длительности")

@@ -446,7 +446,7 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 				log.Printf("[DEBUG][FormatHistory LTM] Чат %d: Найдено %d релевантных сообщений.", chatID, len(relevantMessages))
 			}
 			var ltmBuilder strings.Builder
-			ltmBuilder.WriteString("### Воспоминания из прошлого (релевантный контекст):")
+			ltmBuilder.WriteString("### Воспоминания из прошлого (релевантный контекст):\n") // Исправлен текст заголовка
 			// Сортируем по дате от старых к новым (если они пришли не отсортированными)
 			sort.SliceStable(relevantMessages, func(i, j int) bool {
 				return relevantMessages[i].Time().Before(relevantMessages[j].Time())
@@ -559,3 +559,56 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 
 	return historyBuilder.String()
 }
+
+// formatSingleMessage форматирует одно сообщение для контекста LLM,
+// добавляя информацию об авторе из профиля.
+func formatSingleMessage(msg *tgbotapi.Message, profiles []*storage.UserProfile, loc *time.Location) string {
+	if msg == nil {
+		return ""
+	}
+
+	// Определяем текст сообщения (текст или подпись)
+	messageText := msg.Text
+	if messageText == "" && msg.Caption != "" {
+		messageText = msg.Caption
+	}
+	if messageText == "" {
+		messageText = "[сообщение без текста/подписи]"
+	}
+
+	authorInfo := "Неизвестный"
+	if msg.From != nil {
+		authorInfo = fmt.Sprintf("%s %s (@%s, ID: %d)", msg.From.FirstName, msg.From.LastName, msg.From.UserName, msg.From.ID)
+		// Попробуем найти профиль и использовать Alias
+		for _, p := range profiles {
+			if p.UserID == msg.From.ID {
+				if p.Alias != "" {
+					authorInfo = p.Alias // Используем Alias из профиля
+				} else {
+					authorInfo = msg.From.FirstName // Fallback на FirstName, если Alias пуст
+				}
+				// Можно добавить гендер или другую инфу из профиля при необходимости
+				break
+			}
+		}
+	}
+
+	// Форматируем время сообщения с учетом временной зоны
+	msgTime := msg.Time().In(loc).Format("15:04:05")
+
+	// Формируем строку сообщения
+	// Используем только Время и Автора для краткости
+	return fmt.Sprintf("%s (%s): %s", msgTime, authorInfo, messageText)
+}
+
+// findUserProfile находит профиль пользователя в срезе.
+// Возвращает указатель на профиль или nil, если не найден.
+// (Перенесено в storage)
+// func findUserProfile(userID int64, profiles []*storage.UserProfile) *storage.UserProfile {
+// 	for _, p := range profiles {
+// 		if p.UserID == userID {
+// 			return p
+// 		}
+// 	}
+// 	return nil
+// }

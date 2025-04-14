@@ -829,3 +829,26 @@ func (ps *PostgresStorage) SearchRelevantMessages(chatID int64, queryText string
 	log.Printf("[WARN][PostgresStorage] SearchRelevantMessages вызван для chatID %d, но PostgresStorage не поддерживает векторный поиск. Возвращен пустой результат.", chatID)
 	return []*tgbotapi.Message{}, nil
 }
+
+// === Методы, специфичные для MongoDB (заглушки для PostgresStorage) ===
+
+// GetTotalMessagesCount (заглушка)
+func (ps *PostgresStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
+	log.Printf("[WARN][PostgresStorage] GetTotalMessagesCount вызван для chatID %d, но PostgresStorage не поддерживает эту операцию.", chatID)
+	return 0, fmt.Errorf("GetTotalMessagesCount не поддерживается PostgresStorage")
+}
+
+// FindMessagesWithoutEmbedding (заглушка)
+// Примечание: Сигнатура изменена для соответствия ожидаемой ботом, но функциональность не реализована.
+func (ps *PostgresStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error) {
+	log.Printf("[WARN][PostgresStorage] FindMessagesWithoutEmbedding вызван для chatID %d (лимит %d, пропуск %d ID), но PostgresStorage не поддерживает эту операцию.", chatID, limit, len(skipMessageIDs))
+	// Возвращаем тип MongoMessage, так как именно его ожидает вызывающий код в `runBackfillEmbeddings`.
+	// Это неидеально, но необходимо для компиляции без изменения интерфейса.
+	return nil, fmt.Errorf("FindMessagesWithoutEmbedding не поддерживается PostgresStorage")
+}
+
+// UpdateMessageEmbedding (заглушка)
+func (ps *PostgresStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
+	log.Printf("[WARN][PostgresStorage] UpdateMessageEmbedding вызван для chatID %d, MsgID %d, но PostgresStorage не поддерживает эту операцию.", chatID, messageID)
+	return fmt.Errorf("UpdateMessageEmbedding не поддерживается PostgresStorage")
+}

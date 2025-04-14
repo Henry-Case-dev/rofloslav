@@ -231,3 +231,23 @@ func (fs *FileStorage) SearchRelevantMessages(chatID int64, queryText string, k 
 	log.Printf("[WARN][FileStorage] SearchRelevantMessages вызван для chatID %d, но FileStorage не поддерживает векторный поиск. Возвращен пустой результат.", chatID)
 	return []*tgbotapi.Message{}, nil
 }
+
+// === Методы, специфичные для MongoDB (заглушки для FileStorage) ===
+
+// GetTotalMessagesCount (заглушка)
+func (fs *FileStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
+	log.Printf("[WARN][FileStorage] GetTotalMessagesCount вызван для chatID %d, но FileStorage не поддерживает эту операцию.", chatID)
+	return 0, fmt.Errorf("GetTotalMessagesCount не поддерживается FileStorage")
+}
+
+// FindMessagesWithoutEmbedding (заглушка)
+func (fs *FileStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error) {
+	log.Printf("[WARN][FileStorage] FindMessagesWithoutEmbedding вызван для chatID %d (лимит %d, пропуск %d ID), но FileStorage не поддерживает эту операцию.", chatID, limit, len(skipMessageIDs))
+	return nil, fmt.Errorf("FindMessagesWithoutEmbedding не поддерживается FileStorage")
+}
+
+// UpdateMessageEmbedding (заглушка)
+func (fs *FileStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
+	log.Printf("[WARN][FileStorage] UpdateMessageEmbedding вызван для chatID %d, MsgID %d, но FileStorage не поддерживает эту операцию.", chatID, messageID)
+	return fmt.Errorf("UpdateMessageEmbedding не поддерживается FileStorage")
+}

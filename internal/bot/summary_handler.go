@@ -150,108 +150,75 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 // updateOrCreateMessage редактирует существующее сообщение или отправляет новое.
 // Если текст слишком длинный, разбивает его на части.
 func (b *Bot) updateOrCreateMessage(chatID int64, messageID int, editText, sendText, parseMode string) {
-	textToSend := sendText // Текст для нового сообщения
 	if messageID != 0 {
-		textToSend = editText // Текст для редактирования, если есть ID
-	}
-
-	// Проверяем длину текста
-	if len([]rune(textToSend)) <= telegramMaxMessageLength {
-		// Текст в пределах лимита, отправляем/редактируем как обычно
-		b.sendOrEditSingleMessage(chatID, messageID, editText, sendText, parseMode)
-		return
-	}
-
-	// Текст слишком длинный, нужно разбивать
-	if b.config.Debug {
-		log.Printf("[DEBUG][SplitMsg] Chat %d: Текст превышает лимит (%d > %d). Начинаю разбивку.", chatID, len([]rune(textToSend)), telegramMaxMessageLength)
-	}
-
-	chunks := splitMessageIntoChunks(textToSend, telegramMaxMessageLength)
-
-	// Отправляем или редактируем первую часть
-	if messageID != 0 {
-		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, chunks[0])
-		if parseMode != "" {
-			editMsg.ParseMode = parseMode
-		}
-		if b.config.Debug {
-			log.Printf("[DEBUG][SplitMsg Edit] Chat %d, MsgID %d: Попытка редактирования первой части. ParseMode: '%s'", chatID, messageID, editMsg.ParseMode)
-		}
-		_, err := b.api.Send(editMsg)
-		if err != nil {
-			// Если редактирование не удалось, отправляем первую часть как новое сообщение
-			log.Printf("[WARN][SplitMsg Edit] Chat %d, MsgID %d: Не удалось отредактировать: %v. Отправляю первую часть новым сообщением.", chatID, messageID, err)
-			b.sendSingleMessage(chatID, chunks[0], parseMode) // Отправляем первую часть
-		}
-	} else {
-		// Если исходного сообщения для редактирования не было, отправляем первую часть
-		b.sendSingleMessage(chatID, chunks[0], parseMode)
-	}
-
-	// Отправляем остальные части как новые сообщения
-	for i := 1; i < len(chunks); i++ {
-		time.Sleep(500 * time.Millisecond) // Небольшая задержка между частями
-		b.sendSingleMessage(chatID, chunks[i], parseMode)
-	}
-
-	// Обновляем LastInfoMessageID на ID *последнего* отправленного сообщения (если чанки были)
-	// Это не совсем точно, т.к. последнее отправленное сообщение будет только частью саммари.
-	// Пока оставим так, т.к. непонятно, ID какого сообщения важнее сохранять.
-	// Возможно, стоит вообще не обновлять LastInfoMessageID при разбивке.
-	/*
-		lastSentMsgID := b.getLastSentMessageIDSomehow() // <--- Нужен механизм получения ID последнего сообщения
-		if lastSentMsgID != 0 {
-			b.settingsMutex.Lock()
-			if settings, exists := b.chatSettings[chatID]; exists {
-				settings.LastInfoMessageID = lastSentMsgID
-				log.Printf("[DEBUG][SplitMsg] Сохранен ID последнего чанка: %d для чата %d", lastSentMsgID, chatID)
-			} else {
-				log.Printf("[WARN][SplitMsg] Настройки для чата %d не найдены при попытке сохранить ID последнего чанка.", chatID)
-			}
-			b.settingsMutex.Unlock()
-		}
-	*/
-}
-
-// sendOrEditSingleMessage отправляет или редактирует одно сообщение в пределах лимита
-func (b *Bot) sendOrEditSingleMessage(chatID int64, messageID int, editText, sendText, parseMode string) {
-	if messageID != 0 {
-		// Пытаемся отредактировать существующее сообщение
+		// Попытка редактирования
 		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, editText)
+		// Устанавливаем ParseMode, если он передан
 		if parseMode != "" {
 			editMsg.ParseMode = parseMode
-		}
-		// Добавляем логирование перед отправкой редактирования
-		if b.config.Debug {
-			log.Printf("[DEBUG][UpdateMsg Edit] Chat %d, MsgID %d: Attempting to edit. ParseMode: '%s'", chatID, messageID, editMsg.ParseMode)
 		}
 		_, err := b.api.Send(editMsg)
 		if err == nil {
-			if b.config.Debug {
-				log.Printf("[DEBUG][UpdateMsg] Сообщение %d в чате %d успешно отредактировано.", messageID, chatID)
-			}
-			// Успешно отредактировано, выходим (LastInfoMessageID не меняется)
+			// Успешно отредактировано
+			log.Printf("[DEBUG][Summary] Сообщение саммари (ID: %d) в чате %d успешно отредактировано.", messageID, chatID)
 			return
 		}
-		// Если редактирование не удалось (например, сообщение удалено), логгируем и отправляем новое
-		log.Printf("[WARN][UpdateMsg] Не удалось отредактировать сообщение %d в чате %d: %v. Отправляю новое.", messageID, chatID, err)
-		// ID старого сообщения больше не актуален, сбрасываем его в настройках
+		// Если редактирование не удалось (например, сообщение слишком старое или удалено)
+		log.Printf("[WARN][Summary] Не удалось отредактировать сообщение саммари (ID: %d) в чате %d: %v. Отправляю новое.", messageID, chatID, err)
+		// Сбрасываем messageID в настройках, чтобы следующее саммари создало новое сообщение
 		b.settingsMutex.Lock()
 		if settings, exists := b.chatSettings[chatID]; exists {
-			if settings.LastInfoMessageID == messageID {
+			if settings.LastInfoMessageID == messageID { // Убедимся, что это было именно то сообщение
 				settings.LastInfoMessageID = 0
 			}
 		}
 		b.settingsMutex.Unlock()
-	} else {
-		if b.config.Debug {
-			log.Printf("[DEBUG][UpdateMsg] MessageID == 0 для чата %d. Отправляю новое сообщение.", chatID)
-		}
 	}
 
-	// Отправляем новое сообщение (если редактирование не удалось или messageID был 0)
-	b.sendSingleMessage(chatID, sendText, parseMode)
+	// Отправка нового сообщения
+	msg := tgbotapi.NewMessage(chatID, sendText)
+	// Устанавливаем ParseMode, если он передан
+	if parseMode != "" {
+		msg.ParseMode = parseMode
+	}
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("[ERROR][Summary] Не удалось отправить новое сообщение саммари в чат %d: %v", chatID, err)
+		return
+	}
+	log.Printf("[DEBUG][Summary] Новое сообщение саммари (ID: %d) отправлено в чат %d.", sentMsg.MessageID, chatID)
+
+	// Сохраняем ID нового сообщения
+	b.settingsMutex.Lock()
+	if settings, exists := b.chatSettings[chatID]; exists {
+		settings.LastInfoMessageID = sentMsg.MessageID
+	}
+	b.settingsMutex.Unlock()
+}
+
+// sendOrEditSingleMessage отправляет или редактирует одно сообщение в пределах лимита
+func (b *Bot) sendOrEditSingleMessage(chatID int64, messageID int, editText, sendText, parseMode string) {
+	if messageID > 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, editText)
+		if parseMode != "" {
+			editMsg.ParseMode = parseMode
+		}
+		_, err := b.api.Send(editMsg)
+		if err == nil {
+			return // Успешно отредактировано
+		}
+		log.Printf("[WARN] Не удалось отредактировать сообщение (ID: %d) в чате %d: %v. Отправляю новое.", messageID, chatID, err)
+	}
+
+	// Отправляем новое, если редактирование не удалось или messageID == 0
+	msg := tgbotapi.NewMessage(chatID, sendText)
+	if parseMode != "" {
+		msg.ParseMode = parseMode
+	}
+	_, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("[ERROR] Не удалось отправить сообщение в чат %d: %v", chatID, err)
+	}
 }
 
 // sendSingleMessage отправляет одно сообщение и обновляет LastInfoMessageID

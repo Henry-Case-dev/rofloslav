@@ -77,6 +77,17 @@ type ChatHistoryStorage interface {
 	// GetStatus возвращает строку с текущим статусом хранилища (тип, подключение, кол-во сообщений и т.д.)
 	GetStatus(chatID int64) string
 
+	// === Методы для работы с эмбеддингами (специфичны для MongoDB) ---
+
+	// GetTotalMessagesCount возвращает общее количество сообщений в чате.
+	GetTotalMessagesCount(chatID int64) (int64, error)
+
+	// FindMessagesWithoutEmbedding ищет сообщения без эмбеддингов, исключая указанные ID.
+	FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error)
+
+	// UpdateMessageEmbedding обновляет или добавляет эмбеддинг для сообщения.
+	UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error
+
 	// === Методы для долгосрочной памяти ===
 	// SearchRelevantMessages ищет сообщения, семантически близкие к queryText, используя векторный поиск.
 	// Возвращает до k наиболее релевантных сообщений.

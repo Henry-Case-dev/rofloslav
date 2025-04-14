@@ -45,6 +45,7 @@ type MongoMessage struct {
 	CaptionEntities []tgbotapi.MessageEntity `bson:"caption_entities,omitempty"` // Форматирование подписи
 	HasMedia        bool                     `bson:"has_media,omitempty"`        // Флаг наличия медиа
 	IsVoice         bool                     `bson:"is_voice,omitempty"`         // Флаг, что сообщение из аудио
+	MessageVector   []float32                `bson:"message_vector,omitempty"`   // Векторное представление сообщения
 }
 
 // convertMongoToAPIMessage преобразует MongoMessage обратно в *tgbotapi.Message
@@ -277,61 +278,67 @@ func (ms *MongoStorage) Close() error {
 
 // AddMessage добавляет одно сообщение в историю чата MongoDB.
 func (ms *MongoStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
-	if message == nil {
-		log.Printf("[Mongo AddMessage WARN] Чат %d: Попытка добавить nil сообщение.", chatID)
+	// Проверяем, нужно ли вообще сохранять это сообщение (например, исключаем системные)
+	if message == nil || message.Text == "" && message.Caption == "" && message.Voice == nil && message.Audio == nil && message.Video == nil && message.Photo == nil {
+		// Пропускаем сообщения без текстового контента и не являющиеся голосовыми/медиа
+		// (можно расширить логику, если нужно хранить другие типы)
+		if ms.debug {
+			log.Printf("[Mongo AddMessage SKIP] Чат %d: Сообщение ID %d пропущено (нет текста/caption/медиа).", chatID, message.MessageID)
+		}
 		return
 	}
 
-	if ms.debug {
-		log.Printf("[Mongo AddMessage DEBUG] Чат %d: Попытка добавления сообщения ID %d.", chatID, message.MessageID)
-	}
-
-	// Конвертируем сообщение в формат MongoDB
+	// Конвертируем в формат MongoDB
 	mongoMsg := convertAPIToMongoMessage(chatID, message)
-	if mongoMsg == nil { // Проверка после конвертации
-		log.Printf("[Mongo AddMessage WARN] Чат %d: Сообщение ID %d не удалось конвертировать в MongoMessage.", chatID, message.MessageID)
+	if mongoMsg == nil {
+		log.Printf("[ERROR][Mongo AddMessage] Чат %d: Не удалось конвертировать сообщение ID %d в MongoMessage.", chatID, message.MessageID)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Короткий таймаут для вставки
-	defer cancel()
+	// --- Генерация эмбеддинга перед сохранением ---
+	if ms.cfg.LongTermMemoryEnabled && ms.llmClient != nil {
+		textToEmbed := ""
+		if mongoMsg.Text != "" {
+			textToEmbed = mongoMsg.Text
+		} else if mongoMsg.Caption != "" {
+			textToEmbed = mongoMsg.Caption
+		}
 
-	// Вставляем одно сообщение
-	insertResult, err := ms.messagesCollection.InsertOne(ctx, mongoMsg)
-	if err != nil {
-		// Логируем ошибку более подробно
-		log.Printf("[Mongo AddMessage ERROR] Чат %d: Ошибка вставки сообщения ID %d: %v", chatID, message.MessageID, err)
-		// Попробуем вывести детали ошибки MongoDB, если они есть
-		if mongoErr, ok := err.(mongo.WriteException); ok {
-			for _, writeErr := range mongoErr.WriteErrors {
-				log.Printf("[Mongo AddMessage ERROR Detail] Чат %d: MongoDB WriteError - Code: %d, Message: %s", chatID, writeErr.Code, writeErr.Message)
+		if textToEmbed != "" {
+			if ms.debug {
+				log.Printf("[Mongo AddMessage DEBUG] Чат %d: Попытка генерации эмбеддинга для сообщения ID %d...", chatID, mongoMsg.MessageID)
+			}
+			vector, err := ms.llmClient.EmbedContent(textToEmbed)
+			if err != nil {
+				// Логируем ошибку, но НЕ прерываем сохранение сообщения
+				log.Printf("[WARN][Mongo AddMessage] Чат %d, Msg %d: Ошибка генерации эмбеддинга при добавлении: %v. Сообщение будет сохранено без вектора.", chatID, mongoMsg.MessageID, err)
+			} else {
+				mongoMsg.MessageVector = vector // Сохраняем вектор
+				if ms.debug {
+					log.Printf("[Mongo AddMessage DEBUG] Чат %d, Msg %d: Эмбеддинг успешно сгенерирован (размерность %d).", chatID, mongoMsg.MessageID, len(vector))
+				}
+			}
+		} else {
+			if ms.debug {
+				log.Printf("[Mongo AddMessage DEBUG] Чат %d, Msg %d: Нет текста для генерации эмбеддинга.", chatID, mongoMsg.MessageID)
 			}
 		}
-		return // Выходим при ошибке
 	}
+	// --- Конец генерации эмбеддинга ---
 
-	if ms.debug {
-		if insertResult != nil && insertResult.InsertedID != nil {
-			log.Printf("[Mongo AddMessage DEBUG] Чат %d: Сообщение ID %d успешно вставлено в MongoDB с ID: %v.", chatID, message.MessageID, insertResult.InsertedID)
-		} else {
-			// Эта ветка маловероятна при отсутствии ошибки, но для полноты
-			log.Printf("[Mongo AddMessage DEBUG] Чат %d: Сообщение ID %d вставлено, но InsertedID не получен (возможно, уже существовало?).", chatID, message.MessageID)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Таймаут на вставку
+	defer cancel()
+
+	_, err := ms.messagesCollection.InsertOne(ctx, mongoMsg)
+	if err != nil {
+		log.Printf("[ERROR][Mongo AddMessage] Чат %d: Ошибка вставки сообщения ID %d в MongoDB: %v", chatID, message.MessageID, err)
+		// TODO: Обработка ошибок (например, повторная попытка?)
+	} else if ms.debug {
+		log.Printf("[Mongo AddMessage DEBUG] Чат %d: Сообщение ID %d успешно вставлено в MongoDB с ID: %v.", chatID, message.MessageID, mongoMsg.ID)
 	}
-
-	// Обрезка старых сообщений (если нужно убрать лишнее, оставляем только N последних)
-	// Это ресурсоемкая операция, выполняем ее не на каждое сообщение, а реже или вообще убираем,
-	// полагаясь на TTL индекс или GetMessages с Limit.
-	// Пока закомментируем, чтобы не замедлять вставку.
-	/*
-		if ms.contextWindow > 0 {
-			go ms.trimOldMessages(chatID) // Запускаем в фоне
-		}
-	*/
 }
 
-// convertAPIToMongoMessage преобразует *tgbotapi.Message в *MongoMessage.
-// Вынесено в отдельную функцию для ясности.
+// convertAPIToMongoMessage преобразует сообщение из Telegram API в формат для MongoDB
 func convertAPIToMongoMessage(chatID int64, apiMsg *tgbotapi.Message) *MongoMessage {
 	if apiMsg == nil {
 		return nil
@@ -1173,22 +1180,30 @@ func (ms *MongoStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
 	return count, nil
 }
 
-// FindMessagesWithoutEmbedding ищет пакет сообщений в чате, у которых отсутствует поле message_vector.
-func (ms *MongoStorage) FindMessagesWithoutEmbedding(chatID int64, limit int) ([]MongoMessage, error) {
-	filter := bson.M{
-		"chat_id":        chatID,
-		"message_vector": bson.M{"$exists": false}, // Ищем документы, где поле отсутствует
-		"$or": []bson.M{ // И добавляем условие, что текст или подпись не пустые
-			{"text": bson.M{"$ne": ""}},
-			{"caption": bson.M{"$ne": ""}},
-		},
-	}
-	findOptions := options.Find().SetLimit(int64(limit)).SetSort(bson.D{{"date", 1}}) // Сортируем по дате (от старых к новым)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second) // Таймаут на поиск
+// FindMessagesWithoutEmbedding ищет до `limit` сообщений в чате, у которых отсутствует поле `message_vector`,
+// и либо поле `text`, либо `caption` существует и не является пустой строкой.
+// Исключает сообщения с message_id из `skipMessageIDs`.
+func (ms *MongoStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
+	filter := bson.M{
+		"chat_id":        chatID,
+		"message_vector": bson.M{"$exists": false},
+		"$or": []bson.M{
+			{"text": bson.M{"$exists": true, "$ne": ""}},
+			{"caption": bson.M{"$exists": true, "$ne": ""}},
+		},
+	}
+
+	// Добавляем условие для исключения ID, если список не пустой
+	if len(skipMessageIDs) > 0 {
+		filter["message_id"] = bson.M{"$nin": skipMessageIDs}
+	}
+
+	opts := options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "date", Value: 1}}) // Сортируем по дате, чтобы обрабатывать старые
+
+	cursor, err := ms.messagesCollection.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка поиска сообщений без эмбеддинга: %w", err)
 	}
@@ -1204,23 +1219,42 @@ func (ms *MongoStorage) FindMessagesWithoutEmbedding(chatID int64, limit int) ([
 
 // UpdateMessageEmbedding обновляет поле message_vector для конкретного сообщения.
 func (ms *MongoStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
-	filter := bson.M{"chat_id": chatID, "message_id": messageID}
-	update := bson.M{"$set": bson.M{"message_vector": vector}}
+	filter := bson.M{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	update := bson.M{
+		"$set": bson.M{"message_vector": vector},
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Короткий таймаут на обновление
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	result, err := ms.messagesCollection.UpdateOne(ctx, filter, update)
 	if err != nil {
-		return fmt.Errorf("ошибка выполнения UpdateOne: %w", err)
+		log.Printf("[UpdateEmbedding ERROR] Chat %d, Msg %d: Ошибка MongoDB при обновлении: %v", chatID, messageID, err)
+		return fmt.Errorf("ошибка обновления эмбеддинга в MongoDB: %w", err)
 	}
 
+	// Проверяем результат операции
 	if result.MatchedCount == 0 {
-		log.Printf("[WARN][UpdateEmbedding] Chat %d, Msg %d: Сообщение не найдено для обновления эмбеддинга.", chatID, messageID)
-		// Не возвращаем ошибку, просто логируем
-	} else if result.ModifiedCount == 0 {
-		log.Printf("[WARN][UpdateEmbedding] Chat %d, Msg %d: Эмбеддинг не был изменен (возможно, уже установлен?).", chatID, messageID)
+		// Документ с таким chat_id и message_id вообще не найден.
+		log.Printf("[UpdateEmbedding ERROR] Chat %d, Msg %d: Документ не найден для обновления. MatchedCount=0", chatID, messageID)
+		return fmt.Errorf("документ %d не найден в чате %d", messageID, chatID)
 	}
 
-	return nil
+	if result.ModifiedCount == 0 {
+		// Документ найден, но не был изменен. Это может означать, что:
+		// 1. Вектор уже был установлен точно таким же значением (маловероятно с float).
+		// 2. Какая-то проблема с MongoDB.
+		// Считаем это ошибкой для логики бэкфилла, так как обновление не прошло как ожидалось.
+		log.Printf("[UpdateEmbedding WARN/ERROR] Chat %d, Msg %d: Документ найден, но не модифицирован. Возможно, вектор уже установлен или проблема с обновлением. MatchedCount=%d, ModifiedCount=0", chatID, messageID, result.MatchedCount)
+		return fmt.Errorf("документ найден, но не модифицирован (vector уже может существовать)")
+	}
+
+	if ms.debug {
+		log.Printf("[UpdateEmbedding OK] Chat %d, Msg %d: Эмбеддинг успешно обновлен. Matched: %d, Modified: %d", chatID, messageID, result.MatchedCount, result.ModifiedCount)
+	}
+
+	return nil // Успешное обновление
 }

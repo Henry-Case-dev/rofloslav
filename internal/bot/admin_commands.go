@@ -38,6 +38,9 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 
 	startTime := time.Now()
 
+	// Набор для отслеживания ID, которые постоянно не модифицируются
+	failedToModifyIDs := make(map[int]bool)
+
 	// Итерация по сообщениям без эмбеддингов пакетами
 	for {
 		// Проверяем сигнал остановки бота
@@ -50,10 +53,16 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 			// Продолжаем
 		}
 
-		// Ищем следующий пакет сообщений без message_vector
-		messagesToProcess, findErr := mongoStore.FindMessagesWithoutEmbedding(chatID, b.config.BackfillBatchSize)
+		// --- Собираем ID для пропуска ---
+		skipIDs := make([]int, 0, len(failedToModifyIDs))
+		for id := range failedToModifyIDs {
+			skipIDs = append(skipIDs, id)
+		}
+
+		// Ищем следующий пакет сообщений без message_vector, пропуская проблемные ID
+		messagesToProcess, findErr := mongoStore.FindMessagesWithoutEmbedding(chatID, b.config.BackfillBatchSize, skipIDs)
 		if findErr != nil {
-			log.Printf("[Backfill ERROR] Chat %d: Ошибка поиска сообщений без эмбеддинга: %v", chatID, findErr)
+			log.Printf("[Backfill ERROR] Chat %d: Ошибка поиска сообщений без эмбеддинга (пропущено %d ID): %v", chatID, len(skipIDs), findErr)
 			errorCount++
 			// Решаем, стоит ли продолжать или прервать? Пока продолжим, но сообщим об ошибке.
 			b.sendReply(chatID, fmt.Sprintf("❌ Ошибка поиска сообщений для обработки (пакет %d). Пробую продолжить.", (processedCount/b.config.BackfillBatchSize)+1))
@@ -67,13 +76,20 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 			break // Выходим из цикла
 		}
 
-		log.Printf("[Backfill PROCESS] Chat %d: Обработка пакета из %d сообщений (Всего обработано: %d)...", chatID, len(messagesToProcess), processedCount)
+		log.Printf("[Backfill PROCESS] Chat %d: Обработка пакета из %d сообщений (Всего успешно обновлено: %d)...", chatID, len(messagesToProcess), processedCount)
 
 		batchStartTime := time.Now()
 		batchErrorCount := 0
+		processedInBatch := 0 // Счетчик успешно обработанных в этом пакете
 
 		// Обрабатываем пакет
 		for _, msg := range messagesToProcess {
+			// --- Проверка, не зациклились ли мы на этом ID ---
+			if failedToModifyIDs[msg.MessageID] {
+				log.Printf("[Backfill SKIP LOOP] Chat %d, Msg %d: Пропуск, так как ранее не удалось модифицировать.", chatID, msg.MessageID)
+				continue // Пропускаем это сообщение в текущем пакете
+			}
+
 			// Собираем текст
 			var textToEmbed string
 			if msg.Text != "" {
@@ -83,9 +99,6 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 			}
 
 			if textToEmbed == "" {
-				// Это странно, но может быть. Обновим документ, чтобы не искать его снова.
-				// Установим пустой вектор или специальный маркер?
-				// Пока просто пропустим генерацию, но можно добавить обновление в БД.
 				log.Printf("[Backfill SKIP] Chat %d, Msg %d: Пустой текст, пропуск генерации эмбеддинга.", chatID, msg.MessageID)
 				continue
 			}
@@ -111,17 +124,28 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 			// Обновляем документ в MongoDB
 			updateErr := mongoStore.UpdateMessageEmbedding(chatID, msg.MessageID, vector)
 			if updateErr != nil {
-				log.Printf("[Backfill ERROR] Chat %d, Msg %d: Ошибка обновления эмбеддинга в MongoDB: %v", chatID, msg.MessageID, updateErr)
-				errorCount++
-				batchErrorCount++
-				// Пропускаем счетчик processedCount, так как не обновили
-				continue
+				// Проверяем, является ли ошибка "не модифицирован"
+				if strings.Contains(updateErr.Error(), "не модифицирован") {
+					log.Printf("[Backfill WARN] Chat %d, Msg %d: Пропуск обновления, документ не модифицирован (вектор уже может существовать). Отмечаем ID %d.", chatID, msg.MessageID, msg.MessageID)
+					// Отмечаем этот ID, чтобы пропустить его в следующих пакетах этого запуска
+					failedToModifyIDs[msg.MessageID] = true
+				} else {
+					// Другая ошибка обновления
+					log.Printf("[Backfill ERROR] Chat %d, Msg %d: Ошибка обновления эмбеддинга в MongoDB: %v", chatID, msg.MessageID, updateErr)
+					errorCount++
+					batchErrorCount++
+				}
+				continue // Пропускаем увеличение processedCount
 			}
+			// Успешное обновление
 			processedCount++
+			processedInBatch++
+			// Сбрасываем флаг ошибки для этого ID, если он был
+			delete(failedToModifyIDs, msg.MessageID)
 		}
 
 		batchDuration := time.Since(batchStartTime)
-		log.Printf("[Backfill BATCH OK] Chat %d: Пакет обработан за %v. Ошибок в пакете: %d.", chatID, batchDuration, batchErrorCount)
+		log.Printf("[Backfill BATCH OK] Chat %d: Пакет обработан за %v. Успешно обновлено в пакете: %d. Ошибок (не считая 'не мод.'): %d.", chatID, batchDuration, processedInBatch, batchErrorCount)
 
 		// Отправляем промежуточный статус каждые N пакетов или M сообщений
 		if processedCount > 0 && processedCount%(b.config.BackfillBatchSize*5) == 0 { // Каждые 5 пакетов
