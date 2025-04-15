@@ -1064,6 +1064,46 @@ func (ms *MongoStorage) UpdateDirectLimitDuration(chatID int64, duration time.Du
 	return nil
 }
 
+// UpdateVoiceTranscriptionEnabled обновляет настройку транскрипции голоса
+func (ms *MongoStorage) UpdateVoiceTranscriptionEnabled(chatID int64, enabled bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	update := bson.M{"$set": bson.M{"voice_transcription_enabled": enabled}}
+	opts := options.Update().SetUpsert(true)
+
+	_, err := ms.settingsCollection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[ERROR][MongoStorage] UpdateVoiceTranscriptionEnabled Chat %d: Ошибка обновления: %v", chatID, err)
+		return err
+	}
+	if ms.debug {
+		log.Printf("[DEBUG][MongoStorage] UpdateVoiceTranscriptionEnabled Chat %d: Установлено значение %t", chatID, enabled)
+	}
+	return nil
+}
+
+// UpdateSrachAnalysisEnabled обновляет настройку анализа срачей
+func (ms *MongoStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	update := bson.M{"$set": bson.M{"srach_analysis_enabled": enabled}}
+	opts := options.Update().SetUpsert(true)
+
+	_, err := ms.settingsCollection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("[ERROR][MongoStorage] UpdateSrachAnalysisEnabled Chat %d: Ошибка обновления: %v", chatID, err)
+		return err
+	}
+	if ms.debug {
+		log.Printf("[DEBUG][MongoStorage] UpdateSrachAnalysisEnabled Chat %d: Установлено значение %t", chatID, enabled)
+	}
+	return nil
+}
+
 // SearchRelevantMessages ищет сообщения, семантически близкие к queryText,
 // используя MongoDB Atlas Vector Search.
 func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {

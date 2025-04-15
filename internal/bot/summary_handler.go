@@ -17,6 +17,8 @@ const telegramMaxMessageLength = 4096
 // createAndSendSummary создает и отправляет саммари диалога,
 // редактируя существующее сообщение или отправляя новое.
 func (b *Bot) createAndSendSummary(chatID int64) {
+	log.Printf("[DEBUG][createAndSendSummary] Чат %d: Функция вызвана.", chatID)
+
 	// Получаем ID сообщения "Генерирую..."
 	b.settingsMutex.RLock()
 	settings, exists := b.chatSettings[chatID]

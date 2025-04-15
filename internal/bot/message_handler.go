@@ -451,38 +451,46 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			log.Printf("[WARN][MH] Chat %d: originalMessage is nil, cannot add to storage.", chatID)
 		}
 
-		/*
-			// Обновляем профиль пользователя (используем From из textMessage/originalMessage)
-			// КОММЕНТИРУЕМ ЭТОТ БЛОК, ЧТОБЫ ЗАПРЕТИТЬ АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ ПРОФИЛЕЙ
-			if message.From != nil {
-				go func(chatID int64, user *tgbotapi.User) {
-					// Получаем текущий профиль (если есть) или создаем новый
-					profile, err := b.storage.GetUserProfile(chatID, user.ID)
+		// Обновляем профиль пользователя, ТОЛЬКО ЕСЛИ ОН НЕ СУЩЕСТВУЕТ
+		if message.From != nil {
+			go func(chatID int64, user *tgbotapi.User) {
+				// Проверяем, существует ли профиль
+				existingProfile, err := b.storage.GetUserProfile(chatID, user.ID)
+				if err != nil {
+					// Ошибка получения профиля - ничего не делаем, логируем
+					log.Printf("[ERROR][UpdateProfileIfNeeded] Chat %d, User %d: Ошибка получения профиля: %v", chatID, user.ID, err)
+					return
+				}
+
+				// Если профиль НЕ существует, создаем и сохраняем новый
+				if existingProfile == nil {
+					log.Printf("[DEBUG][UpdateProfileIfNeeded] Chat %d, User %d (@%s): Профиль не найден, создаю новый.", chatID, user.ID, user.UserName)
+					location, _ := time.LoadLocation(b.config.TimeZone)
+					newProfile := &storage.UserProfile{
+						ChatID:    chatID,
+						UserID:    user.ID,
+						Username:  user.UserName,
+						LastSeen:  time.Unix(int64(message.Date), 0).In(location), // Используем корректное время
+						Alias:     user.FirstName,                                 // Используем FirstName как начальный Alias
+						Gender:    "",                                             // Инициализируем пустым
+						RealName:  "",                                             // Инициализируем пустым
+						Bio:       "",                                             // Инициализируем пустым
+						CreatedAt: time.Now().In(location),                        // Устанавливаем время создания с учетом TZ
+						UpdatedAt: time.Now().In(location),                        // Время обновления = время создания с учетом TZ
+					}
+					// Сохраняем новый профиль
+					err = b.storage.SetUserProfile(newProfile)
 					if err != nil {
-						log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка получения профиля: %v", chatID, user.ID, err)
-						return // Не удалось получить, не обновляем
+						log.Printf("[ERROR][UpdateProfileIfNeeded] Chat %d, User %d: Ошибка сохранения НОВОГО профиля: %v", chatID, user.ID, err)
 					}
-					if profile == nil {
-						profile = &storage.UserProfile{
-							ChatID: chatID,
-							UserID: user.ID,
-						}
+				} else {
+					// Профиль уже существует - НИЧЕГО НЕ ДЕЛАЕМ
+					if b.config.Debug {
+						log.Printf("[DEBUG][UpdateProfileIfNeeded] Chat %d, User %d (@%s): Профиль уже существует, автоматическое обновление пропущено.", chatID, user.ID, user.UserName)
 					}
-					// Обновляем данные
-					profile.Username = user.UserName
-					profile.LastSeen = time.Unix(int64(message.Date), 0)
-					// Устанавливаем Alias из FirstName при первом создании, если Alias пуст
-					if profile.Alias == "" && user.FirstName != "" {
-						profile.Alias = user.FirstName
-					}
-					// Сохраняем
-					err = b.storage.SetUserProfile(profile)
-					if err != nil {
-						log.Printf("[ERROR][UpdateProfile] Chat %d, User %d: Ошибка сохранения профиля: %v", chatID, user.ID, err)
-					}
-				}(message.Chat.ID, message.From) // Передаем chatID и user в горутину
-			}
-		*/
+				}
+			}(message.Chat.ID, message.From) // Передаем chatID и user в горутину
+		}
 
 		// --- Srach Analysis ---
 		srachHandled := false  // Flag that message was handled by srach logic
@@ -737,6 +745,11 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 	} else {
 		finalPrompt = b.config.DirectPrompt
 	}
+	// --- ЛОГИРОВАНИЕ --- >
+	if b.config.Debug {
+		log.Printf("[DEBUG][MH][DirectResponse] Chat %d: Финальный промпт перед отправкой: %s...", chatID, truncateString(finalPrompt, 150))
+	}
+	// --- КОНЕЦ ЛОГИРОВАНИЯ --- <
 
 	// 5. Генерируем ответ, используя GenerateResponseFromTextContext
 	responseText, errGen := b.llm.GenerateResponseFromTextContext(finalPrompt, contextText)

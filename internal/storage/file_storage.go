@@ -251,3 +251,15 @@ func (fs *FileStorage) UpdateMessageEmbedding(chatID int64, messageID int, vecto
 	log.Printf("[WARN][FileStorage] UpdateMessageEmbedding вызван для chatID %d, MsgID %d, но FileStorage не поддерживает эту операцию.", chatID, messageID)
 	return fmt.Errorf("UpdateMessageEmbedding не поддерживается FileStorage")
 }
+
+// UpdateVoiceTranscriptionEnabled обновляет настройку транскрипции голоса (Заглушка для FileStorage)
+func (fs *FileStorage) UpdateVoiceTranscriptionEnabled(chatID int64, enabled bool) error {
+	log.Printf("[WARN][FileStorage] UpdateVoiceTranscriptionEnabled для чата %d: операция не поддерживается FileStorage.", chatID)
+	return fmt.Errorf("UpdateVoiceTranscriptionEnabled не поддерживается FileStorage")
+}
+
+// UpdateSrachAnalysisEnabled обновляет настройку анализа срачей (Заглушка для FileStorage)
+func (fs *FileStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) error {
+	log.Printf("[WARN][FileStorage] UpdateSrachAnalysisEnabled для чата %d: операция не поддерживается FileStorage.", chatID)
+	return fmt.Errorf("UpdateSrachAnalysisEnabled не поддерживается FileStorage")
+}

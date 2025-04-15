@@ -41,11 +41,10 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		if settings, exists := b.chatSettings[chatID]; exists {
 			settings.PendingSetting = ""
 			lastSettingsMsgID = settings.LastSettingsMessageID // Используем сохраненный ID
-			settings.LastSettingsMessageID = 0                 // Сбрасываем ID после использования
 			// Удаляем само сообщение с настройками, если ID совпадает с callback.Message.MessageID
 			// (на случай, если lastSettingsMsgID не был сохранен правильно)
 			if lastSettingsMsgID == 0 || lastSettingsMsgID != callback.Message.MessageID {
-				log.Printf("[WARN] LastSettingsMessageID (%d) не совпадает с callback.Message.MessageID (%d) для чата %d. Удаляю callback.Message",
+				log.Printf("[WARN] LastSettingsMessageID (%d) не совпадает с callback.Message.MessageID (%d) для чата %d. Использую ID из колбэка.",
 					lastSettingsMsgID, callback.Message.MessageID, chatID)
 				lastSettingsMsgID = callback.Message.MessageID // Используем ID из колбэка как запасной вариант
 			}
@@ -77,32 +76,37 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		b.settingsMutex.Lock()
 		if settings, exists := b.chatSettings[chatID]; exists {
 			settings.Active = false
+			// Сохраняем ID меню для удаления
+			lastMainMenuMsgID := callback.Message.MessageID
+			settings.LastMenuMessageID = 0 // Сбрасываем сохраненный ID
+			b.settingsMutex.Unlock()
+
+			// Удаляем сообщение с основным меню
+			deleteMsg := tgbotapi.NewDeleteMessage(chatID, lastMainMenuMsgID)
+			b.api.Request(deleteMsg)
+
+			// Отправляем текстовое подтверждение
+			b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
+			b.answerCallback(callback.ID, "Бот остановлен")
+		} else {
+			b.settingsMutex.Unlock()
+			log.Printf("[WARN][Callback stop] Настройки для чата %d не найдены", chatID)
+			b.answerCallback(callback.ID, "Ошибка остановки")
 		}
-		b.settingsMutex.Unlock()
-		// Удаляем сообщение с основным меню
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
-		b.api.Request(deleteMsg)
-		// Отправляем текстовое подтверждение
-		b.sendReply(chatID, "Бот поставлен на паузу. Используйте /start чтобы возобновить.")
-		b.answerCallback(callback.ID, "Бот остановлен")
-		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
+		// Не обновляем клавиатуру, так как меню удалено
 		return
 
 	// Новые коллбэки для управления анализом срачей
-	case "toggle_srach_analysis": // Используем одно имя для переключения
-		b.settingsMutex.Lock()
-		if settings, exists := b.chatSettings[chatID]; exists {
-			settings.SrachAnalysisEnabled = !settings.SrachAnalysisEnabled
-			log.Printf("Чат %d: Анализ срачей переключен на %s", chatID, getEnabledStatusText(settings.SrachAnalysisEnabled))
-			// Сбрасываем состояние срача при переключении
-			settings.SrachState = "none"
-			settings.SrachMessages = nil
-			b.answerCallback(callback.ID, fmt.Sprintf("Анализ срачей: %s", getEnabledStatusText(settings.SrachAnalysisEnabled)))
+	case "toggle_srach_analysis":
+		log.Printf("[DEBUG][Callback] Chat %d: Получен коллбэк toggle_srach_analysis", chatID)
+		newEnabled, err := b.toggleSrachAnalysis(chatID) // Вызываем обновленную функцию
+		if err != nil {
+			log.Printf("[ERROR][Callback] Chat %d: Ошибка toggleSrachAnalysis: %v", chatID, err)
+			b.answerCallback(callback.ID, "Ошибка обновления настройки")
 		} else {
-			b.answerCallback(callback.ID, "Ошибка: Настройки чата не найдены")
+			b.answerCallback(callback.ID, fmt.Sprintf("🤬 Анализ срачей: %s", getEnabledStatusText(newEnabled)))
+			b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
 		}
-		b.settingsMutex.Unlock()
-		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
 		return
 
 	// Переключение транскрипции голоса
@@ -125,20 +129,21 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 
 		// 3. Переключаем состояние
 		newState := !currentState
-		dbSettings.VoiceTranscriptionEnabled = &newState // Обновляем указатель в настройках
+		// dbSettings.VoiceTranscriptionEnabled = &newState // Обновляем указатель в настройках
 		log.Printf("[DEBUG][Callback] Chat %d: Новое состояние VoiceTranscriptionEnabled: %t", chatID, newState)
 
-		// 4. Сохраняем обновленные настройки
-		err = b.storage.SetChatSettings(dbSettings)
+		// 4. Сохраняем обновленные настройки используя метод хранилища
+		err = b.storage.UpdateVoiceTranscriptionEnabled(chatID, newState)
+		// err = b.storage.SetChatSettings(dbSettings) // Заменяем на прямой вызов
 		if err != nil {
-			log.Printf("[ERROR][Callback] Chat %d: Ошибка сохранения настроек в DB для toggle_voice_transcription: %v", chatID, err)
-			b.answerCallback(callback.ID, "Ошибка сохранения настроек")
+			log.Printf("[ERROR][Callback] Chat %d: Ошибка сохранения настройки VoiceTranscriptionEnabled в DB: %v", chatID, err)
+			b.answerCallback(callback.ID, "Ошибка сохранения настройки")
 			return
 		}
 
 		// 5. Отвечаем и обновляем клавиатуру
 		statusText := getEnabledStatusText(newState)
-		b.answerCallback(callback.ID, fmt.Sprintf("Транскрипция голоса: %s", statusText))
+		b.answerCallback(callback.ID, fmt.Sprintf("🎤 Распознавание голоса: %s", statusText))
 		b.updateSettingsKeyboard(callback) // Обновляем клавиатуру
 		return
 

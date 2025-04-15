@@ -46,7 +46,15 @@ func (b *Bot) sendSettingsKeyboard(chatID int64, lastSettingsMsgID int) {
 	}
 
 	// Добавляем специфичные для чата настройки из dbSettings
-	voiceStatus := b.config.VoiceTranscriptionEnabledDefault
+	// Срач анализ
+	srachStatus := b.config.SrachAnalysisEnabled // Дефолт из конфига
+	if dbSettings.SrachAnalysisEnabled != nil {
+		srachStatus = *dbSettings.SrachAnalysisEnabled
+	}
+	msgText += fmt.Sprintf("\n🤬 Анализ срачей: %s", getEnabledStatusText(srachStatus))
+
+	// Транскрипция голоса
+	voiceStatus := b.config.VoiceTranscriptionEnabledDefault // Дефолт из конфига
 	if dbSettings.VoiceTranscriptionEnabled != nil {
 		voiceStatus = *dbSettings.VoiceTranscriptionEnabled
 	}
@@ -130,7 +138,15 @@ func (b *Bot) updateSettingsKeyboard(query *tgbotapi.CallbackQuery) {
 	}
 
 	// Добавляем специфичные для чата настройки из dbSettings
-	voiceStatus := b.config.VoiceTranscriptionEnabledDefault
+	// Срач анализ
+	srachStatus := b.config.SrachAnalysisEnabled // Дефолт из конфига
+	if dbSettings.SrachAnalysisEnabled != nil {
+		srachStatus = *dbSettings.SrachAnalysisEnabled
+	}
+	msgText += fmt.Sprintf("\n🤬 Анализ срачей: %s", getEnabledStatusText(srachStatus))
+
+	// Транскрипция голоса
+	voiceStatus := b.config.VoiceTranscriptionEnabledDefault // Дефолт из конфига
 	if dbSettings.VoiceTranscriptionEnabled != nil {
 		voiceStatus = *dbSettings.VoiceTranscriptionEnabled
 	}

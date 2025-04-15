@@ -164,6 +164,7 @@ func (b *Bot) runAutoSummaryForAllChats() {
 			settings.LastAutoSummaryTime = now // Обновляем время последнего запуска СРАЗУ
 			triggeredCount++
 			// Запускаем генерацию в горутине, чтобы не блокировать проверку других чатов
+			log.Printf("[DEBUG][AutoSummary] -> Запуск горутины createAndSendSummary для чата %d", chatID)
 			go b.createAndSendSummary(chatID)
 		}
 	}

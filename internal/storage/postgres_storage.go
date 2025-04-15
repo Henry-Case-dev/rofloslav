@@ -852,3 +852,11 @@ func (ps *PostgresStorage) UpdateMessageEmbedding(chatID int64, messageID int, v
 	log.Printf("[WARN][PostgresStorage] UpdateMessageEmbedding вызван для chatID %d, MsgID %d, но PostgresStorage не поддерживает эту операцию.", chatID, messageID)
 	return fmt.Errorf("UpdateMessageEmbedding не поддерживается PostgresStorage")
 }
+
+func (ps *PostgresStorage) UpdateVoiceTranscriptionEnabled(chatID int64, enabled bool) error {
+	return ps.updateSingleSetting(chatID, "voice_transcription_enabled", enabled)
+}
+
+func (ps *PostgresStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) error {
+	return ps.updateSingleSetting(chatID, "srach_analysis_enabled", enabled)
+}
