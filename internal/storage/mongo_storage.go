@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config" // Исправлен путь импорта конфига
+	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
 	"github.com/Henry-Case-dev/rofloslav/internal/llm"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -90,11 +91,12 @@ type MongoStorage struct {
 	cfg                    *config.Config    // Добавлена ссылка на конфиг
 	debug                  bool              // Сохраняем флаг debug из конфига
 	llmClient              llm.LLMClient     // Клиент LLM для генерации эмбеддингов
+	embeddingClient        *gemini.Client    // Клиент Gemini ИМЕННО для эмбеддингов
 }
 
 // NewMongoStorage создает новый экземпляр MongoStorage.
 // Принимает URI, имя БД, имена коллекций, конфиг и LLM клиент.
-func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, cfg *config.Config, llmClient llm.LLMClient) (*MongoStorage, error) {
+func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesCollectionName string, cfg *config.Config, llmClient llm.LLMClient, embeddingClient *gemini.Client) (*MongoStorage, error) {
 	if mongoURI == "" || dbName == "" || messagesCollectionName == "" || userProfilesCollectionName == "" || cfg.MongoDbSettingsCollection == "" {
 		return nil, fmt.Errorf("необходимо указать MongoDB URI, имя БД и имена всех коллекций (messages, userProfiles, settings)")
 	}
@@ -128,8 +130,9 @@ func NewMongoStorage(mongoURI, dbName, messagesCollectionName, userProfilesColle
 		userProfilesCollection: userProfilesColl,
 		settingsCollection:     settingsColl,
 		cfg:                    cfg,
-		debug:                  cfg.Debug, // Берем из конфига
-		llmClient:              llmClient, // Сохраняем LLM клиент
+		debug:                  cfg.Debug,       // Берем из конфига
+		llmClient:              llmClient,       // Сохраняем LLM клиент
+		embeddingClient:        embeddingClient, // Сохраняем правильный клиент
 	}
 
 	// Создание индексов при инициализации
@@ -296,7 +299,7 @@ func (ms *MongoStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
 	}
 
 	// --- Генерация эмбеддинга перед сохранением ---
-	if ms.cfg.LongTermMemoryEnabled && ms.llmClient != nil {
+	if ms.cfg.LongTermMemoryEnabled {
 		textToEmbed := ""
 		if mongoMsg.Text != "" {
 			textToEmbed = mongoMsg.Text
@@ -305,18 +308,22 @@ func (ms *MongoStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
 		}
 
 		if textToEmbed != "" {
-			if ms.debug {
-				log.Printf("[Mongo AddMessage DEBUG] Чат %d: Попытка генерации эмбеддинга для сообщения ID %d...", chatID, mongoMsg.MessageID)
-			}
-			vector, err := ms.llmClient.EmbedContent(textToEmbed)
-			if err != nil {
-				// Логируем ошибку, но НЕ прерываем сохранение сообщения
-				log.Printf("[WARN][Mongo AddMessage] Чат %d, Msg %d: Ошибка генерации эмбеддинга при добавлении: %v. Сообщение будет сохранено без вектора.", chatID, mongoMsg.MessageID, err)
-			} else {
-				mongoMsg.MessageVector = vector // Сохраняем вектор
+			if ms.embeddingClient != nil { // Проверяем, что embeddingClient инициализирован
 				if ms.debug {
-					log.Printf("[Mongo AddMessage DEBUG] Чат %d, Msg %d: Эмбеддинг успешно сгенерирован (размерность %d).", chatID, mongoMsg.MessageID, len(vector))
+					log.Printf("[Mongo AddMessage DEBUG] Чат %d: Попытка генерации эмбеддинга для сообщения ID %d...", chatID, mongoMsg.MessageID)
 				}
+				var embedErr error
+				mongoMsg.MessageVector, embedErr = ms.embeddingClient.EmbedContent(textToEmbed) // Используем embeddingClient!
+				if embedErr != nil {
+					log.Printf("[WARN][Mongo AddMessage] Чат %d, Msg %d: Ошибка генерации эмбеддинга при добавлении: %v. Сообщение будет сохранено без вектора.", chatID, mongoMsg.MessageID, embedErr)
+					// Не прерываем сохранение, просто эмбеддинга не будет
+				} else {
+					if ms.debug {
+						log.Printf("[Mongo AddMessage DEBUG] Чат %d: Эмбеддинг для сообщения ID %d успешно сгенерирован.", chatID, mongoMsg.MessageID)
+					}
+				}
+			} else {
+				log.Printf("[WARN][Mongo AddMessage] Чат %d, Msg %d: embeddingClient не инициализирован, пропуск генерации эмбеддинга.", chatID, mongoMsg.MessageID)
 			}
 		} else {
 			if ms.debug {
@@ -1107,8 +1114,8 @@ func (ms *MongoStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) e
 // SearchRelevantMessages ищет сообщения, семантически близкие к queryText,
 // используя MongoDB Atlas Vector Search.
 func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
-	if ms.llmClient == nil {
-		return nil, fmt.Errorf("LLM клиент не инициализирован в MongoStorage для поиска эмбеддингов")
+	if ms.embeddingClient == nil {
+		return nil, fmt.Errorf("embeddingClient не инициализирован в MongoStorage для поиска эмбеддингов")
 	}
 	if ms.cfg.MongoVectorIndexName == "" {
 		return nil, fmt.Errorf("имя векторного индекса (MONGO_VECTOR_INDEX_NAME) не задано в конфигурации")
@@ -1123,7 +1130,7 @@ func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k
 	}
 
 	// 1. Генерируем вектор для запроса
-	queryVector, err := ms.llmClient.EmbedContent(queryText)
+	queryVector, err := ms.embeddingClient.EmbedContent(queryText)
 	if err != nil {
 		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка генерации эмбеддинга для запроса: %v", chatID, err)
 		return nil, fmt.Errorf("ошибка генерации эмбеддинга запроса: %w", err)
@@ -1145,7 +1152,7 @@ func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k
 				{"index", ms.cfg.MongoVectorIndexName},
 				{"queryVector", queryVector},
 				{"path", "message_vector"},       // Поле, содержащее векторы в документах
-				{"numCandidates", int64(k * 10)}, // Искать среди большего числа кандидатов для точности (можно настроить)
+				{"numCandidates", int64(k * 50)}, // Искать среди большего числа кандидатов для точности (можно настроить)
 				{"limit", int64(k)},              // Вернуть только top K результатов
 				// Добавляем фильтр по chat_id, чтобы искать только в текущем чате
 				{"filter", bson.D{{"chat_id", chatID}}},

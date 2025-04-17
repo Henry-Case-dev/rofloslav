@@ -11,6 +11,7 @@ import (
 	"github.com/Henry-Case-dev/rofloslav/internal/deepseek"
 	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
 	"github.com/Henry-Case-dev/rofloslav/internal/llm"
+	"github.com/Henry-Case-dev/rofloslav/internal/openrouter"
 	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -22,6 +23,7 @@ import (
 type Bot struct {
 	api                   *tgbotapi.BotAPI
 	llm                   llm.LLMClient
+	embeddingClient       *gemini.Client
 	storage               storage.ChatHistoryStorage // Используем интерфейс
 	config                *config.Config
 	chatSettings          map[int64]*ChatSettings         // Настройки чатов (в памяти)
@@ -59,6 +61,8 @@ func New(cfg *config.Config) (*Bot, error) {
 		llmClient, err = gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.GeminiEmbeddingModelName, cfg.Debug)
 	case config.ProviderDeepSeek:
 		llmClient, err = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekModelName, cfg.DeepSeekBaseURL, cfg.Debug)
+	case config.ProviderOpenRouter:
+		llmClient, err = openrouter.New(cfg.OpenRouterAPIKey, cfg.OpenRouterModelName, cfg.OpenRouterSiteURL, cfg.OpenRouterSiteTitle, cfg)
 	default:
 		return nil, fmt.Errorf("неизвестный LLM провайдер: %s", cfg.LLMProvider)
 	}
@@ -66,6 +70,19 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil, fmt.Errorf("ошибка инициализации LLM клиента %s: %w", cfg.LLMProvider, err)
 	}
 	log.Println("LLM клиент успешно инициализирован.")
+
+	// Инициализация отдельного Gemini клиента для эмбеддингов/транскрипции
+	var geminiEmbedClient *gemini.Client
+	if cfg.GeminiAPIKey != "" { // Инициализируем, только если есть ключ
+		geminiEmbedClient, err = gemini.New(cfg.GeminiAPIKey, cfg.GeminiModelName, cfg.GeminiEmbeddingModelName, cfg.Debug)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка инициализации Gemini клиента для эмбеддингов: %w", err)
+		} else {
+			log.Println("--- Gemini Embedding/Transcription Client Initialized --- ")
+		}
+	} else {
+		log.Println("[WARN] Gemini API Key не указан. Функции эмбеддингов и транскрипции будут недоступны.")
+	}
 
 	// Инициализация хранилища
 	log.Printf("Инициализация хранилища: %s", cfg.StorageType)
@@ -98,8 +115,9 @@ func New(cfg *config.Config) (*Bot, error) {
 			cfg.MongoDbName,
 			cfg.MongoDbMessagesCollection,
 			cfg.MongoDbUserProfilesCollection,
-			cfg,       // Передаем весь конфиг
-			llmClient, // Передаем LLM клиент
+			cfg,               // Передаем весь конфиг
+			llmClient,         // Передаем LLM клиент
+			geminiEmbedClient, // Передаем сюда КЛИЕНТ ДЛЯ ЭМБЕДДИНГОВ
 		)
 		if initErr != nil {
 			log.Printf("[WARN] Ошибка инициализации MongoDB хранилища: %v. Переключение на файловое хранилище.", initErr)
@@ -124,6 +142,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	b := &Bot{
 		api:                   api,
 		llm:                   llmClient,
+		embeddingClient:       geminiEmbedClient,
 		storage:               storageImpl, // Назначаем выбранное хранилище
 		config:                cfg,
 		chatSettings:          chatSettings,

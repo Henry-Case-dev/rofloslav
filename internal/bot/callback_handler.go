@@ -265,12 +265,15 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	}
 }
 
+// getCurrentModelName возвращает имя текущей используемой модели LLM
 func (b *Bot) getCurrentModelName() string {
 	switch b.config.LLMProvider {
 	case config.ProviderGemini:
 		return b.config.GeminiModelName
 	case config.ProviderDeepSeek:
 		return b.config.DeepSeekModelName
+	case config.ProviderOpenRouter:
+		return b.config.OpenRouterModelName
 	default:
 		return "Неизвестная модель"
 	}

@@ -51,23 +51,28 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 			return
 		}
 
-		// 3. Транскрибируем аудио
-		// Используем MIME-тип из Voice, если он есть, иначе предполагаем 'audio/ogg'
-		mimeType := originalMessage.Voice.MimeType
-		if mimeType == "" {
-			mimeType = "audio/ogg" // Типичный формат для голосовых Telegram
+		// Распознаем речь
+		if b.embeddingClient == nil {
+			log.Printf("[ERROR][VoiceHandler] Chat %d: embeddingClient не инициализирован, транскрибация невозможна.", chatID)
+			b.sendReply(chatID, "⚠️ Ошибка конфигурации: транскрибация аудио недоступна.")
+			b.deleteMessage(chatID, loadingMsg.MessageID) // Удаляем статусное сообщение
+			return
 		}
-		rawTranscript, err := b.llm.TranscribeAudio(audioData, mimeType)
+		transcribedText, err := b.embeddingClient.TranscribeAudio(audioData, message.Voice.MimeType)
 		if err != nil {
 			log.Printf("[ERROR][VoiceHandler] Chat %d: Ошибка транскрибации: %v", chatID, err)
-			b.sendReply(chatID, "⚠️ Не удалось распознать речь в сообщении.")
+			errMsg := "⚠️ Не удалось распознать речь в сообщении."
+			if strings.Contains(err.Error(), "лимит") || strings.Contains(err.Error(), "quota") {
+				errMsg = "⚠️ Превышен лимит использования или квота для транскрибации."
+			}
+			b.sendReply(chatID, errMsg)
 			if loadingMsg != nil {
 				b.deleteMessage(chatID, loadingMsg.MessageID)
 			}
 			return
 		}
 
-		if rawTranscript == "" {
+		if transcribedText == "" {
 			log.Printf("[WARN][VoiceHandler] Chat %d: Транскрипция вернула пустой текст.", chatID)
 			b.sendReply(chatID, "⚠️ Распознанный текст пуст.")
 			if loadingMsg != nil {
@@ -77,10 +82,10 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		}
 
 		// 4. Форматируем текст (пунктуация, абзацы)
-		formattedText, err := b.llm.GenerateArbitraryResponse(b.config.VoiceFormatPrompt, rawTranscript)
+		formattedText, err := b.llm.GenerateArbitraryResponse(b.config.VoiceFormatPrompt, transcribedText)
 		if err != nil {
 			log.Printf("[WARN][VoiceHandler] Chat %d: Ошибка форматирования текста: %v. Использую сырой текст.", chatID, err)
-			formattedText = rawTranscript // Используем сырой текст как fallback
+			formattedText = transcribedText // Используем сырой текст как fallback
 		}
 
 		// 5. Создаем представительное текстовое сообщение

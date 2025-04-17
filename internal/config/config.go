@@ -11,15 +11,17 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// LLMProvider определяет тип используемого LLM провайдера
+// LLMProvider определяет тип для выбора LLM провайдера
 type LLMProvider string
 
 const (
-	ProviderGemini   LLMProvider = "gemini"
-	ProviderDeepSeek LLMProvider = "deepseek"
+	// Константы для типов LLM провайдеров
+	ProviderGemini     LLMProvider = "gemini"
+	ProviderDeepSeek   LLMProvider = "deepseek"
+	ProviderOpenRouter LLMProvider = "openrouter"
 )
 
-// StorageType определяет тип используемого хранилища
+// StorageType определяет тип используемого хранилища.
 type StorageType string
 
 const (
@@ -44,7 +46,7 @@ type Config struct {
 	// --- Новые поля для настроек по умолчанию ---
 	DefaultConversationStyle string  // Стиль общения по умолчанию
 	DefaultTemperature       float64 // Температура по умолчанию
-	DefaultModel             string  // Модель LLM по умолчанию
+	DefaultModel             string  // Модель LLM по умолчанию // ПРИМЕЧАНИЕ: Это поле больше не используется напрямую для выбора модели LLM! Используются специфичные для провайдера поля ниже.
 	DefaultSafetyThreshold   string  // Уровень безопасности Gemini по умолчанию
 	// --- Конец новых полей ---
 	// Настройки Gemini
@@ -54,6 +56,12 @@ type Config struct {
 	DeepSeekAPIKey    string
 	DeepSeekModelName string
 	DeepSeekBaseURL   string // Опционально, для кастомного URL
+	// --- НОВЫЕ Настройки OpenRouter ---
+	OpenRouterAPIKey    string
+	OpenRouterModelName string
+	OpenRouterSiteURL   string // Optional HTTP-Referer
+	OpenRouterSiteTitle string // Optional X-Title
+	// --- КОНЕЦ Настроек OpenRouter ---
 	// Настройки поведения бота
 	RateLimitStaticText string // Статический текст для сообщения о лимите
 	RateLimitPrompt     string // Промпт для LLM для сообщения о лимите
@@ -158,6 +166,12 @@ func Load() (*Config, error) {
 	deepSeekModelName := getEnvOrDefault("DEEPSEEK_MODEL_NAME", "deepseek-chat")           // По умолчанию deepseek-chat
 	deepSeekBaseURL := getEnvOrDefault("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1") // Стандартный URL API v1
 
+	// --- Загрузка переменных OpenRouter ---
+	openRouterAPIKey := getEnvOrDefault("OPENROUTER_API_KEY", "")
+	openRouterModelName := getEnvOrDefault("OPENROUTER_MODEL_NAME", "google/gemini-flash-1.5")
+	openRouterSiteURL := getEnvOrDefault("OPENROUTER_SITE_URL", "")
+	openRouterSiteTitle := getEnvOrDefault("OPENROUTER_SITE_TITLE", "")
+
 	// --- Загрузка промптов для настроек и срачей ---
 	classifyDirectMessagePrompt := getEnvOrDefault("CLASSIFY_DIRECT_MESSAGE_PROMPT", "Классифицируй это сообщение: serious или casual?")
 	seriousDirectPrompt := getEnvOrDefault("SERIOUS_DIRECT_PROMPT", "Ответь серьезно.")
@@ -209,6 +223,11 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] DEEPSEEK_API_KEY: ...%s (len %d)", truncateStringEnd(deepSeekAPIKey, 5), len(deepSeekAPIKey))
 	log.Printf("[Config Load] DEEPSEEK_MODEL_NAME: %s", deepSeekModelName)
 	log.Printf("[Config Load] DEEPSEEK_BASE_URL: %s", deepSeekBaseURL)
+	log.Printf("[Config Load] --- OpenRouter Settings ---")
+	log.Printf("[Config Load] OPENROUTER_API_KEY: ...%s (len %d)", truncateStringEnd(openRouterAPIKey, 5), len(openRouterAPIKey))
+	log.Printf("[Config Load] OPENROUTER_MODEL_NAME: %s", openRouterModelName)
+	log.Printf("[Config Load] OPENROUTER_SITE_URL: %s", openRouterSiteURL)
+	log.Printf("[Config Load] OPENROUTER_SITE_TITLE: %s", openRouterSiteTitle)
 	log.Printf("[Config Load] --- Database Settings ---")
 	log.Printf("[Config Load] STORAGE_TYPE: %s", storageTypeStr) // Логируем тип хранилища
 	// Логирование PostgreSQL
@@ -267,6 +286,11 @@ func Load() (*Config, error) {
 		llmProvider = ProviderDeepSeek
 		if defaultModel == "" {
 			defaultModel = deepSeekModelName // Используем модель DeepSeek по умолчанию
+		}
+	case string(ProviderOpenRouter):
+		llmProvider = ProviderOpenRouter
+		if defaultModel == "" {
+			defaultModel = openRouterModelName // Используем модель OpenRouter по умолчанию
 		}
 	default:
 		log.Printf("[Config Load WARN] Неизвестный LLM_PROVIDER '%s'. Используется '%s'.", llmProviderStr, ProviderGemini)
@@ -436,6 +460,11 @@ func Load() (*Config, error) {
 		// --- Настройки бэкфилла эмбеддингов ---
 		BackfillBatchSize:         backfillBatchSize,
 		BackfillBatchDelaySeconds: backfillBatchDelaySeconds,
+		// --- Новые поля для OpenRouter ---
+		OpenRouterAPIKey:    openRouterAPIKey,
+		OpenRouterModelName: openRouterModelName,
+		OpenRouterSiteURL:   openRouterSiteURL,
+		OpenRouterSiteTitle: openRouterSiteTitle,
 	}
 
 	// Валидация и установка StorageType
@@ -465,6 +494,11 @@ func Load() (*Config, error) {
 		// cfg.LLMProvider = ProviderDeepSeek // Уже установлено
 		if cfg.DeepSeekAPIKey == "" {
 			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
+		}
+		// Установка DefaultModel уже произошла выше, если он был пуст
+	case ProviderOpenRouter:
+		if cfg.OpenRouterAPIKey == "" {
+			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_API_KEY не установлен")
 		}
 		// Установка DefaultModel уже произошла выше, если он был пуст
 	default: // Этот кейс не должен достигаться из-за валидации выше, но на всякий случай
@@ -567,6 +601,11 @@ func logLoadedConfig(cfg *Config) {
 		log.Printf("  DeepSeek API Key: %s", maskSecret(cfg.DeepSeekAPIKey))
 		log.Printf("  DeepSeek Model: %s", cfg.DeepSeekModelName)
 		log.Printf("  DeepSeek Base URL: %s", cfg.DeepSeekBaseURL)
+	case ProviderOpenRouter:
+		log.Printf("  OpenRouter API Key: %s", maskSecret(cfg.OpenRouterAPIKey))
+		log.Printf("  OpenRouter Model Name: %s", cfg.OpenRouterModelName)
+		log.Printf("  OpenRouter Site URL: %s", cfg.OpenRouterSiteURL)
+		log.Printf("  OpenRouter Site Title: %s", cfg.OpenRouterSiteTitle)
 	}
 
 	log.Printf("Rate Limit Static Text: %s", cfg.RateLimitStaticText)
@@ -629,9 +668,9 @@ func getEnvOrDefault(key, defaultValue string) string {
 	}
 	if defaultValue != "" { // Логируем только если значение не пустое
 		// Уменьшил уровень детализации для значений по умолчанию БД и секретов
-		if !strings.HasPrefix(key, "POSTGRESQL_") && !strings.HasPrefix(key, "MONGODB_") && key != "GEMINI_API_KEY" && key != "DEEPSEEK_API_KEY" {
+		if !strings.HasPrefix(key, "POSTGRESQL_") && !strings.HasPrefix(key, "MONGODB_") && key != "GEMINI_API_KEY" && key != "DEEPSEEK_API_KEY" && key != "OPENROUTER_API_KEY" && key != "OPENROUTER_MODEL_NAME" {
 			log.Printf("Переменная окружения %s не установлена, используется значение по умолчанию: %s", key, defaultValue)
-		} else if key == "POSTGRESQL_PASSWORD" || key == "GEMINI_API_KEY" || key == "DEEPSEEK_API_KEY" || key == "MONGODB_URI" {
+		} else if key == "POSTGRESQL_PASSWORD" || key == "GEMINI_API_KEY" || key == "DEEPSEEK_API_KEY" || key == "OPENROUTER_API_KEY" || key == "MONGODB_URI" || key == "OPENROUTER_SITE_URL" || key == "OPENROUTER_SITE_TITLE" {
 			log.Printf("Переменная окружения %s не установлена.", key) // Не логируем секретные значения по умолчанию
 		} else {
 			// Не логируем хост, юзера, имя БД если они пустые по умолчанию
@@ -690,19 +729,49 @@ func ValidateConfig(cfg *Config) error {
 		if cfg.GeminiAPIKey == "" {
 			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_API_KEY не установлен")
 		}
+		if cfg.GeminiModelName == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_MODEL_NAME не установлен")
+		}
+		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
+			return fmt.Errorf("LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен")
+		}
 	case ProviderDeepSeek:
 		if cfg.DeepSeekAPIKey == "" {
 			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
 		}
-		// Валидация новых промптов
-		if cfg.ClassifyDirectMessagePrompt == "" {
-			return fmt.Errorf("ошибка конфигурации: CLASSIFY_DIRECT_MESSAGE_PROMPT не должен быть пустым")
+		if cfg.DeepSeekModelName == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_MODEL_NAME не установлен")
 		}
-		if cfg.SeriousDirectPrompt == "" {
-			return fmt.Errorf("ошибка конфигурации: SERIOUS_DIRECT_PROMPT не должен быть пустым")
+		// Для DeepSeek также нужен GeminiEmbeddingModelName, если LongTermMemoryEnabled
+		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
+			log.Println("[WARN] LLM_PROVIDER='deepseek' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен. Используется 'embedding-001' по умолчанию.")
+			// Можно установить дефолт здесь или при загрузке
+			if cfg.GeminiEmbeddingModelName == "" {
+				cfg.GeminiEmbeddingModelName = "embedding-001"
+			}
+		}
+		if cfg.LongTermMemoryEnabled && cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("LLM_PROVIDER='deepseek' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_API_KEY не установлен (нужен для эмбеддингов)")
+		}
+	case ProviderOpenRouter:
+		if cfg.OpenRouterAPIKey == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_API_KEY не установлен")
+		}
+		if cfg.OpenRouterModelName == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_MODEL_NAME не установлен")
+		}
+		// Для OpenRouter также нужен GeminiEmbeddingModelName, если LongTermMemoryEnabled
+		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
+			log.Println("[WARN] LLM_PROVIDER='openrouter' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен. Используется 'embedding-001' по умолчанию.")
+			if cfg.GeminiEmbeddingModelName == "" {
+				cfg.GeminiEmbeddingModelName = "embedding-001"
+			}
+		}
+		if cfg.LongTermMemoryEnabled && cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("LLM_PROVIDER='openrouter' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_API_KEY не установлен (нужен для эмбеддингов)")
 		}
 	default:
-		return fmt.Errorf("ошибка конфигурации: неизвестный LLM_PROVIDER '%s'", cfg.LLMProvider)
+		return fmt.Errorf("неизвестный LLM_PROVIDER: '%s'. Допустимые значения: 'gemini', 'deepseek', 'openrouter'", cfg.LLMProvider)
 	}
 
 	// Валидация интервалов
@@ -718,7 +787,7 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.ContextWindow < 1 {
 		return fmt.Errorf("ошибка конфигурации: CONTEXT_WINDOW (%d) должен быть >= 1", cfg.ContextWindow)
 	}
-	if cfg.SummaryIntervalHours < 0 || cfg.SummaryIntervalHours > 24 {
+	if cfg.SummaryIntervalHours < 0 {
 		return fmt.Errorf("ошибка конфигурации: SUMMARY_INTERVAL_HOURS (%d) должен быть в диапазоне 0-24", cfg.SummaryIntervalHours)
 	}
 
@@ -769,6 +838,17 @@ func ValidateConfig(cfg *Config) error {
 	}
 	if cfg.PromptEnterDirectLimitDuration == "" {
 		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_DURATION не должен быть пустым")
+	}
+
+	// Проверка ключа Gemini, если включена долгосрочная память или транскрипция
+	if cfg.LongTermMemoryEnabled || cfg.VoiceTranscriptionEnabledDefault {
+		if cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("GEMINI_API_KEY должен быть установлен, так как включена долгосрочная память или транскрипция голоса по умолчанию")
+		}
+		if cfg.GeminiEmbeddingModelName == "" {
+			log.Println("Предупреждение: GEMINI_EMBEDDING_MODEL_NAME не установлен, используется модель по умолчанию 'embedding-001' для эмбеддингов.")
+			cfg.GeminiEmbeddingModelName = "embedding-001" // Установим дефолтное значение, если не задано
+		}
 	}
 
 	return nil
