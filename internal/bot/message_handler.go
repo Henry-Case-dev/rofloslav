@@ -701,11 +701,14 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 
 	// 3. Собираем контекст для ответа
 	// 3.1 Получаем историю из краткосрочной памяти
-	history := b.storage.GetMessages(chatID)
-	// Ограничиваем историю
-	if len(history) > b.config.ContextWindow {
-		history = history[len(history)-b.config.ContextWindow:]
+	history, errHist := b.storage.GetMessages(chatID, b.config.ContextWindow)
+	if errHist != nil {
+		log.Printf("[ERROR][MH][DirectResponse] Chat %d: Ошибка получения истории сообщений: %v", chatID, errHist)
+		// Попробуем продолжить без истории или вернуть ошибку?
+		// Пока просто логируем и используем пустой срез
+		history = []*tgbotapi.Message{}
 	}
+	// Ограничивать историю тут уже не нужно, так как GetMessages делает это по limit
 
 	// 3.2 Получаем релевантные сообщения из долгосрочной памяти (если включено)
 	var relevantMessages []*tgbotapi.Message
@@ -780,15 +783,12 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 // sendAIResponse генерирует и отправляет ответ с помощью AI
 func (b *Bot) sendAIResponse(chatID int64) {
 	// --- Загрузка истории сообщений ---
-	history := b.storage.GetMessages(chatID) // Получаем всю доступную историю
-
-	// Ограничиваем историю до contextWindow, если она слишком большая
-	if len(history) > b.config.ContextWindow {
-		if b.config.Debug {
-			log.Printf("[DEBUG][sendAIResponse] Чат %d: История (%d) больше окна (%d), обрезаю.", chatID, len(history), b.config.ContextWindow)
-		}
-		history = history[len(history)-b.config.ContextWindow:]
+	history, errHist := b.storage.GetMessages(chatID, b.config.ContextWindow) // Используем limit
+	if errHist != nil {
+		log.Printf("[ERROR][MH][AIResponse] Chat %d: Ошибка получения истории сообщений: %v", chatID, errHist)
+		return // Не можем сгенерировать ответ без истории
 	}
+	// Ограничивать историю тут уже не нужно
 
 	// --- Форматирование контекста с профилями ---
 	// Передаем cfg и llmClient для работы долгосрочной памяти

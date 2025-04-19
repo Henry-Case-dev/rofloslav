@@ -80,8 +80,12 @@ func (b *Bot) loadChatHistory(chatID int64) {
 		// Загрузка последних N сообщений в память не требуется для БД,
 		// но можно запросить текущие GetMessages для логов
 		if b.config.Debug {
-			currentMsgs := b.storage.GetMessages(chatID) // Запросим для лога
-			log.Printf("[DEBUG][Load History] Чат %d: Хранилище (%s) инициализировано. Текущий контекст (из GetMessages): %d сообщ.", chatID, b.config.StorageType, len(currentMsgs))
+			currentMsgs, errGet := b.storage.GetMessages(chatID, b.config.ContextWindow) // Используем ContextWindow как лимит
+			if errGet != nil {
+				log.Printf("[DEBUG][Load History] Чат %d: Ошибка при вызове GetMessages для лога: %v", chatID, errGet)
+			} else {
+				log.Printf("[DEBUG][Load History] Чат %d: Хранилище (%s) инициализировано. Текущий контекст (из GetMessages): %d сообщ.", chatID, b.config.StorageType, len(currentMsgs))
+			}
 		}
 	}
 

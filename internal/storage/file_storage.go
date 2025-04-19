@@ -3,10 +3,10 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -146,185 +146,357 @@ func ConvertToAPIMessage(stored *StoredMessage) *tgbotapi.Message {
 	return msg
 }
 
-// SaveChatHistory сохраняет историю сообщений в файл
-func (fs *FileStorage) SaveChatHistory(chatID int64) error {
+// FileStorage реализует интерфейс ChatHistoryStorage для хранения данных в файлах JSON.
+type FileStorage struct {
+	messages      map[int64][]*tgbotapi.Message
+	userProfiles  map[int64]map[int64]*UserProfile // map[chatID]map[userID]UserProfile
+	contextWindow int
+	mutex         sync.RWMutex
+	autoSave      bool
+}
+
+// Убедимся, что FileStorage реализует интерфейс ChatHistoryStorage.
+var _ ChatHistoryStorage = (*FileStorage)(nil)
+
+// NewFileStorage создает новое файловое хранилище.
+func NewFileStorage(contextWindow int, autoSave bool) *FileStorage {
+	fs := &FileStorage{
+		messages:      make(map[int64][]*tgbotapi.Message),
+		userProfiles:  make(map[int64]map[int64]*UserProfile),
+		contextWindow: contextWindow,
+		autoSave:      autoSave,
+	}
+	// Загрузка существующих историй при старте
+	// TODO: Пересмотреть логику загрузки при старте
+	return fs
+}
+
+// AddMessage добавляет сообщение в историю чата в памяти.
+func (fs *FileStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
+	fs.mutex.Lock()
+	defer fs.mutex.Unlock()
+
+	fs.messages[chatID] = append(fs.messages[chatID], message)
+	// Ограничиваем размер истории
+	if len(fs.messages[chatID]) > fs.contextWindow {
+		fs.messages[chatID] = fs.messages[chatID][len(fs.messages[chatID])-fs.contextWindow:]
+	}
+}
+
+// GetMessages возвращает последние N сообщений для указанного чата из памяти.
+func (fs *FileStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Message, error) {
 	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+
 	messages, exists := fs.messages[chatID]
-	fs.mutex.RUnlock()
-
-	if !exists || len(messages) == 0 {
-		// Убрал лог, т.к. это нормальная ситуация
-		// log.Printf("[SaveChatHistory] Чат %d: Нет сообщений для сохранения или чат не найден.", chatID)
-		return nil
+	if !exists {
+		return nil, nil // Возвращаем nil, nil, если истории для чата нет
 	}
 
-	// Уменьшил уровень логирования, чтобы не засорять логи
-	// log.Printf("[SaveChatHistory] Чат %d: Начинаю сохранение %d сообщений.", chatID, len(messages))
-
-	// --- Используем директорию /data для Amvera ---
-	historyDir := "/data"
-	if err := os.MkdirAll(historyDir, 0755); err != nil {
-		log.Printf("[SaveChatHistory ERROR] Чат %d: Ошибка создания/доступа к директории /data: %v", chatID, err)
-		return fmt.Errorf("error creating/accessing history directory '/data': %w", err)
+	// Копируем срез, чтобы избежать гонки данных при возврате
+	// и обрезаем до лимита, если нужно
+	numMessages := len(messages)
+	start := 0
+	if numMessages > limit {
+		start = numMessages - limit
 	}
-	// Убрал лог об успешной проверке директории
-	// log.Printf("[SaveChatHistory] Чат %d: Директория '%s' проверена/создана.", chatID, historyDir)
+	msgsCopy := make([]*tgbotapi.Message, numMessages-start)
+	copy(msgsCopy, messages[start:])
 
-	fileName := filepath.Join(historyDir, fmt.Sprintf("chat_%d.json", chatID))
-	// Убрал лог имени файла
-	// log.Printf("[SaveChatHistory] Чат %d: Файл для сохранения: '%s'", chatID, fileName)
+	// Сообщения в file storage хранятся в хронологическом порядке (старые -> новые)
+	// Возвращаем последние 'limit' сообщений
+	return msgsCopy, nil
+}
 
-	// Преобразуем сообщения в формат для хранения
-	var storedMessages []*StoredMessage
-	for _, msg := range messages {
-		storedMsg := ConvertToStoredMessage(msg)
-		if storedMsg != nil {
-			storedMessages = append(storedMessages, storedMsg)
+// GetMessagesSince возвращает сообщения из указанного чата, начиная с определенного времени.
+func (fs *FileStorage) GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+
+	messages, exists := fs.messages[chatID]
+	if !exists {
+		return nil, nil // Нет истории для чата
+	}
+
+	// Ищем индекс первого сообщения, которое >= since
+	startIndex := -1
+	for i, msg := range messages {
+		if time.Unix(int64(msg.Date), 0).After(since) || time.Unix(int64(msg.Date), 0).Equal(since) {
+			startIndex = i
+			break
 		}
 	}
-	// Убрал лог о конвертации
-	// log.Printf("[SaveChatHistory] Чат %d: Сообщения сконвертированы в StoredMessage (%d).", chatID, len(storedMessages))
 
-	// Сериализуем в JSON
-	data, err := json.MarshalIndent(storedMessages, "", "  ")
-	if err != nil {
-		log.Printf("[SaveChatHistory ERROR] Чат %d: Ошибка маршалинга JSON: %v", chatID, err)
-		return fmt.Errorf("error marshaling chat history: %w", err)
-	}
-	// Убрал лог о сериализации
-	// log.Printf("[SaveChatHistory] Чат %d: История успешно сериализована в JSON (%d байт).", chatID, len(data))
-
-	// Записываем в файл
-	if err := ioutil.WriteFile(fileName, data, 0644); err != nil {
-		log.Printf("[SaveChatHistory ERROR] Чат %d: Ошибка записи в файл '%s': %v", chatID, fileName, err)
-		return fmt.Errorf("error writing chat history to '%s': %w", fileName, err)
+	if startIndex == -1 {
+		return nil, nil // Нет сообщений после указанной даты
 	}
 
-	log.Printf("[SaveChatHistory OK] Чат %d: История (%d сообщ.) записана в '%s'.", chatID, len(storedMessages), fileName)
+	// Копируем срез, чтобы избежать гонки данных при возврате
+	msgsCopy := make([]*tgbotapi.Message, len(messages)-startIndex)
+	copy(msgsCopy, messages[startIndex:])
+
+	return msgsCopy, nil // Возвращаем (slice, nil)
+}
+
+// AddMessagesToContext добавляет предоставленные сообщения в контекст чата.
+func (fs *FileStorage) AddMessagesToContext(chatID int64, messages []*tgbotapi.Message) {
+	fs.mutex.Lock()
+	defer fs.mutex.Unlock()
+	fs.messages[chatID] = messages
+
+	// Ограничиваем размер истории после добавления
+	if len(fs.messages[chatID]) > fs.contextWindow {
+		fs.messages[chatID] = fs.messages[chatID][len(fs.messages[chatID])-fs.contextWindow:]
+	}
+}
+
+// ClearChatHistory очищает историю сообщений для чата в памяти и удаляет файл.
+func (fs *FileStorage) ClearChatHistory(chatID int64) error {
+	fs.mutex.Lock()
+	defer fs.mutex.Unlock()
+
+	delete(fs.messages, chatID)
+
+	// Удаляем файл истории, если он существует
+	if err := fs.deleteChatHistoryFile(chatID); err != nil {
+		// Логируем ошибку, но не считаем её критичной для очистки памяти
+		log.Printf("[FileStorage ClearHistory WARN] Ошибка удаления файла истории для chatID %d: %v", chatID, err)
+	}
 	return nil
 }
 
-// LoadChatHistory загружает историю сообщений из файла
-func (fs *FileStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {
-	// --- Используем директорию /data для Amvera ---
-	historyDir := "/data"
-	fileName := filepath.Join(historyDir, fmt.Sprintf("chat_%d.json", chatID))
-	log.Printf("[LoadChatHistory] Чат %d: Загружаю историю из '%s'", chatID, fileName)
+// Close в FileStorage ничего не делает, но должен быть для интерфейса.
+func (fs *FileStorage) Close() error {
+	if fs.autoSave {
+		log.Println("FileStorage: Сохранение всех историй перед закрытием...")
+		for chatID := range fs.messages {
+			if err := fs.SaveChatHistory(chatID); err != nil {
+				log.Printf("[FileStorage Close ERROR] Ошибка сохранения истории для chatID %d: %v", chatID, err)
+			}
+		}
+		log.Println("FileStorage: Сохранение завершено.")
+	}
+	return nil
+}
 
-	// Проверяем существование файла
-	if _, err := os.Stat(fileName); os.IsNotExist(err) {
-		log.Printf("[LoadChatHistory] Чат %d: Файл истории '%s' не найден.", chatID, fileName)
-		return nil, nil // Файла нет - это не ошибка, просто нет истории
-	} else if err != nil {
-		// Другая ошибка при проверке файла
-		log.Printf("[LoadChatHistory ERROR] Чат %d: Ошибка проверки файла '%s': %v", chatID, fileName, err)
-		return nil, fmt.Errorf("error checking history file stat: %w", err)
+// SaveChatHistory сохраняет историю сообщений чата в JSON файл.
+func (fs *FileStorage) SaveChatHistory(chatID int64) error {
+	fs.mutex.RLock() // Блокируем на чтение
+	messages, exists := fs.messages[chatID]
+	fs.mutex.RUnlock()
+
+	if !exists {
+		// Если истории нет, ничего не сохраняем (или удаляем файл?) Пока ничего.
+		return nil
 	}
 
-	// Читаем данные из файла
-	// log.Printf("[LoadChatHistory] Чат %d: Файл '%s' найден, читаю содержимое.", chatID, fileName)
-	data, err := ioutil.ReadFile(fileName)
+	// Конвертируем сообщения в формат для хранения
+	storedMessages := make([]*StoredMessage, 0, len(messages))
+	for _, msg := range messages {
+		storedMessages = append(storedMessages, ConvertToStoredMessage(msg))
+	}
+
+	data, err := json.MarshalIndent(storedMessages, "", "  ")
 	if err != nil {
-		log.Printf("[LoadChatHistory ERROR] Чат %d: Ошибка чтения файла '%s': %v", chatID, fileName, err)
-		return nil, fmt.Errorf("error reading chat history: %w", err)
+		return fmt.Errorf("ошибка маршалинга истории чата %d: %w", chatID, err)
 	}
-	// log.Printf("[LoadChatHistory] Чат %d: Файл '%s' прочитан (%d байт).", chatID, fileName, len(data))
 
-	// Десериализуем из JSON
+	filename := fs.getChatHistoryFilename(chatID)
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("ошибка записи истории чата %d в файл %s: %w", chatID, filename, err)
+	}
+
+	return nil
+}
+
+// LoadChatHistory загружает историю сообщений из JSON файла.
+func (fs *FileStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {
+	filename := fs.getChatHistoryFilename(chatID)
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // Файл не найден - это не ошибка, просто нет истории
+		}
+		return nil, fmt.Errorf("ошибка чтения истории чата %d из файла %s: %w", chatID, filename, err)
+	}
+
+	if len(data) == 0 {
+		return []*tgbotapi.Message{}, nil // Пустой файл - пустая история
+	}
+
 	var storedMessages []*StoredMessage
 	if err := json.Unmarshal(data, &storedMessages); err != nil {
-		// Попытка обработать пустой или поврежденный JSON
-		if len(data) == 0 || string(data) == "null" || string(data) == "[]" {
-			log.Printf("[LoadChatHistory] Чат %d: Файл '%s' пуст или содержит пустой JSON, возвращаю пустую историю.", chatID, fileName)
-			return []*tgbotapi.Message{}, nil // Возвращаем пустой слайс, а не ошибку
-		}
-		log.Printf("[LoadChatHistory ERROR] Чат %d: Ошибка десериализации JSON из '%s': %v", chatID, fileName, err)
-		return nil, fmt.Errorf("error unmarshaling chat history: %w", err)
+		return nil, fmt.Errorf("ошибка демаршалинга истории чата %d из файла %s: %w", chatID, filename, err)
 	}
-	// log.Printf("[LoadChatHistory] Чат %d: JSON успешно десериализован в %d StoredMessage.", chatID, len(storedMessages))
 
-	// Преобразуем обратно в tgbotapi.Message
-	var messages []*tgbotapi.Message
+	// Конвертируем обратно в формат API
+	messages := make([]*tgbotapi.Message, 0, len(storedMessages))
 	for _, stored := range storedMessages {
-		apiMsg := ConvertToAPIMessage(stored)
-		if apiMsg != nil { // Добавляем проверку, что конвертация успешна
-			messages = append(messages, apiMsg)
-		} else {
-			log.Printf("[LoadChatHistory WARN] Чат %d: Не удалось конвертировать StoredMessage ID %d в tgbotapi.Message", chatID, stored.MessageID)
-		}
+		messages = append(messages, ConvertToAPIMessage(stored))
 	}
-	log.Printf("[LoadChatHistory OK] Чат %d: Успешно загружено %d сообщений из '%s'.", chatID, len(messages), fileName)
 
 	return messages, nil
 }
 
-// GetChatSettings возвращает пустые настройки, так как FileStorage их не хранит.
+// getChatHistoryFilename возвращает имя файла для истории чата.
+func (fs *FileStorage) getChatHistoryFilename(chatID int64) string {
+	// Создаем папку data, если ее нет
+	if _, err := os.Stat("data"); os.IsNotExist(err) {
+		_ = os.Mkdir("data", 0755)
+	}
+	return filepath.Join("data", fmt.Sprintf("%d.json", chatID))
+}
+
+// deleteChatHistoryFile удаляет файл истории чата.
+func (fs *FileStorage) deleteChatHistoryFile(chatID int64) error {
+	filename := fs.getChatHistoryFilename(chatID)
+	err := os.Remove(filename)
+	if err != nil && !os.IsNotExist(err) {
+		return err // Возвращаем ошибку, если она не "файл не найден"
+	}
+	return nil
+}
+
+// --- User Profile Methods (FileStorage - In-Memory) ---
+
+// GetUserProfile возвращает профиль пользователя из памяти.
+func (fs *FileStorage) GetUserProfile(chatID int64, userID int64) (*UserProfile, error) {
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+
+	if profiles, ok := fs.userProfiles[chatID]; ok {
+		if profile, ok := profiles[userID]; ok {
+			// Возвращаем копию, чтобы избежать изменения вне мьютекса
+			profileCopy := *profile
+			return &profileCopy, nil
+		}
+	}
+	return nil, nil // Профиль не найден
+}
+
+// SetUserProfile сохраняет профиль пользователя в память.
+func (fs *FileStorage) SetUserProfile(profile *UserProfile) error {
+	fs.mutex.Lock()
+	defer fs.mutex.Unlock()
+
+	if _, ok := fs.userProfiles[profile.ChatID]; !ok {
+		fs.userProfiles[profile.ChatID] = make(map[int64]*UserProfile)
+	}
+	// Сохраняем копию
+	profileCopy := *profile
+	fs.userProfiles[profile.ChatID][profile.UserID] = &profileCopy
+	// TODO: Добавить сохранение профилей в файл?
+	return nil
+}
+
+// GetAllUserProfiles возвращает все профили пользователей для чата из памяти.
+func (fs *FileStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+
+	if profilesMap, ok := fs.userProfiles[chatID]; ok {
+		profiles := make([]*UserProfile, 0, len(profilesMap))
+		for _, profile := range profilesMap {
+			// Возвращаем копии
+			profileCopy := *profile
+			profiles = append(profiles, &profileCopy)
+		}
+		return profiles, nil
+	}
+	return []*UserProfile{}, nil // Возвращаем пустой срез, если для чата нет профилей
+}
+
+// GetAllChatIDs возвращает все ID чатов, для которых есть история в памяти.
+func (fs *FileStorage) GetAllChatIDs() ([]int64, error) {
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+
+	chatIDs := make([]int64, 0, len(fs.messages))
+	for chatID := range fs.messages {
+		chatIDs = append(chatIDs, chatID)
+	}
+	return chatIDs, nil
+}
+
+// GetStatus возвращает строку со статусом FileStorage.
+func (fs *FileStorage) GetStatus(chatID int64) string {
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+
+	msgCount := 0
+	if msgs, ok := fs.messages[chatID]; ok {
+		msgCount = len(msgs)
+	}
+	profileCount := 0
+	if profiles, ok := fs.userProfiles[chatID]; ok {
+		profileCount = len(profiles)
+	}
+
+	return fmt.Sprintf("FileStorage | Сообщ: %d/%d | Профили: %d | Автосохр: %t",
+		msgCount, fs.contextWindow, profileCount, fs.autoSave)
+}
+
+// --- Chat Settings Methods (FileStorage - Not Implemented) ---
+
 func (fs *FileStorage) GetChatSettings(chatID int64) (*ChatSettings, error) {
-	log.Printf("[WARN][FileStorage] GetChatSettings вызван для chatID %d, но FileStorage не хранит настройки. Возвращены пустые.", chatID)
-	return &ChatSettings{ChatID: chatID}, nil // Возвращаем пустую структуру
+	// FileStorage не хранит настройки чатов персистентно.
+	// Возвращаем nil и nil, чтобы вызывающий код использовал дефолтные настройки.
+	return nil, nil
 }
 
-// SetChatSettings ничего не делает, так как FileStorage не хранит настройки.
 func (fs *FileStorage) SetChatSettings(settings *ChatSettings) error {
-	log.Printf("[WARN][FileStorage] SetChatSettings вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", settings.ChatID)
-	return nil // Не ошибка, просто ничего не делаем
+	log.Printf("[FileStorage WARN] SetChatSettings не поддерживается FileStorage для chatID %d", settings.ChatID)
+	return fmt.Errorf("SetChatSettings не поддерживается FileStorage")
 }
 
-// --- Новые методы для обновления отдельных настроек лимитов (заглушки) ---
-
-// UpdateDirectLimitEnabled ничего не делает, так как FileStorage не хранит настройки чата.
 func (fs *FileStorage) UpdateDirectLimitEnabled(chatID int64, enabled bool) error {
-	log.Printf("[WARN][FileStorage] UpdateDirectLimitEnabled вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
-	return nil // FileStorage не хранит ChatSettings
+	log.Printf("[FileStorage WARN] UpdateDirectLimitEnabled не поддерживается FileStorage для chatID %d", chatID)
+	return fmt.Errorf("UpdateDirectLimitEnabled не поддерживается FileStorage")
 }
 
-// UpdateDirectLimitCount ничего не делает, так как FileStorage не хранит настройки чата.
 func (fs *FileStorage) UpdateDirectLimitCount(chatID int64, count int) error {
-	log.Printf("[WARN][FileStorage] UpdateDirectLimitCount вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
-	return nil // FileStorage не хранит ChatSettings
+	log.Printf("[FileStorage WARN] UpdateDirectLimitCount не поддерживается FileStorage для chatID %d", chatID)
+	return fmt.Errorf("UpdateDirectLimitCount не поддерживается FileStorage")
 }
 
-// UpdateDirectLimitDuration ничего не делает, так как FileStorage не хранит настройки чата.
 func (fs *FileStorage) UpdateDirectLimitDuration(chatID int64, duration time.Duration) error {
-	log.Printf("[WARN][FileStorage] UpdateDirectLimitDuration вызван для chatID %d, но FileStorage не хранит настройки. Операция проигнорирована.", chatID)
-	return nil // FileStorage не хранит ChatSettings
+	log.Printf("[FileStorage WARN] UpdateDirectLimitDuration не поддерживается FileStorage для chatID %d", chatID)
+	return fmt.Errorf("UpdateDirectLimitDuration не поддерживается FileStorage")
 }
 
-// SearchRelevantMessages (Заглушка для FileStorage)
-// FileStorage не поддерживает векторный поиск.
-func (fs *FileStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
-	log.Printf("[WARN][FileStorage] SearchRelevantMessages вызван для chatID %d, но FileStorage не поддерживает векторный поиск. Возвращен пустой результат.", chatID)
-	return []*tgbotapi.Message{}, nil
-}
-
-// === Методы, специфичные для MongoDB (заглушки для FileStorage) ===
-
-// GetTotalMessagesCount (заглушка)
-func (fs *FileStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
-	log.Printf("[WARN][FileStorage] GetTotalMessagesCount вызван для chatID %d, но FileStorage не поддерживает эту операцию.", chatID)
-	return 0, fmt.Errorf("GetTotalMessagesCount не поддерживается FileStorage")
-}
-
-// FindMessagesWithoutEmbedding (заглушка)
-func (fs *FileStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error) {
-	log.Printf("[WARN][FileStorage] FindMessagesWithoutEmbedding вызван для chatID %d (лимит %d, пропуск %d ID), но FileStorage не поддерживает эту операцию.", chatID, limit, len(skipMessageIDs))
-	return nil, fmt.Errorf("FindMessagesWithoutEmbedding не поддерживается FileStorage")
-}
-
-// UpdateMessageEmbedding (заглушка)
-func (fs *FileStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
-	log.Printf("[WARN][FileStorage] UpdateMessageEmbedding вызван для chatID %d, MsgID %d, но FileStorage не поддерживает эту операцию.", chatID, messageID)
-	return fmt.Errorf("UpdateMessageEmbedding не поддерживается FileStorage")
-}
-
-// UpdateVoiceTranscriptionEnabled обновляет настройку транскрипции голоса (Заглушка для FileStorage)
 func (fs *FileStorage) UpdateVoiceTranscriptionEnabled(chatID int64, enabled bool) error {
-	log.Printf("[WARN][FileStorage] UpdateVoiceTranscriptionEnabled для чата %d: операция не поддерживается FileStorage.", chatID)
+	log.Printf("[FileStorage WARN] UpdateVoiceTranscriptionEnabled не поддерживается FileStorage для chatID %d", chatID)
 	return fmt.Errorf("UpdateVoiceTranscriptionEnabled не поддерживается FileStorage")
 }
 
-// UpdateSrachAnalysisEnabled обновляет настройку анализа срачей (Заглушка для FileStorage)
 func (fs *FileStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) error {
-	log.Printf("[WARN][FileStorage] UpdateSrachAnalysisEnabled для чата %d: операция не поддерживается FileStorage.", chatID)
+	log.Printf("[FileStorage WARN] UpdateSrachAnalysisEnabled не поддерживается FileStorage для chatID %d", chatID)
 	return fmt.Errorf("UpdateSrachAnalysisEnabled не поддерживается FileStorage")
+}
+
+// --- Embedding and Vector Search Methods (FileStorage - Stubs) ---
+
+func (fs *FileStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
+	log.Printf("[FileStorage WARN] SearchRelevantMessages не поддерживается FileStorage для chatID %d", chatID)
+	return nil, fmt.Errorf("векторный поиск не поддерживается FileStorage")
+}
+
+func (fs *FileStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
+	log.Printf("[FileStorage WARN] GetTotalMessagesCount не поддерживается FileStorage для chatID %d", chatID)
+	fs.mutex.RLock()
+	defer fs.mutex.RUnlock()
+	if msgs, ok := fs.messages[chatID]; ok {
+		return int64(len(msgs)), nil
+	}
+	return 0, nil // Возвращаем 0, если истории нет
+}
+
+func (fs *FileStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error) {
+	log.Printf("[FileStorage WARN] FindMessagesWithoutEmbedding не поддерживается FileStorage для chatID %d", chatID)
+	return nil, fmt.Errorf("операции с эмбеддингами не поддерживаются FileStorage")
+}
+
+func (fs *FileStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
+	log.Printf("[FileStorage WARN] UpdateMessageEmbedding не поддерживается FileStorage для chatID %d, messageID %d", chatID, messageID)
+	return fmt.Errorf("операции с эмбеддингами не поддерживаются FileStorage")
 }

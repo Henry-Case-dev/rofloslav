@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -17,31 +18,68 @@ const telegramMaxMessageLength = 4096
 // createAndSendSummary создает и отправляет саммари диалога,
 // редактируя существующее сообщение или отправляя новое.
 func (b *Bot) createAndSendSummary(chatID int64) {
-	log.Printf("[DEBUG][createAndSendSummary] Чат %d: Функция вызвана.", chatID)
-
-	// Получаем ID сообщения "Генерирую..."
-	b.settingsMutex.RLock()
-	settings, exists := b.chatSettings[chatID]
-	var infoMessageID int
-	if exists {
-		infoMessageID = settings.LastInfoMessageID
-	} else {
-		log.Printf("[WARN][createAndSendSummary] Чат %d: Настройки не найдены, не могу получить LastInfoMessageID.", chatID)
+	if b.config.Debug {
+		log.Printf("[DEBUG][createAndSendSummary] Чат %d: Функция вызвана.", chatID)
 	}
-	b.settingsMutex.RUnlock()
 
-	// --- Сообщение для редактирования/отправки ---
+	// Объявляем переменные для текста сообщения
 	var editText, sendText string // Текст для редактирования или нового сообщения
 	parseMode := ""               // Режим парсинга (Markdown)
 
+	// Загружаем или берем из кэша настройки чата
+	b.settingsMutex.RLock()
+	chatSettings, exists := b.chatSettings[chatID]
+	b.settingsMutex.RUnlock()
+	if !exists {
+		log.Printf("[Summary] Ошибка: Настройки для чата %d не найдены.", chatID)
+		return
+	}
+
 	// Получаем сообщения за последние 24 часа
-	messages := b.storage.GetMessagesSince(chatID, time.Now().Add(-24*time.Hour))
+	messages, errMsgs := b.storage.GetMessagesSince(chatID, time.Now().Add(-24*time.Hour))
+	if errMsgs != nil {
+		log.Printf("[Summary] Chat %d: Ошибка получения сообщений: %v", chatID, errMsgs)
+		// Обновляем сообщение, если есть ID
+		editText = fmt.Sprintf("❌ Ошибка при получении сообщений для саммари: %v", errMsgs)
+		sendText = editText // Используем тот же текст для отправки нового сообщения
+		b.updateOrCreateMessage(chatID, chatSettings.LastInfoMessageID, editText, sendText, "")
+		return
+	}
+
 	if len(messages) == 0 {
 		editText = "Недостаточно сообщений за последние 24 часа для создания саммари."
 		sendText = editText
-		b.updateOrCreateMessage(chatID, infoMessageID, editText, sendText, parseMode)
+		b.updateOrCreateMessage(chatID, chatSettings.LastInfoMessageID, editText, sendText, "")
 		return
 	}
+
+	// --- Получение профилей пользователей ---
+	userProfiles, errProfiles := b.storage.GetAllUserProfiles(chatID)
+	if errProfiles != nil {
+		log.Printf("[Summary] Chat %d: Ошибка получения профилей пользователей: %v", chatID, errProfiles)
+		// Можно продолжить без профилей или вернуть ошибку?
+		// Пока продолжим, просто залогировав.
+		userProfiles = []*storage.UserProfile{} // Используем пустой срез
+	}
+
+	// --- Форматирование истории с профилями ---
+	// loc, _ := time.LoadLocation(b.config.TimeZone) // Загружаем таймзону (перенесено внутрь formatHistoryWithProfiles)
+	contextText := formatHistoryWithProfiles(chatID, messages, b.storage, b.config, b.llm, b.config.Debug, b.config.TimeZone)
+
+	if contextText == "" {
+		log.Printf("[Summary] Chat %d: Контекст для саммари пуст после форматирования.", chatID)
+		editText = "Не удалось подготовить данные для саммари (контекст пуст)."
+		sendText = editText
+		b.updateOrCreateMessage(chatID, chatSettings.LastInfoMessageID, editText, sendText, "")
+		return
+	}
+
+	if b.config.Debug {
+		log.Printf("[DEBUG] Создаю саммари для чата %d. Используется сообщений: %d (%d профилей). Инфо-сообщение ID: %d",
+			chatID, len(messages), len(userProfiles), chatSettings.LastInfoMessageID) // Используем userProfiles в логе
+	}
+
+	// --- Генерация саммари ---
 
 	// --- Ограничение количества сообщений для саммари ---
 	if len(messages) > maxMessagesForSummary {
@@ -50,24 +88,8 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	}
 	// --- Конец ограничения ---
 
-	if b.config.Debug {
-		log.Printf("[DEBUG] Создаю саммари для чата %d. Используется сообщений: %d. Инфо-сообщение ID: %d", chatID, len(messages), infoMessageID)
-	}
-
 	// Используем только промпт для саммари без комбинирования
 	summaryPrompt := b.config.SummaryPrompt
-
-	// --- Формирование контекста с профилями ---
-	// Передаем cfg и llmClient для возможного использования долгосрочной памяти при генерации саммари (хотя пока не используется)
-	contextText := formatHistoryWithProfiles(chatID, messages, b.storage, b.config, b.llm, b.config.Debug, b.config.TimeZone)
-	if contextText == "" {
-		log.Printf("[WARN][createAndSendSummary] Чат %d: Отформатированный контекст для саммари пуст.", chatID)
-		editText = "Не удалось подготовить данные для саммари (контекст пуст)."
-		sendText = editText
-		b.updateOrCreateMessage(chatID, infoMessageID, editText, sendText, parseMode)
-		return
-	}
-	// --- Конец форматирования ---
 
 	const maxAttempts = 3 // Максимальное количество попыток генерации
 	const minWords = 10   // Минимальное количество слов в саммари
@@ -146,7 +168,7 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	}
 
 	// Обновляем или создаем сообщение
-	b.updateOrCreateMessage(chatID, infoMessageID, editText, sendText, parseMode)
+	b.updateOrCreateMessage(chatID, chatSettings.LastInfoMessageID, editText, sendText, parseMode)
 }
 
 // updateOrCreateMessage редактирует существующее сообщение или отправляет новое.

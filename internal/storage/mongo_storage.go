@@ -2,21 +2,19 @@ package storage
 
 import (
 	"context"
-	"encoding/json"
-	"errors" // Для проверки ошибок MongoDB
+	"errors"
 	"fmt"
 	"log"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/Henry-Case-dev/rofloslav/internal/config" // Исправлен путь импорта конфига
-	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
-	"github.com/Henry-Case-dev/rofloslav/internal/llm"
-
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
+	"github.com/Henry-Case-dev/rofloslav/internal/gemini" // Для типа embeddingClient
+	"github.com/Henry-Case-dev/rofloslav/internal/llm"    // Для типа llmClient
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -26,66 +24,6 @@ var _ ChatHistoryStorage = (*MongoStorage)(nil)
 
 // Имя коллекции для настроек чата
 const settingsCollectionName = "chat_settings"
-
-// MongoMessage представляет структуру сообщения для хранения в MongoDB.
-type MongoMessage struct {
-	ID               primitive.ObjectID       `bson:"_id,omitempty"`
-	ChatID           int64                    `bson:"chat_id"`
-	MessageID        int                      `bson:"message_id"`
-	UserID           int64                    `bson:"user_id,omitempty"`
-	Username         string                   `bson:"username,omitempty"`
-	FirstName        string                   `bson:"first_name,omitempty"`
-	LastName         string                   `bson:"last_name,omitempty"`
-	IsBot            bool                     `bson:"is_bot,omitempty"`
-	Date             time.Time                `bson:"date"` // Используем time.Time для сортировки
-	Text             string                   `bson:"text,omitempty"`
-	ReplyToMessageID int                      `bson:"reply_to_message_id,omitempty"`
-	Entities         []tgbotapi.MessageEntity `bson:"entities,omitempty"`
-	// Новые поля:
-	Caption         string                   `bson:"caption,omitempty"`          // Текст подписи к медиа
-	CaptionEntities []tgbotapi.MessageEntity `bson:"caption_entities,omitempty"` // Форматирование подписи
-	HasMedia        bool                     `bson:"has_media,omitempty"`        // Флаг наличия медиа
-	IsVoice         bool                     `bson:"is_voice,omitempty"`         // Флаг, что сообщение из аудио
-	MessageVector   []float32                `bson:"message_vector,omitempty"`   // Векторное представление сообщения
-	// --- Добавляем поля для информации о пересылке ---
-	IsForward              bool      `bson:"is_forward,omitempty"`
-	ForwardedFromUserID    int64     `bson:"forwarded_from_user_id,omitempty"`
-	ForwardedFromChatID    int64     `bson:"forwarded_from_chat_id,omitempty"` // Если переслано из канала
-	ForwardedFromMessageID int       `bson:"forwarded_from_message_id,omitempty"`
-	ForwardedDate          time.Time `bson:"forwarded_date,omitempty"`
-}
-
-// convertMongoToAPIMessage преобразует MongoMessage обратно в *tgbotapi.Message
-func convertMongoToAPIMessage(mongoMsg *MongoMessage) *tgbotapi.Message {
-	if mongoMsg == nil {
-		return nil
-	}
-
-	msg := &tgbotapi.Message{
-		MessageID: mongoMsg.MessageID,
-		From: &tgbotapi.User{
-			ID:        mongoMsg.UserID,
-			IsBot:     mongoMsg.IsBot,
-			FirstName: mongoMsg.FirstName,
-			LastName:  mongoMsg.LastName,
-			UserName:  mongoMsg.Username,
-		},
-		Date:     int(mongoMsg.Date.Unix()),           // Преобразуем time.Time обратно в Unix timestamp
-		Chat:     &tgbotapi.Chat{ID: mongoMsg.ChatID}, // Добавляем ChatID
-		Text:     mongoMsg.Text,
-		Entities: mongoMsg.Entities,
-	}
-
-	// Информацию об ответе не храним в MongoMessage, поэтому не восстанавливаем
-	// msg.ReplyToMessage = ...
-
-	// Добавляем префикс для голосовых сообщений
-	if mongoMsg.IsVoice {
-		msg.Text = fmt.Sprintf("[Голосовое]: %s", msg.Text)
-	}
-
-	return msg
-}
 
 // MongoStorage реализует ChatHistoryStorage с использованием MongoDB.
 type MongoStorage struct {
@@ -98,6 +36,9 @@ type MongoStorage struct {
 	debug                  bool              // Сохраняем флаг debug из конфига
 	llmClient              llm.LLMClient     // Клиент LLM для генерации эмбеддингов
 	embeddingClient        *gemini.Client    // Клиент Gemini ИМЕННО для эмбеддингов
+
+	// Мьютекс для защиты map-ов с последними данными
+	settingsMutex sync.RWMutex
 }
 
 // NewMongoStorage создает новый экземпляр MongoStorage.
@@ -407,104 +348,94 @@ func convertAPIToMongoMessage(chatID int64, apiMsg *tgbotapi.Message) *MongoMess
 }
 
 // GetMessages возвращает последние сообщения из MongoDB для указанного chatID
-func (ms *MongoStorage) GetMessages(chatID int64) []*tgbotapi.Message {
+func (ms *MongoStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Message, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Опции для поиска: сортировка по дате (убывание) и лимит
+	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: -1}}).SetLimit(int64(limit)) // Исправлено
 	filter := bson.M{"chat_id": chatID}
-	findOptions := options.Find().
-		SetSort(bson.D{{"date", -1}}).        // Сортируем по дате, новые первыми
-		SetLimit(int64(ms.cfg.ContextWindow)) // Используем cfg.ContextWindow
 
 	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			if ms.debug {
-				log.Printf("[Mongo GetMessages DEBUG] Сообщения для chatID %d не найдены.", chatID)
-			}
-			return []*tgbotapi.Message{}
-		}
-		log.Printf("[Mongo GetMessages ERROR] Ошибка поиска сообщений для chatID %d: %v", chatID, err)
-		return nil // Возвращаем nil в случае ошибки запроса
+		log.Printf("[MongoStorage GetMessages ERROR] Ошибка поиска сообщений для chatID %d: %v", chatID, err)
+		return nil, err
 	}
 	defer cursor.Close(ctx)
 
 	var results []*tgbotapi.Message
 	for cursor.Next(ctx) {
 		var mongoMsg MongoMessage
-		if err := cursor.Decode(&mongoMsg); err != nil {
-			log.Printf("[Mongo GetMessages ERROR] Ошибка декодирования сообщения для chatID %d: %v", chatID, err)
-			continue // Пропускаем поврежденное сообщение
+		err := cursor.Decode(&mongoMsg)
+		if err != nil {
+			log.Printf("[MongoStorage GetMessages ERROR] Ошибка декодирования сообщения для chatID %d: %v", chatID, err)
+			continue // Пропускаем некорректные сообщения
 		}
 		apiMsg := convertMongoToAPIMessage(&mongoMsg)
-		if apiMsg != nil {
-			results = append(results, apiMsg)
-		}
+		results = append(results, apiMsg)
 	}
 
 	if err := cursor.Err(); err != nil {
-		log.Printf("[Mongo GetMessages ERROR] Ошибка курсора после итерации для chatID %d: %v", chatID, err)
+		log.Printf("[MongoStorage GetMessages ERROR] Ошибка курсора при чтении сообщений для chatID %d: %v", chatID, err)
+		return nil, err
 	}
 
-	// Разворачиваем срез, т.к. сортировали от новых к старым
+	// Результаты уже отсортированы по убыванию даты (новые -> старые) из-за опции find
+	// Но для консистентности с другими хранилищами (где ожидается старые -> новые),
+	// развернем их.
 	for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
 		results[i], results[j] = results[j], results[i]
 	}
 
 	if ms.debug {
-		log.Printf("[Mongo GetMessages DEBUG] Запрошено %d сообщений для chatID %d.", len(results), chatID)
+		log.Printf("[MongoStorage GetMessages DEBUG] Загружено %d сообщений для chatID %d с лимитом %d.", len(results), chatID, limit)
 	}
 
-	return results
+	return results, nil
 }
 
-func (ms *MongoStorage) GetMessagesSince(chatID int64, since time.Time) []*tgbotapi.Message {
+// GetMessagesSince возвращает сообщения из указанного чата, начиная с определенного времени.
+func (ms *MongoStorage) GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Фильтр: ищем сообщения в чате, начиная с времени 'since'
 	filter := bson.M{
 		"chat_id": chatID,
-		"date":    bson.M{"$gt": since}, // Исправлено: убран ненужный \ перед $
+		"date":    bson.M{"$gte": since},
 	}
-
-	// Сортируем по дате, старые первыми, лимит не нужен
-	findOptions := options.Find().SetSort(bson.D{{"date", 1}})
+	// Опции: сортируем по дате по возрастанию
+	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: 1}}) // Исправлено
 
 	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			if ms.debug {
-				log.Printf("[Mongo GetMessagesSince DEBUG] Новые сообщения для chatID %d с %s не найдены.", chatID, since)
-			}
-			return []*tgbotapi.Message{}
-		}
-		log.Printf("[Mongo GetMessagesSince ERROR] Ошибка поиска сообщений для chatID %d с %s: %v", chatID, since, err)
-		return nil // Возвращаем nil в случае ошибки запроса
+		log.Printf("[MongoStorage GetMessagesSince ERROR] Ошибка поиска сообщений для chatID %d с %v: %v", chatID, since, err)
+		return nil, err // Возвращаем ошибку
 	}
 	defer cursor.Close(ctx)
 
 	var results []*tgbotapi.Message
 	for cursor.Next(ctx) {
 		var mongoMsg MongoMessage
-		if err := cursor.Decode(&mongoMsg); err != nil {
-			log.Printf("[Mongo GetMessagesSince ERROR] Ошибка декодирования сообщения для chatID %d: %v", chatID, err)
-			continue // Пропускаем поврежденное сообщение
+		err := cursor.Decode(&mongoMsg)
+		if err != nil {
+			log.Printf("[MongoStorage GetMessagesSince ERROR] Ошибка декодирования сообщения для chatID %d: %v", chatID, err)
+			continue // Пропускаем
 		}
 		apiMsg := convertMongoToAPIMessage(&mongoMsg)
-		if apiMsg != nil {
-			results = append(results, apiMsg)
-		}
+		results = append(results, apiMsg)
 	}
 
 	if err := cursor.Err(); err != nil {
-		log.Printf("[Mongo GetMessagesSince ERROR] Ошибка курсора после итерации для chatID %d: %v", chatID, err)
+		log.Printf("[MongoStorage GetMessagesSince ERROR] Ошибка курсора при чтении сообщений для chatID %d: %v", chatID, err)
+		return nil, err // Возвращаем ошибку
 	}
 
 	if ms.debug {
-		log.Printf("[Mongo GetMessagesSince DEBUG] Найдено %d новых сообщений для chatID %d с %s.", len(results), chatID, since)
+		log.Printf("[MongoStorage GetMessagesSince DEBUG] Загружено %d сообщений для chatID %d с %v.", len(results), chatID, since)
 	}
 
-	return results
+	return results, nil // Возвращаем (slice, nil)
 }
 
 func (ms *MongoStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {
@@ -1130,8 +1061,7 @@ func (ms *MongoStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) e
 	return nil
 }
 
-// SearchRelevantMessages ищет сообщения, семантически близкие к queryText,
-// используя MongoDB Atlas Vector Search.
+// SearchRelevantMessages ищет сообщения, семантически близкие к queryText, используя векторный поиск.
 func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
 	if ms.embeddingClient == nil {
 		return nil, fmt.Errorf("embeddingClient не инициализирован в MongoStorage для поиска эмбеддингов")
@@ -1163,68 +1093,96 @@ func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k
 		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Эмбеддинг запроса сгенерирован (размерность %d).", chatID, len(queryVector))
 	}
 
-	// 2. Формируем pipeline для $vectorSearch
-	// Используем официальную документацию: https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-stage/
-	pipeline := mongo.Pipeline{
-		{
-			{"$vectorSearch", bson.D{
-				{"index", ms.cfg.MongoVectorIndexName},
-				{"queryVector", queryVector},
-				{"path", "message_vector"},       // Поле, содержащее векторы в документах
-				{"numCandidates", int64(k * 50)}, // Искать среди большего числа кандидатов для точности (можно настроить)
-				{"limit", int64(k)},              // Вернуть только top K результатов
-				// Добавляем фильтр по chat_id, чтобы искать только в текущем чате
-				{"filter", bson.D{{"chat_id", chatID}}},
-			}},
-		},
-		// Опционально: добавляем $project для исключения поля message_vector из результата
-		// (чтобы не передавать большие векторы обратно)
-		{
-			{"$project", bson.D{
-				{"message_vector", 0}, // Исключаем поле message_vector
-				{"score", 0},          // Также исключаем поле score, если оно не нужно
-			}},
-		},
+	// Создаем пайплайн для векторного поиска
+	vectorSearchStage := bson.D{
+		{Key: "$vectorSearch", Value: bson.D{
+			{Key: "index", Value: ms.cfg.MongoVectorIndexName},
+			{Key: "path", Value: "message_vector"},
+			{Key: "queryVector", Value: queryVector},
+			{Key: "numCandidates", Value: k * 10},
+			{Key: "limit", Value: k},
+			{Key: "filter", Value: bson.M{"chat_id": chatID}},
+		}},
 	}
 
-	if ms.debug {
-		// Логируем pipeline (может быть полезно для отладки)
-		pipelineBytes, _ := json.MarshalIndent(pipeline, "", "  ")
-		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Pipeline:\n%s", chatID, string(pipelineBytes))
+	// Добавляем стадию для проекции полей (выбираем только нужные)
+	projectStage := bson.D{
+		{Key: "$project", Value: bson.D{
+			{Key: "_id", Value: 1},
+			{Key: "chat_id", Value: 1},
+			{Key: "message_id", Value: 1},
+			{Key: "user_id", Value: 1},
+			{Key: "username", Value: 1},
+			{Key: "first_name", Value: 1},
+			{Key: "last_name", Value: 1},
+			{Key: "is_bot", Value: 1},
+			{Key: "date", Value: 1},
+			{Key: "text", Value: 1},
+			{Key: "reply_to_message_id", Value: 1},
+			{Key: "entities", Value: 1},
+			{Key: "caption", Value: 1},
+			{Key: "caption_entities", Value: 1},
+			{Key: "has_media", Value: 1},
+			{Key: "is_voice", Value: 1},
+			// Добавляем поля пересылки
+			{Key: "is_forward", Value: 1},
+			{Key: "forwarded_from_user_id", Value: 1},
+			{Key: "forwarded_from_chat_id", Value: 1},
+			{Key: "forwarded_from_message_id", Value: 1},
+			{Key: "forwarded_date", Value: 1},
+			{Key: "score", Value: bson.D{{Key: "$meta", Value: "vectorSearchScore"}}}, // Исправлено
+		}},
 	}
 
-	// 3. Выполняем агрегацию
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Увеличим таймаут для поиска
+	// Объединяем стадии
+	pipeline := mongo.Pipeline{vectorSearchStage, projectStage}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	cursor, err := ms.messagesCollection.Aggregate(ctx, pipeline)
 	if err != nil {
-		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка выполнения Aggregate: %v", chatID, err)
-		return nil, fmt.Errorf("ошибка выполнения векторного поиска: %w", err)
+		log.Printf("[MongoStorage SearchRelevantMessages ERROR] Chat %d: Ошибка агрегации: %v", chatID, err)
+		return nil, err
 	}
 	defer cursor.Close(ctx)
 
-	// 4. Декодируем результаты
-	var mongoResults []MongoMessage
-	if err = cursor.All(ctx, &mongoResults); err != nil {
-		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка декодирования результатов: %v", chatID, err)
-		return nil, fmt.Errorf("ошибка декодирования результатов поиска: %w", err)
-	}
+	var results []*tgbotapi.Message
+	for cursor.Next(ctx) {
+		// Структура для декодирования результата агрегации (включая score)
+		type AggregateResult struct {
+			MongoMessage `bson:",inline"` // Встраиваем поля MongoMessage
+			Score        float64          `bson:"score"`
+		}
+		var aggResult AggregateResult
+		if err := cursor.Decode(&aggResult); err != nil {
+			log.Printf("[MongoStorage SearchRelevantMessages ERROR] Chat %d: Ошибка декодирования результата: %v", chatID, err)
+			continue
+		}
 
-	if ms.debug {
-		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Найдено %d релевантных сообщений.", chatID, len(mongoResults))
-	}
-
-	// 5. Конвертируем в tgbotapi.Message
-	apiResults := make([]*tgbotapi.Message, 0, len(mongoResults))
-	for i := range mongoResults { // Используем индекс для взятия адреса
-		apiMsg := convertMongoToAPIMessage(&mongoResults[i])
+		// Конвертируем обратно в tgbotapi.Message
+		apiMsg := convertMongoToAPIMessage(&aggResult.MongoMessage)
 		if apiMsg != nil {
-			apiResults = append(apiResults, apiMsg)
+			results = append(results, apiMsg)
+			if ms.debug {
+				log.Printf("[Mongo Search DEBUG] Chat %d: Найдено релевантное сообщение ID %d (Score: %.4f)", chatID, apiMsg.MessageID, aggResult.Score)
+			}
 		}
 	}
 
-	return apiResults, nil
+	if err := cursor.Err(); err != nil {
+		log.Printf("[MongoStorage SearchRelevantMessages ERROR] Chat %d: Ошибка курсора: %v", chatID, err)
+		return nil, err
+	}
+
+	// Результаты уже отсортированы по релевантности (score) MongoDB Atlas
+	// Разворачивать не нужно, наиболее релевантные первыми
+
+	if ms.debug {
+		log.Printf("[MongoStorage SearchRelevantMessages DEBUG] Chat %d: Найдено %d релевантных сообщений для '%s'", chatID, len(results), truncateString(queryText, 50))
+	}
+
+	return results, nil
 }
 
 // --- Вспомогательные методы для бэкфилла эмбеддингов ---
@@ -1323,4 +1281,69 @@ func (ms *MongoStorage) UpdateMessageEmbedding(chatID int64, messageID int, vect
 	}
 
 	return nil // Успешное обновление
+}
+
+// convertMongoToAPIMessage преобразует MongoMessage обратно в *tgbotapi.Message
+func convertMongoToAPIMessage(mongoMsg *MongoMessage) *tgbotapi.Message {
+	if mongoMsg == nil {
+		return nil
+	}
+
+	msg := &tgbotapi.Message{
+		MessageID: mongoMsg.MessageID,
+		From: &tgbotapi.User{
+			ID:        mongoMsg.UserID,
+			IsBot:     mongoMsg.IsBot,
+			FirstName: mongoMsg.FirstName,
+			LastName:  mongoMsg.LastName,
+			UserName:  mongoMsg.Username,
+		},
+		Date:     int(mongoMsg.Date.Unix()),           // Преобразуем time.Time обратно в Unix timestamp
+		Chat:     &tgbotapi.Chat{ID: mongoMsg.ChatID}, // Добавляем ChatID
+		Text:     mongoMsg.Text,
+		Entities: mongoMsg.Entities,
+		Caption:  mongoMsg.Caption,
+		// CaptionEntities не входят в стандартную структуру tgbotapi.Message
+		// HasMedia и IsVoice - это наши внутренние флаги, не стандартные поля
+	}
+
+	// Восстанавливаем ReplyToMessage
+	if mongoMsg.ReplyToMessageID != 0 {
+		msg.ReplyToMessage = &tgbotapi.Message{
+			MessageID: mongoMsg.ReplyToMessageID,
+			Chat:      msg.Chat, // Предполагаем, что ответ в том же чате
+		}
+	}
+
+	// Восстанавливаем информацию о пересылке
+	if mongoMsg.IsForward {
+		msg.ForwardDate = int(mongoMsg.ForwardedDate.Unix())
+		msg.ForwardFromMessageID = mongoMsg.ForwardedFromMessageID
+		if mongoMsg.ForwardedFromUserID != 0 {
+			msg.ForwardFrom = &tgbotapi.User{ID: mongoMsg.ForwardedFromUserID}
+		}
+		if mongoMsg.ForwardedFromChatID != 0 {
+			msg.ForwardFromChat = &tgbotapi.Chat{ID: mongoMsg.ForwardedFromChatID}
+		}
+	}
+
+	// Добавляем префикс для голосовых сообщений (если нужно визуально отличать)
+	// if mongoMsg.IsVoice {
+	// 	msg.Text = fmt.Sprintf("[Голосовое]: %s", msg.Text)
+	// }
+
+	return msg
+}
+
+// --- Вспомогательная функция для усечения строки ---
+
+// truncateString обрезает строку до максимальной длины, добавляя "..." в конце.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return "..." // Или вернуть пустую строку или ошибку?
+	}
+	return s[:maxLen-3] + "..."
 }
