@@ -81,6 +81,12 @@ func (ps *PostgresStorage) createTablesIfNotExists() error {
 		reply_to_message_id INT,
 		entities JSONB, -- Для хранения MessageEntity
 		raw_message JSONB, -- Для хранения всего объекта сообщения (на всякий случай)
+		-- Добавляем поля для пересылки
+		is_forward BOOLEAN DEFAULT FALSE,
+		forwarded_from_user_id BIGINT,
+		forwarded_from_chat_id BIGINT,
+		forwarded_from_message_id INT,
+		forwarded_date TIMESTAMP WITH TIME ZONE,
 		PRIMARY KEY (chat_id, message_id)
 	);
 
@@ -158,153 +164,341 @@ func (ps *PostgresStorage) Close() error {
 // --- Заглушки для методов интерфейса ChatHistoryStorage --- //
 // --- Они будут реализованы в следующих шагах --- //
 
-// AddMessage добавляет сообщение в базу данных PostgreSQL.
+// AddMessage добавляет одно сообщение в базу данных PostgreSQL.
 func (ps *PostgresStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
 	if message == nil {
-		log.Printf("[PostgresStorage Add WARN] Попытка добавить nil сообщение для chatID %d", chatID)
+		log.Printf("[PostgresStorage AddMessage WARN] Попытка добавить nil сообщение для chatID %d", chatID)
 		return
 	}
 
-	query := `
-	INSERT INTO chat_messages (
-		chat_id, message_id, user_id, username, first_name, last_name, is_bot, 
-		message_text, message_date, reply_to_message_id, entities, raw_message
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	ON CONFLICT (chat_id, message_id) DO NOTHING; -- Игнорируем дубликаты
-	`
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Подготовка данных
-	var userID sql.NullInt64
-	var userName, firstName, lastName sql.NullString
-	var isBot sql.NullBool
-	if message.From != nil {
-		userID = sql.NullInt64{Int64: message.From.ID, Valid: true}
-		userName = sql.NullString{String: message.From.UserName, Valid: message.From.UserName != ""}
-		firstName = sql.NullString{String: message.From.FirstName, Valid: message.From.FirstName != ""}
-		lastName = sql.NullString{String: message.From.LastName, Valid: message.From.LastName != ""}
-		isBot = sql.NullBool{Bool: message.From.IsBot, Valid: true}
+	if ps.debug {
+		// log.Printf("[PostgresStorage AddMessage DEBUG] Добавление сообщения %d для chatID %d.", message.MessageID, chatID)
 	}
 
-	messageDate := time.Unix(int64(message.Date), 0)
-	messageText := sql.NullString{String: message.Text, Valid: message.Text != ""}
+	// Подготовка данных для вставки
+	var userID int64
+	var username, firstName, lastName string
+	var isBot bool
+	if message.From != nil {
+		userID = message.From.ID
+		username = message.From.UserName
+		firstName = message.From.FirstName
+		lastName = message.From.LastName
+		isBot = message.From.IsBot
+	}
 
-	var replyToMessageID sql.NullInt32
+	var replyToMessageID sql.NullInt64
 	if message.ReplyToMessage != nil {
-		replyToMessageID = sql.NullInt32{Int32: int32(message.ReplyToMessage.MessageID), Valid: true}
+		replyToMessageID.Int64 = int64(message.ReplyToMessage.MessageID)
+		replyToMessageID.Valid = true
+	} else {
+		replyToMessageID.Valid = false // Убедимся, что это NULL, если нет ответа
+	}
+
+	// Информация о пересылке
+	var isForward sql.NullBool
+	var forwardedFromUserID, forwardedFromChatID sql.NullInt64
+	var forwardedFromMessageID sql.NullInt32
+	var forwardedDate sql.NullTime
+
+	if message.ForwardDate != 0 {
+		isForward.Bool = true
+		isForward.Valid = true
+		forwardedDate.Time = time.Unix(int64(message.ForwardDate), 0)
+		forwardedDate.Valid = true
+		forwardedFromMessageID.Int32 = int32(message.ForwardFromMessageID)
+		forwardedFromMessageID.Valid = true
+
+		if message.ForwardFrom != nil {
+			forwardedFromUserID.Int64 = message.ForwardFrom.ID
+			forwardedFromUserID.Valid = true
+		} else if message.ForwardFromChat != nil {
+			forwardedFromChatID.Int64 = message.ForwardFromChat.ID
+			forwardedFromChatID.Valid = true
+		}
+	} else {
+		isForward.Bool = false
+		isForward.Valid = true // Важно указать false, а не NULL, если нет пересылки
 	}
 
 	entitiesJSON := jsonify(message.Entities)
-	rawMessageJSON := jsonify(message)
+	rawMessageJSON := jsonify(message) // Сохраняем всё сообщение
+
+	query := `
+	INSERT INTO chat_messages (
+		chat_id, message_id, user_id, username, first_name, last_name, is_bot,
+		message_text, message_date, reply_to_message_id, entities, raw_message,
+		is_forward, forwarded_from_user_id, forwarded_from_chat_id, forwarded_from_message_id, forwarded_date
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+	ON CONFLICT (chat_id, message_id) DO UPDATE SET
+		user_id = EXCLUDED.user_id,
+		username = EXCLUDED.username,
+		first_name = EXCLUDED.first_name,
+		last_name = EXCLUDED.last_name,
+		is_bot = EXCLUDED.is_bot,
+		message_text = EXCLUDED.message_text,
+		message_date = EXCLUDED.message_date,
+		reply_to_message_id = EXCLUDED.reply_to_message_id,
+		entities = EXCLUDED.entities,
+		raw_message = EXCLUDED.raw_message,
+		is_forward = EXCLUDED.is_forward,
+		forwarded_from_user_id = EXCLUDED.forwarded_from_user_id,
+		forwarded_from_chat_id = EXCLUDED.forwarded_from_chat_id,
+		forwarded_from_message_id = EXCLUDED.forwarded_from_message_id,
+		forwarded_date = EXCLUDED.forwarded_date;
+	`
+	ctx := context.Background() // Используем фоновый контекст для записи
 
 	_, err := ps.db.ExecContext(ctx, query,
-		chatID, message.MessageID, userID, userName, firstName, lastName, isBot,
-		messageText, messageDate, replyToMessageID, entitiesJSON, rawMessageJSON,
+		chatID,
+		message.MessageID,
+		userID,
+		username,
+		firstName,
+		lastName,
+		isBot,
+		message.Text,                      // Текст сообщения
+		time.Unix(int64(message.Date), 0), // Дата сообщения
+		replyToMessageID,                  // ID сообщения, на которое отвечают
+		entitiesJSON,                      // Message Entities в JSON
+		rawMessageJSON,                    // Сырое сообщение в JSON
+		// Добавляем поля пересылки
+		isForward,
+		forwardedFromUserID,
+		forwardedFromChatID,
+		forwardedFromMessageID,
+		forwardedDate,
 	)
 
 	if err != nil {
-		log.Printf("[PostgresStorage Add ERROR] Ошибка добавления сообщения (ChatID: %d, MsgID: %d): %v", chatID, message.MessageID, err)
-	} else if ps.debug {
-		// log.Printf("[PostgresStorage Add DEBUG] Сообщение (ChatID: %d, MsgID: %d) добавлено/проигнорировано.", chatID, message.MessageID)
+		log.Printf("[PostgresStorage AddMessage ERROR] Ошибка добавления/обновления сообщения %d для chatID %d: %v", message.MessageID, chatID, err)
+	} else {
+		if ps.debug {
+			// log.Printf("[PostgresStorage AddMessage DEBUG] Сообщение %d для chatID %d успешно добавлено или уже существовало.", message.MessageID, chatID)
+		}
 	}
 }
 
-// GetMessages возвращает последние N (contextWindow) сообщений для чата из БД.
-func (ps *PostgresStorage) GetMessages(chatID int64) []*tgbotapi.Message {
+// GetMessages извлекает последние N сообщений для указанного чата.
+func (ps *PostgresStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Message, error) {
 	query := `
-	SELECT raw_message
+	SELECT
+		message_id, user_id, username, first_name, last_name, is_bot,
+		message_text, message_date, reply_to_message_id, entities, raw_message,
+		is_forward, forwarded_from_user_id, forwarded_from_chat_id, forwarded_from_message_id, forwarded_date
 	FROM chat_messages
 	WHERE chat_id = $1
 	ORDER BY message_date DESC
 	LIMIT $2;
 	`
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rows, err := ps.db.QueryContext(ctx, query, chatID, ps.contextWindow)
+	rows, err := ps.db.QueryContext(ctx, query, chatID, limit)
 	if err != nil {
 		log.Printf("[PostgresStorage GetMessages ERROR] Ошибка запроса сообщений для chatID %d: %v", chatID, err)
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 
-	var messages []*tgbotapi.Message
+	messages := make([]*tgbotapi.Message, 0)
 	for rows.Next() {
-		var rawMessageJSON []byte
-		if err := rows.Scan(&rawMessageJSON); err != nil {
-			log.Printf("[PostgresStorage GetMessages ERROR] Ошибка сканирования raw_message для chatID %d: %v", chatID, err)
-			continue // Пропускаем это сообщение, но пытаемся прочитать остальные
+		var msg tgbotapi.Message
+		var userID sql.NullInt64
+		var username, firstName, lastName sql.NullString
+		var isBot sql.NullBool
+		var messageText sql.NullString
+		var messageDate time.Time
+		var replyToMessageID sql.NullInt32
+		var entitiesJSON []byte   // Храним как JSON
+		var rawMessageJSON []byte // Храним все сообщение как JSON
+		// Поля пересылки
+		var isForward sql.NullBool
+		var forwardedFromUserID, forwardedFromChatID sql.NullInt64
+		var forwardedFromMessageID sql.NullInt32
+		var forwardedDate sql.NullTime
+
+		err := rows.Scan(
+			&msg.MessageID, &userID, &username, &firstName, &lastName, &isBot,
+			&messageText, &messageDate, &replyToMessageID, &entitiesJSON, &rawMessageJSON,
+			&isForward, &forwardedFromUserID, &forwardedFromChatID, &forwardedFromMessageID, &forwardedDate,
+		)
+		if err != nil {
+			log.Printf("[PostgresStorage GetMessages ERROR] Ошибка сканирования строки сообщения для chatID %d: %v", chatID, err)
+			continue // Пропускаем ошибочную строку
 		}
 
-		var msg tgbotapi.Message
-		if err := json.Unmarshal(rawMessageJSON, &msg); err != nil {
-			log.Printf("[PostgresStorage GetMessages ERROR] Ошибка десериализации raw_message для chatID %d: %v", chatID, err)
-			continue // Пропускаем некорректное сообщение
+		// Пытаемся десериализовать из raw_message
+		if len(rawMessageJSON) > 0 {
+			err = json.Unmarshal(rawMessageJSON, &msg)
+			if err == nil {
+				// Успешно десериализовали, но убедимся, что основные поля верны
+				msg.Chat = &tgbotapi.Chat{ID: chatID} // Установим Chat.ID, т.к. он не хранится в raw_message
+				messages = append(messages, &msg)
+				continue // Переходим к следующей строке
+			}
+			// Если десериализация не удалась, попробуем восстановить вручную ниже
+			log.Printf("[PostgresStorage GetMessages WARNING] Ошибка десериализации raw_message для сообщения %d chatID %d: %v. Восстанавливаем вручную.", msg.MessageID, chatID, err)
 		}
+
+		// Ручное восстановление, если raw_message отсутствует или десериализация не удалась
+		msg.Chat = &tgbotapi.Chat{ID: chatID}
+		msg.Date = int(messageDate.Unix())
+		msg.Text = messageText.String // Используем .String для NullString
+
+		if userID.Valid {
+			msg.From = &tgbotapi.User{
+				ID:        userID.Int64,
+				UserName:  username.String,
+				FirstName: firstName.String,
+				LastName:  lastName.String,
+				IsBot:     isBot.Bool,
+			}
+		}
+
+		if replyToMessageID.Valid {
+			msg.ReplyToMessage = &tgbotapi.Message{MessageID: int(replyToMessageID.Int32)}
+		}
+
+		// Десериализуем entities из JSON
+		if len(entitiesJSON) > 0 {
+			err = json.Unmarshal(entitiesJSON, &msg.Entities)
+			if err != nil {
+				log.Printf("[PostgresStorage GetMessages WARNING] Ошибка десериализации entities для сообщения %d chatID %d: %v", msg.MessageID, chatID, err)
+			}
+		}
+
+		// Восстановление информации о пересылке
+		if isForward.Valid && isForward.Bool {
+			msg.ForwardDate = int(forwardedDate.Time.Unix())
+			msg.ForwardFromMessageID = int(forwardedFromMessageID.Int32) // NullInt32 -> int
+			if forwardedFromUserID.Valid {
+				msg.ForwardFrom = &tgbotapi.User{ID: forwardedFromUserID.Int64}
+			} else if forwardedFromChatID.Valid {
+				msg.ForwardFromChat = &tgbotapi.Chat{ID: forwardedFromChatID.Int64}
+			}
+		}
+
 		messages = append(messages, &msg)
 	}
 
-	if err := rows.Err(); err != nil {
-		log.Printf("[PostgresStorage GetMessages ERROR] Ошибка после итерации по строкам для chatID %d: %v", chatID, err)
+	if err = rows.Err(); err != nil {
+		log.Printf("[PostgresStorage GetMessages ERROR] Ошибка итерации по строкам сообщений для chatID %d: %v", chatID, err)
+		return nil, err
 	}
 
-	// Так как мы выбирали ORDER BY DESC, нужно перевернуть срез, чтобы сообщения были в хронологическом порядке
-	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-		messages[i], messages[j] = messages[j], messages[i]
-	}
+	// Возвращаем сообщения в обратном хронологическом порядке (от новых к старым)
+	// Если нужен прямой порядок, можно развернуть здесь:
+	// reverseMessages(messages)
 
-	if ps.debug {
-		log.Printf("[PostgresStorage GetMessages DEBUG] Запрошено %d сообщений для chatID %d.", len(messages), chatID)
-	}
-
-	return messages
+	return messages, nil
 }
 
-// GetMessagesSince возвращает сообщения для чата, начиная с указанного времени.
-func (ps *PostgresStorage) GetMessagesSince(chatID int64, since time.Time) []*tgbotapi.Message {
+// GetMessagesSince извлекает сообщения из указанного чата, начиная с определенного времени.
+func (ps *PostgresStorage) GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
 	query := `
-	SELECT raw_message
+	SELECT
+		message_id, user_id, username, first_name, last_name, is_bot,
+		message_text, message_date, reply_to_message_id, entities, raw_message,
+		is_forward, forwarded_from_user_id, forwarded_from_chat_id, forwarded_from_message_id, forwarded_date
 	FROM chat_messages
 	WHERE chat_id = $1 AND message_date >= $2
-	ORDER BY message_date ASC; -- Сразу сортируем в хронологическом порядке
+	ORDER BY message_date ASC; -- Заказываем по возрастанию для GetMessagesSince
 	`
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Увеличим таймаут для потенциально больших выборок
 	defer cancel()
 
 	rows, err := ps.db.QueryContext(ctx, query, chatID, since)
 	if err != nil {
-		log.Printf("[PostgresStorage GetSince ERROR] Ошибка запроса сообщений для chatID %d с %s: %v", chatID, since, err)
-		return nil
+		log.Printf("[PostgresStorage GetMessagesSince ERROR] Ошибка запроса сообщений для chatID %d с %v: %v", chatID, since, err)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var messages []*tgbotapi.Message
+	messages := make([]*tgbotapi.Message, 0)
 	for rows.Next() {
+		var msg tgbotapi.Message
+		var userID sql.NullInt64
+		var username, firstName, lastName sql.NullString
+		var isBot sql.NullBool
+		var messageText sql.NullString
+		var messageDate time.Time
+		var replyToMessageID sql.NullInt32
+		var entitiesJSON []byte
 		var rawMessageJSON []byte
-		if err := rows.Scan(&rawMessageJSON); err != nil {
-			log.Printf("[PostgresStorage GetSince ERROR] Ошибка сканирования raw_message для chatID %d: %v", chatID, err)
+		// Поля пересылки
+		var isForward sql.NullBool
+		var forwardedFromUserID, forwardedFromChatID sql.NullInt64
+		var forwardedFromMessageID sql.NullInt32
+		var forwardedDate sql.NullTime
+
+		err := rows.Scan(
+			&msg.MessageID, &userID, &username, &firstName, &lastName, &isBot,
+			&messageText, &messageDate, &replyToMessageID, &entitiesJSON, &rawMessageJSON,
+			&isForward, &forwardedFromUserID, &forwardedFromChatID, &forwardedFromMessageID, &forwardedDate,
+		)
+		if err != nil {
+			log.Printf("[PostgresStorage GetMessagesSince ERROR] Ошибка сканирования строки сообщения для chatID %d: %v", chatID, err)
 			continue
 		}
 
-		var msg tgbotapi.Message
-		if err := json.Unmarshal(rawMessageJSON, &msg); err != nil {
-			log.Printf("[PostgresStorage GetSince ERROR] Ошибка десериализации raw_message для chatID %d: %v", chatID, err)
-			continue
+		// Пытаемся десериализовать из raw_message
+		if len(rawMessageJSON) > 0 {
+			err = json.Unmarshal(rawMessageJSON, &msg)
+			if err == nil {
+				msg.Chat = &tgbotapi.Chat{ID: chatID}
+				messages = append(messages, &msg)
+				continue
+			}
+			log.Printf("[PostgresStorage GetMessagesSince WARNING] Ошибка десериализации raw_message для сообщения %d chatID %d: %v. Восстанавливаем вручную.", msg.MessageID, chatID, err)
 		}
+
+		// Ручное восстановление
+		msg.Chat = &tgbotapi.Chat{ID: chatID}
+		msg.Date = int(messageDate.Unix())
+		msg.Text = messageText.String
+
+		if userID.Valid {
+			msg.From = &tgbotapi.User{
+				ID:        userID.Int64,
+				UserName:  username.String,
+				FirstName: firstName.String,
+				LastName:  lastName.String,
+				IsBot:     isBot.Bool,
+			}
+		}
+
+		if replyToMessageID.Valid {
+			msg.ReplyToMessage = &tgbotapi.Message{MessageID: int(replyToMessageID.Int32)}
+		}
+
+		if len(entitiesJSON) > 0 {
+			err = json.Unmarshal(entitiesJSON, &msg.Entities)
+			if err != nil {
+				log.Printf("[PostgresStorage GetMessagesSince WARNING] Ошибка десериализации entities для сообщения %d chatID %d: %v", msg.MessageID, chatID, err)
+			}
+		}
+
+		// Восстановление информации о пересылке
+		if isForward.Valid && isForward.Bool {
+			msg.ForwardDate = int(forwardedDate.Time.Unix())
+			msg.ForwardFromMessageID = int(forwardedFromMessageID.Int32)
+			if forwardedFromUserID.Valid {
+				msg.ForwardFrom = &tgbotapi.User{ID: forwardedFromUserID.Int64}
+			} else if forwardedFromChatID.Valid {
+				msg.ForwardFromChat = &tgbotapi.Chat{ID: forwardedFromChatID.Int64}
+			}
+		}
+
 		messages = append(messages, &msg)
 	}
 
-	if err := rows.Err(); err != nil {
-		log.Printf("[PostgresStorage GetSince ERROR] Ошибка после итерации по строкам для chatID %d: %v", chatID, err)
+	if err = rows.Err(); err != nil {
+		log.Printf("[PostgresStorage GetMessagesSince ERROR] Ошибка итерации по строкам сообщений для chatID %d: %v", chatID, err)
+		return nil, err
 	}
 
-	if ps.debug {
-		log.Printf("[PostgresStorage GetSince DEBUG] Запрошено %d сообщений для chatID %d с %s.", len(messages), chatID, since)
-	}
-
-	return messages
+	return messages, nil
 }
 
 func (ps *PostgresStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {

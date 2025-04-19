@@ -14,16 +14,24 @@ import (
 
 // StoredMessage представляет сообщение для хранения в файле
 type StoredMessage struct {
-	MessageID      int                      `json:"message_id"`
-	FromID         int64                    `json:"from_id"`
-	FromIsBot      bool                     `json:"from_is_bot"`
-	FromFirstName  string                   `json:"from_first_name"`
-	FromLastName   string                   `json:"from_last_name"`
-	FromUserName   string                   `json:"from_username"`
-	Date           int                      `json:"date"`
-	Text           string                   `json:"text"`
-	ReplyToMessage *StoredMessage           `json:"reply_to_message,omitempty"`
-	Entities       []tgbotapi.MessageEntity `json:"entities,omitempty"`
+	ChatID           int64  `json:"chat_id"`
+	MessageID        int    `json:"message_id"`
+	UserID           int64  `json:"user_id,omitempty"`
+	Username         string `json:"username,omitempty"`
+	FirstName        string `json:"first_name,omitempty"`
+	LastName         string `json:"last_name,omitempty"`
+	IsBot            bool   `json:"is_bot,omitempty"`
+	Text             string `json:"text,omitempty"`
+	Date             int    `json:"date"`
+	ReplyToMessageID int    `json:"reply_to_message_id,omitempty"`
+	RawMessageJSON   string `json:"raw_message_json,omitempty"` // Для хранения всего сообщения
+
+	// Поля для пересылки
+	IsForward              bool  `json:"is_forward,omitempty"`
+	ForwardedFromUserID    int64 `json:"forwarded_from_user_id,omitempty"`
+	ForwardedFromChatID    int64 `json:"forwarded_from_chat_id,omitempty"`
+	ForwardedFromMessageID int   `json:"forwarded_from_message_id,omitempty"`
+	ForwardedDate          int   `json:"forwarded_date,omitempty"`
 }
 
 // ConvertToStoredMessage преобразует tgbotapi.Message в StoredMessage
@@ -32,50 +40,107 @@ func ConvertToStoredMessage(msg *tgbotapi.Message) *StoredMessage {
 		return nil
 	}
 
-	stored := &StoredMessage{
+	storedMsg := &StoredMessage{
+		ChatID:    msg.Chat.ID,
 		MessageID: msg.MessageID,
+		Text:      msg.Text, // Сохраняем и Text, и Caption
 		Date:      msg.Date,
-		Text:      msg.Text,
-		Entities:  msg.Entities,
 	}
-
 	if msg.From != nil {
-		stored.FromID = msg.From.ID
-		stored.FromIsBot = msg.From.IsBot
-		stored.FromFirstName = msg.From.FirstName
-		stored.FromLastName = msg.From.LastName
-		stored.FromUserName = msg.From.UserName
+		storedMsg.UserID = msg.From.ID
+		storedMsg.Username = msg.From.UserName
+		storedMsg.FirstName = msg.From.FirstName
+		storedMsg.LastName = msg.From.LastName
+		storedMsg.IsBot = msg.From.IsBot
 	}
-
 	if msg.ReplyToMessage != nil {
-		stored.ReplyToMessage = ConvertToStoredMessage(msg.ReplyToMessage)
+		storedMsg.ReplyToMessageID = msg.ReplyToMessage.MessageID
 	}
 
-	return stored
+	// Сохраняем информацию о пересылке
+	if msg.ForwardDate > 0 {
+		storedMsg.IsForward = true
+		storedMsg.ForwardedDate = msg.ForwardDate
+		if msg.ForwardFrom != nil {
+			storedMsg.ForwardedFromUserID = msg.ForwardFrom.ID
+		}
+		if msg.ForwardFromChat != nil {
+			storedMsg.ForwardedFromChatID = msg.ForwardFromChat.ID
+		}
+		storedMsg.ForwardedFromMessageID = msg.ForwardFromMessageID
+	}
+
+	// Сериализуем всё сообщение в JSON для RawMessageJSON
+	rawJSONBytes, err := json.Marshal(msg)
+	if err == nil {
+		storedMsg.RawMessageJSON = string(rawJSONBytes)
+	} else {
+		log.Printf("Error marshaling raw message for chat %d, msg %d: %v", msg.Chat.ID, msg.MessageID, err)
+		// Можно решить, что делать в случае ошибки - пропустить или записать пустую строку
+		storedMsg.RawMessageJSON = ""
+	}
+
+	return storedMsg
 }
 
-// ConvertToAPIMessage преобразует StoredMessage обратно в tgbotapi.Message
+// ConvertToAPIMessage преобразует StoredMessage обратно в *tgbotapi.Message.
+// Основная логика теперь полагается на десериализацию из RawMessageJSON,
+// но мы сохраняем базовую конвертацию для обратной совместимости или случаев,
+// когда RawMessageJSON отсутствует.
 func ConvertToAPIMessage(stored *StoredMessage) *tgbotapi.Message {
 	if stored == nil {
 		return nil
 	}
 
+	// Пытаемся десериализовать из RawMessageJSON в первую очередь
+	if stored.RawMessageJSON != "" {
+		var msg tgbotapi.Message
+		err := json.Unmarshal([]byte(stored.RawMessageJSON), &msg)
+		if err == nil {
+			return &msg // Успешно десериализовано
+		}
+		log.Printf("Error unmarshaling raw message for chat %d, msg %d: %v. Falling back to manual conversion.", stored.ChatID, stored.MessageID, err)
+	}
+
+	// Fallback: ручное восстановление из полей StoredMessage
 	msg := &tgbotapi.Message{
 		MessageID: stored.MessageID,
 		From: &tgbotapi.User{
-			ID:        stored.FromID,
-			IsBot:     stored.FromIsBot,
-			FirstName: stored.FromFirstName,
-			LastName:  stored.FromLastName,
-			UserName:  stored.FromUserName,
+			ID:        stored.UserID,
+			IsBot:     stored.IsBot,
+			FirstName: stored.FirstName,
+			LastName:  stored.LastName,
+			UserName:  stored.Username,
 		},
-		Date:     stored.Date,
-		Text:     stored.Text,
-		Entities: stored.Entities,
+		Chat: &tgbotapi.Chat{
+			ID: stored.ChatID,
+			// Другие поля Chat могут быть недоступны в StoredMessage
+		},
+		Date: stored.Date,
+		Text: stored.Text,
+		// Entities и другие поля будут пустыми при ручном восстановлении
 	}
 
-	if stored.ReplyToMessage != nil {
-		msg.ReplyToMessage = ConvertToAPIMessage(stored.ReplyToMessage)
+	if stored.ReplyToMessageID != 0 {
+		// Создаем "пустое" сообщение для ReplyTo, так как полных данных нет
+		msg.ReplyToMessage = &tgbotapi.Message{
+			MessageID: stored.ReplyToMessageID,
+			Chat:      msg.Chat, // Предполагаем, что ответ в том же чате
+		}
+	}
+
+	// Восстанавливаем информацию о пересылке
+	if stored.IsForward {
+		msg.ForwardDate = stored.ForwardedDate
+		msg.ForwardFromMessageID = stored.ForwardedFromMessageID
+		if stored.ForwardedFromUserID != 0 {
+			msg.ForwardFrom = &tgbotapi.User{ID: stored.ForwardedFromUserID}
+			// Остальные поля ForwardFrom User неизвестны
+		}
+		if stored.ForwardedFromChatID != 0 {
+			msg.ForwardFromChat = &tgbotapi.Chat{ID: stored.ForwardedFromChatID}
+			// Остальные поля ForwardFromChat неизвестны
+		}
 	}
 
 	return msg

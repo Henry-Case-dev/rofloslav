@@ -47,6 +47,12 @@ type MongoMessage struct {
 	HasMedia        bool                     `bson:"has_media,omitempty"`        // Флаг наличия медиа
 	IsVoice         bool                     `bson:"is_voice,omitempty"`         // Флаг, что сообщение из аудио
 	MessageVector   []float32                `bson:"message_vector,omitempty"`   // Векторное представление сообщения
+	// --- Добавляем поля для информации о пересылке ---
+	IsForward              bool      `bson:"is_forward,omitempty"`
+	ForwardedFromUserID    int64     `bson:"forwarded_from_user_id,omitempty"`
+	ForwardedFromChatID    int64     `bson:"forwarded_from_chat_id,omitempty"` // Если переслано из канала
+	ForwardedFromMessageID int       `bson:"forwarded_from_message_id,omitempty"`
+	ForwardedDate          time.Time `bson:"forwarded_date,omitempty"`
 }
 
 // convertMongoToAPIMessage преобразует MongoMessage обратно в *tgbotapi.Message
@@ -383,6 +389,19 @@ func convertAPIToMongoMessage(chatID int64, apiMsg *tgbotapi.Message) *MongoMess
 	// Добавляем информацию о медиа (простой флаг)
 	mongoMsg.HasMedia = mongoMsg.Caption != "" || (apiMsg.Photo != nil || apiMsg.Video != nil || apiMsg.Document != nil || apiMsg.Audio != nil || apiMsg.Voice != nil || apiMsg.Sticker != nil)
 	mongoMsg.IsVoice = apiMsg.Voice != nil // Устанавливаем флаг, если поле Voice не nil
+
+	// --- Добавляем информацию о пересылке ---
+	mongoMsg.IsForward = apiMsg.ForwardDate > 0
+	if mongoMsg.IsForward {
+		mongoMsg.ForwardedDate = time.Unix(int64(apiMsg.ForwardDate), 0)
+		mongoMsg.ForwardedFromMessageID = apiMsg.ForwardFromMessageID
+		if apiMsg.ForwardFrom != nil { // Переслано от пользователя
+			mongoMsg.ForwardedFromUserID = apiMsg.ForwardFrom.ID
+		} else if apiMsg.ForwardFromChat != nil { // Переслано из чата/канала
+			mongoMsg.ForwardedFromChatID = apiMsg.ForwardFromChat.ID
+		}
+		// ForwardedFromUsername не всегда доступен, оставляем его пустым или можно добавить логику его получения, если нужно
+	}
 
 	return mongoMsg
 }
