@@ -270,81 +270,76 @@ func (b *Bot) Stop() {
 	log.Println("Бот успешно остановлен.")
 }
 
-// ensureChatInitializedAndWelcome проверяет, инициализирован ли чат, и отправляет приветственное сообщение при необходимости.
-// Возвращает текущие настройки чата и флаг, был ли чат только что инициализирован.
+// ensureChatInitializedAndWelcome проверяет, инициализирован ли чат, и приветствует, если нет.
+// Возвращает настройки чата и флаг, был ли чат только что инициализирован.
 func (b *Bot) ensureChatInitializedAndWelcome(update tgbotapi.Update) (*ChatSettings, bool) {
 	var chatID int64
-	var msg *tgbotapi.Message
-
+	var chatTitle string
 	if update.Message != nil {
 		chatID = update.Message.Chat.ID
-		msg = update.Message
+		chatTitle = update.Message.Chat.Title
 	} else if update.CallbackQuery != nil {
 		chatID = update.CallbackQuery.Message.Chat.ID
+		chatTitle = update.CallbackQuery.Message.Chat.Title
 	} else {
-		// Неизвестный тип обновления, игнорируем
-		return nil, false
+		return nil, false // Неизвестный тип апдейта
 	}
+
+	b.settingsMutex.RLock()
+	settings, exists := b.chatSettings[chatID]
+	b.settingsMutex.RUnlock()
+
+	if exists && settings.Active {
+		return settings, false // Чат уже активен
+	}
+
+	// --- Чат не существует или неактивен, инициализируем --- \
+	justInitialized := !exists || !settings.Active
+	log.Printf("Инициализация нового или неактивного чата: %d (%s)", chatID, chatTitle)
 
 	b.settingsMutex.Lock()
 	defer b.settingsMutex.Unlock()
 
-	settings, exists := b.chatSettings[chatID]
-	justInitialized := !exists
+	// Перепроверяем существование после захвата мьютекса
+	settings, exists = b.chatSettings[chatID]
+	if exists && settings.Active {
+		return settings, false
+	}
 
-	if !exists {
-		log.Printf("Инициализация нового чата: %d", chatID)
+	// Определяем начальный message count случайно
+	r := rand.New(b.randSource) // Используем наш источник
+	initialMessageCount := r.Intn(b.config.MaxMessages-b.config.MinMessages+1) + b.config.MinMessages
 
-		// Загружаем настройки из БД, чтобы получить специфичные для чата значения
-		dbSettings, err := b.storage.GetChatSettings(chatID)
+	// Создаем новые настройки в памяти
+	settings = &ChatSettings{
+		Active:               true,
+		MinMessages:          b.config.MinMessages,
+		MaxMessages:          b.config.MaxMessages,
+		DailyTakeTime:        b.config.DailyTakeTime,
+		SummaryIntervalHours: b.config.SummaryIntervalHours,
+		MessageCount:         initialMessageCount,
+		SrachState:           "none",
+		SrachAnalysisEnabled: b.config.SrachAnalysisEnabled, // Берем из config
+		// ID сообщений (LastMenuMessageID и т.д.) инициализируются нулями
+	}
+	b.chatSettings[chatID] = settings
+
+	// Отправляем приветствие только при ПЕРВОЙ инициализации
+	if justInitialized {
+		log.Printf("Чат %d: Отправка приветственного сообщения...", chatID)
+		welcomePrompt := b.config.WelcomePrompt
+		welcomeText, err := b.llm.GenerateArbitraryResponse(welcomePrompt, "")
 		if err != nil {
-			log.Printf("[ERROR][ensureChatInitialized] Ошибка получения настроек из DB для чата %d: %v. Будут использованы дефолты из config.", chatID, err)
-			dbSettings = &storage.ChatSettings{} // Используем пустые, чтобы не было паники
+			log.Printf("Ошибка генерации приветствия для чата %d: %v", chatID, err)
+			welcomeText = "Привет, чат!"
 		}
+		b.sendReply(chatID, welcomeText)
 
-		// Создаем настройки в памяти, используя глобальные и загруженные из БД
-		r := b.randSource // Получаем источник случайных чисел
-		settings = &ChatSettings{
-			Active:               true,
-			MinMessages:          b.config.MinMessages,
-			MaxMessages:          b.config.MaxMessages,
-			DailyTakeTime:        b.config.DailyTakeTime,
-			SummaryIntervalHours: b.config.SummaryIntervalHours,
-			MessageCount:         r.Intn(b.config.MaxMessages-b.config.MinMessages+1) + b.config.MinMessages, // Случайное значение
-			SrachState:           "none",
-			SrachAnalysisEnabled: b.getSrachEnabledFromDbOrDefault(dbSettings), // Получаем из БД или дефолт конфига
-		}
-		b.chatSettings[chatID] = settings
-		// Инициализируем map для лимитов этого чата
-		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
-
-		// Отправляем приветственное сообщение в новом чате
-		if msg != nil && msg.NewChatMembers != nil { // Только если добавили новых участников
-			welcomePrompt := b.config.WelcomePrompt
-			welcomeMsg, genErr := b.llm.GenerateArbitraryResponse(welcomePrompt, "")
-			if genErr != nil {
-				log.Printf("[ERROR][ensureChatInitialized] Ошибка генерации приветствия для чата %d: %v", chatID, genErr)
-				welcomeMsg = "Всем привет! Я Рофлослав, готов общаться."
-			}
-			// Отправляем приветствие без сохранения в историю или обработки
-			b.sendReply(chatID, welcomeMsg)
-		}
-
-		// Загружаем историю чата в фоне (после инициализации настроек)
+		// После приветствия загружаем историю
 		go b.loadChatHistory(chatID)
 	}
 
 	return settings, justInitialized
-}
-
-// getSrachEnabledFromDbOrDefault возвращает значение SrachAnalysisEnabled из dbSettings или из config.
-func (b *Bot) getSrachEnabledFromDbOrDefault(dbSettings *storage.ChatSettings) bool {
-	// TODO: Когда SrachAnalysisEnabled будет в storage.ChatSettings, использовать его:
-	// if dbSettings != nil && dbSettings.SrachAnalysisEnabled != nil {
-	// 	 return *dbSettings.SrachAnalysisEnabled
-	// }
-	// Пока что всегда берем из config
-	return b.config.SrachAnalysisEnabled
 }
 
 // handleUpdate обрабатывает входящие обновления
@@ -392,65 +387,46 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	}
 }
 
-// loadAllChatSettingsFromStorage загружает настройки для всех известных чатов из хранилища.
+// loadAllChatSettingsFromStorage загружает настройки всех известных чатов из хранилища в память
+// (используется при старте бота)
 func (b *Bot) loadAllChatSettingsFromStorage() {
+	log.Println("Загрузка настроек всех чатов из хранилища...")
 	chatIDs, err := b.storage.GetAllChatIDs()
 	if err != nil {
-		log.Printf("[ERROR][LoadAllSettings] Ошибка получения списка ChatID из хранилища: %v", err)
+		log.Printf("[ERROR] Не удалось получить список chatID из хранилища: %v", err)
 		return
 	}
 
-	if len(chatIDs) == 0 {
-		log.Println("[LoadAllSettings] Не найдено чатов в хранилище для загрузки настроек.")
-		return
-	}
-
-	log.Printf("[LoadAllSettings] Загрузка настроек для %d чатов...", len(chatIDs))
-	loadedCount := 0
-	failedCount := 0
-
+	log.Printf("Найдено %d чатов в хранилище.", len(chatIDs))
 	b.settingsMutex.Lock()
 	defer b.settingsMutex.Unlock()
 
+	loadedCount := 0
+	failedCount := 0
 	for _, chatID := range chatIDs {
-		_, memoryExists := b.chatSettings[chatID]
-		if memoryExists {
-			if b.config.Debug {
-				log.Printf("[DEBUG][LoadAllSettings] Настройки для чата %d уже в памяти, пропускаем загрузку из хранилища.", chatID)
-			}
-			loadedCount++
+		// Проверяем, есть ли уже настройки в памяти (маловероятно, но на всякий случай)
+		if _, exists := b.chatSettings[chatID]; exists {
 			continue
 		}
 
-		// Загружаем настройки из хранилища (не из памяти)
-		dbSettings, err := b.storage.GetChatSettings(chatID)
-		if err != nil {
-			log.Printf("[ERROR][LoadAllSettings] Ошибка загрузки настроек для чата %d из хранилища: %v", chatID, err)
-			failedCount++
-			continue
-		}
-
-		// Создаем ChatSettings в памяти на основе глобальных настроек и специфичных для чата из БД
-		r := b.randSource // Получаем источник случайных чисел
-		newSettings := &ChatSettings{
-			Active:               true, // Считаем активным по умолчанию при загрузке
+		// Создаем базовые настройки в памяти
+		r := rand.New(b.randSource)
+		memSettings := &ChatSettings{
+			Active:               true, // Считаем активным, раз есть в БД
 			MinMessages:          b.config.MinMessages,
 			MaxMessages:          b.config.MaxMessages,
 			DailyTakeTime:        b.config.DailyTakeTime,
 			SummaryIntervalHours: b.config.SummaryIntervalHours,
-			MessageCount:         r.Intn(b.config.MaxMessages-b.config.MinMessages+1) + b.config.MinMessages, // Случайное значение при инициализации
+			MessageCount:         r.Intn(b.config.MaxMessages-b.config.MinMessages+1) + b.config.MinMessages,
 			SrachState:           "none",
-			SrachAnalysisEnabled: b.getSrachEnabledFromDbOrDefault(dbSettings), // Получаем из БД или дефолт конфига
-			// ID сообщений (LastMenuMessageID и т.д.) инициализируются нулями
+			SrachAnalysisEnabled: b.config.SrachAnalysisEnabled, // Берем из config
 		}
-
-		b.chatSettings[chatID] = newSettings
-		// Инициализируем map для лимитов этого чата
-		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
+		b.chatSettings[chatID] = memSettings
 		loadedCount++
 	}
 
-	log.Printf("[LoadAllSettings] Загрузка настроек завершена. Загружено: %d, Ошибок: %d", loadedCount, failedCount)
+	log.Printf("Загружено настроек для %d чатов. Ошибок: %d.", loadedCount, failedCount)
+
 }
 
 // handleChatMemberUpdate обрабатывает изменения статуса бота в чате

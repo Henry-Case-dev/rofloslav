@@ -111,8 +111,8 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 				batchErrorCount++
 				// Если ошибка - лимит запросов, делаем большую паузу
 				if strings.Contains(embedErr.Error(), "лимит запросов") || strings.Contains(embedErr.Error(), "429") {
-					log.Printf("[Backfill PAUSE] Chat %d: Обнаружен лимит запросов API. Пауза на %v...", chatID, b.config.BackfillBatchDelaySeconds)
-					time.Sleep(b.config.BackfillBatchDelaySeconds)
+					log.Printf("[Backfill PAUSE] Chat %d: Обнаружен лимит запросов API. Пауза на %v...", chatID, b.config.BackfillBatchDelay)
+					time.Sleep(b.config.BackfillBatchDelay)
 					// Повторяем попытку для этого же сообщения? Или пропускаем?
 					// Пока пропустим, чтобы не усложнять цикл.
 					continue
@@ -163,8 +163,8 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 
 		// Задержка между пакетами, чтобы не перегружать API/DB
 		if len(messagesToProcess) == b.config.BackfillBatchSize { // Только если пакет был полным
-			log.Printf("[Backfill DELAY] Chat %d: Задержка перед следующим пакетом: %v", chatID, b.config.BackfillBatchDelaySeconds)
-			time.Sleep(b.config.BackfillBatchDelaySeconds)
+			log.Printf("[Backfill DELAY] Chat %d: Задержка перед следующим пакетом: %v", chatID, b.config.BackfillBatchDelay)
+			time.Sleep(b.config.BackfillBatchDelay)
 		}
 	}
 

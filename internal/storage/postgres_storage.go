@@ -395,7 +395,8 @@ func (ps *PostgresStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Mes
 }
 
 // GetMessagesSince извлекает сообщения из указанного чата, начиная с определенного времени.
-func (ps *PostgresStorage) GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
+// Добавляем context.Context как первый параметр
+func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
 	query := `
 	SELECT
 		message_id, user_id, username, first_name, last_name, is_bot,
@@ -403,11 +404,13 @@ func (ps *PostgresStorage) GetMessagesSince(chatID int64, since time.Time) ([]*t
 		is_forward, forwarded_from_user_id, forwarded_from_chat_id, forwarded_from_message_id, forwarded_date
 	FROM chat_messages
 	WHERE chat_id = $1 AND message_date >= $2
-	ORDER BY message_date ASC; -- Заказываем по возрастанию для GetMessagesSince
+	ORDER BY message_date ASC; -- Сортируем по возрастанию, чтобы получить сообщения в правильном порядке
 	`
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Увеличим таймаут для потенциально больших выборок
-	defer cancel()
+	// Убираем создание контекста с таймаутом, используем переданный ctx
+	// ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Увеличим таймаут
+	// defer cancel()
 
+	// Используем переданный ctx
 	rows, err := ps.db.QueryContext(ctx, query, chatID, since)
 	if err != nil {
 		log.Printf("[PostgresStorage GetMessagesSince ERROR] Ошибка запроса сообщений для chatID %d с %v: %v", chatID, since, err)
@@ -1053,4 +1056,11 @@ func (ps *PostgresStorage) UpdateVoiceTranscriptionEnabled(chatID int64, enabled
 
 func (ps *PostgresStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) error {
 	return ps.updateSingleSetting(chatID, "srach_analysis_enabled", enabled)
+}
+
+// GetReplyChain - Заглушка для PostgresStorage
+func (ps *PostgresStorage) GetReplyChain(ctx context.Context, chatID int64, messageID int, maxDepth int) ([]*tgbotapi.Message, error) {
+	log.Printf("[PostgresStorage WARN] GetReplyChain не реализован для PostgreSQL.")
+	// Реализация потребует рекурсивных запросов или CTE (Common Table Expressions)
+	return nil, fmt.Errorf("GetReplyChain не реализован для PostgresStorage")
 }

@@ -2,10 +2,12 @@ package deepseek
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
-	"github.com/Henry-Case-dev/rofloslav/internal/llm" // Импортируем наш интерфейс
+	"github.com/Henry-Case-dev/rofloslav/internal/llm"
+	"github.com/Henry-Case-dev/rofloslav/internal/utils" // <--- Добавляем импорт
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -55,64 +57,56 @@ func (c *Client) Close() error {
 
 // GenerateResponse генерирует ответ с использованием DeepSeek API
 func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Message, lastMessage *tgbotapi.Message) (string, error) {
-	ctx := context.Background()
-
-	// Объединяем историю и последнее сообщение для DeepSeek
-	allMessages := make([]*tgbotapi.Message, 0, len(history)+1)
-	allMessages = append(allMessages, history...)
-	if lastMessage != nil { // Добавляем последнее сообщение, если оно не nil
-		allMessages = append(allMessages, lastMessage)
-	}
-
-	// Подготавливаем историю сообщений для OpenAI формата
-	chatMessages := c.prepareChatHistory(systemPrompt, allMessages) // Передаем весь набор
-
-	// Формируем запрос
-	req := openai.ChatCompletionRequest{
-		Model:    c.modelName,
-		Messages: chatMessages,
-		// TODO: Добавить возможность конфигурации параметров, если нужно
-		Temperature: 1.0,  // Пример значения, можно взять из конфига
-		MaxTokens:   8192, // Максимальное значение для deepseek-chat/reasoner
-		// TopP: 0.95, // DeepSeek вроде бы не поддерживает TopP так же как OpenAI/Gemini
-	}
-
 	if c.debug {
-		log.Printf("[DEBUG] DeepSeek Запрос: Модель %s, Сообщений: %d", c.modelName, len(chatMessages))
-		// Логируем сами сообщения (осторожно, может быть много текста)
-		// for i, msg := range chatMessages {
-		// 	log.Printf("[DEBUG] DeepSeek Msg %d: Role=%s, Content=%s...", i, msg.Role, truncateString(msg.Content, 50))
-		// }
+		log.Printf("[DEBUG] DeepSeek Запрос: SystemPrompt: %s...", utils.TruncateString(systemPrompt, 100))
+		log.Printf("[DEBUG] DeepSeek Запрос: LastMessage: %s...", utils.TruncateString(lastMessage.Text, 50))
+		log.Printf("[DEBUG] DeepSeek Запрос: Модель %s", c.modelName)
 	}
 
-	resp, err := c.openaiClient.CreateChatCompletion(ctx, req)
+	// Преобразование истории в формат OpenAI
+	chatMessages := c.prepareChatHistory(systemPrompt, history)
+
+	// Добавляем последнее сообщение пользователя
+	chatMessages = append(chatMessages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: lastMessage.Text,
+	})
+
+	// Вызов API
+	resp, err := c.openaiClient.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:    c.modelName,
+			Messages: chatMessages,
+		},
+	)
+
 	if err != nil {
-		if c.debug {
-			log.Printf("[DEBUG] DeepSeek Ошибка API: %v", err)
-		}
+		log.Printf("[ERROR] DeepSeek Ошибка API: %v", err)
 		return "", fmt.Errorf("ошибка вызова DeepSeek API: %w", err)
 	}
 
-	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+	if len(resp.Choices) > 0 {
+		response := resp.Choices[0].Message.Content
 		if c.debug {
-			log.Printf("[DEBUG] DeepSeek Ответ: Получен пустой ответ или нет вариантов.")
+			log.Printf("[DEBUG] DeepSeek Ответ: %s...", utils.TruncateString(response, 100))
 		}
-		return "", fmt.Errorf("DeepSeek не вернул валидный ответ")
+		return response, nil
 	}
 
-	finalResponse := resp.Choices[0].Message.Content
-	if c.debug {
-		log.Printf("[DEBUG] DeepSeek Ответ: %s...", truncateString(finalResponse, 100))
-	}
-
-	return finalResponse, nil
+	log.Printf("[ERROR] DeepSeek: Пустой ответ от API.")
+	return "", errors.New("deepseek: пустой ответ от API")
 }
 
-// GenerateArbitraryResponse генерирует ответ на основе промпта и контекста
+// GenerateArbitraryResponse генерирует ответ на основе системного промпта и произвольного текстового контекста.
 func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText string) (string, error) {
-	ctx := context.Background()
+	if c.debug {
+		log.Printf("[DEBUG] DeepSeek Запрос (Arbitrary): SystemPrompt: %s...", utils.TruncateString(systemPrompt, 100))
+		log.Printf("[DEBUG] DeepSeek Запрос (Arbitrary): ContextText: %s...", utils.TruncateString(contextText, 150))
+		log.Printf("[DEBUG] DeepSeek Запрос (Arbitrary): Модель %s", c.modelName)
+	}
 
-	// Формируем сообщения: системный промпт и контекст как сообщение пользователя
+	// Формируем сообщение для API
 	chatMessages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
@@ -131,11 +125,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 		MaxTokens:   8192,
 	}
 
-	if c.debug {
-		log.Printf("[DEBUG] DeepSeek Запрос (Arbitrary): Модель %s", c.modelName)
-	}
-
-	resp, err := c.openaiClient.CreateChatCompletion(ctx, req)
+	resp, err := c.openaiClient.CreateChatCompletion(context.Background(), req)
 	if err != nil {
 		if c.debug {
 			log.Printf("[DEBUG] DeepSeek Ошибка API (Arbitrary): %v", err)
@@ -150,15 +140,15 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 		return "", fmt.Errorf("DeepSeek не вернул валидный ответ (Arbitrary)")
 	}
 
-	finalResponse := resp.Choices[0].Message.Content
+	response := resp.Choices[0].Message.Content
 	if c.debug {
-		log.Printf("[DEBUG] DeepSeek Ответ (Arbitrary): %s...", truncateString(finalResponse, 100))
+		log.Printf("[DEBUG] DeepSeek Ответ (Arbitrary): %s...", utils.TruncateString(response, 100))
 	}
 
-	return finalResponse, nil
+	return response, nil
 }
 
-// prepareChatHistory преобразует сообщения Telegram в формат OpenAI
+// prepareChatHistory преобразует историю сообщений Telegram в формат OpenAI
 func (c *Client) prepareChatHistory(systemPrompt string, messages []*tgbotapi.Message) []openai.ChatCompletionMessage {
 	openAiMessages := make([]openai.ChatCompletionMessage, 0, len(messages)+1)
 
@@ -195,11 +185,15 @@ func (c *Client) prepareChatHistory(systemPrompt string, messages []*tgbotapi.Me
 	return openAiMessages
 }
 
-// GenerateResponseFromTextContext генерирует ответ на основе промпта и готового текстового контекста
+// GenerateResponseFromTextContext генерирует ответ на основе системного промпта и предварительно отформатированного текстового контекста.
 func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextText string) (string, error) {
-	ctx := context.Background()
+	if c.debug {
+		log.Printf("[DEBUG] DeepSeek Запрос (Text Context): SystemPrompt: %s...", utils.TruncateString(systemPrompt, 100))
+		log.Printf("[DEBUG] DeepSeek Запрос (Text Context): ContextText: %s...", utils.TruncateString(contextText, 150))
+		log.Printf("[DEBUG] DeepSeek Запрос (Text Context): Модель %s", c.modelName)
+	}
 
-	// Формируем сообщения: системный промпт и контекст как сообщение пользователя
+	// Формируем сообщение для API
 	chatMessages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
@@ -218,11 +212,7 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 		MaxTokens:   8192,
 	}
 
-	if c.debug {
-		log.Printf("[DEBUG] DeepSeek Запрос (Text Context): Модель %s", c.modelName)
-	}
-
-	resp, err := c.openaiClient.CreateChatCompletion(ctx, req)
+	resp, err := c.openaiClient.CreateChatCompletion(context.Background(), req)
 	if err != nil {
 		if c.debug {
 			log.Printf("[DEBUG] DeepSeek Ошибка API (Text Context): %v", err)
@@ -237,27 +227,15 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 		return "", fmt.Errorf("DeepSeek не вернул валидный ответ (Text Context)")
 	}
 
-	finalResponse := resp.Choices[0].Message.Content
+	response := resp.Choices[0].Message.Content
 	if c.debug {
-		log.Printf("[DEBUG] DeepSeek Ответ (Text Context): %s...", truncateString(finalResponse, 100))
+		log.Printf("[DEBUG] DeepSeek Ответ (Text Context): %s...", utils.TruncateString(response, 100))
 	}
 
-	return finalResponse, nil
+	return response, nil
 }
 
-// Вспомогательная функция для обрезки строки (можно вынести в общий util пакет)
-func truncateString(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	if maxLen < 3 {
-		return string(runes[:maxLen])
-	}
-	return string(runes[:maxLen-3]) + "..."
-}
-
-// TranscribeAudio для DeepSeek (возвращает ошибку, т.к. не поддерживается)
+// TranscribeAudio - Заглушка, DeepSeek через OpenAI SDK не поддерживает напрямую транскрипцию
 func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, error) {
 	return "", fmt.Errorf("транскрибация аудио не поддерживается DeepSeek API")
 }

@@ -2,17 +2,14 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"reflect"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config"
-	"github.com/Henry-Case-dev/rofloslav/internal/gemini" // Для типа embeddingClient
-	"github.com/Henry-Case-dev/rofloslav/internal/llm"    // Для типа llmClient
+	"github.com/Henry-Case-dev/rofloslav/internal/gemini"
+	"github.com/Henry-Case-dev/rofloslav/internal/llm" // <--- Добавляем импорт
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -224,428 +221,67 @@ func (ms *MongoStorage) Close() error {
 	return nil
 }
 
-// --- Реализация методов интерфейса ChatHistoryStorage ---
+// === Методы для истории сообщений (перенесены в mongo_messages.go) ===
 
-// AddMessage добавляет одно сообщение в историю чата MongoDB.
+// Commenting out moved method AddMessage
+/*
 func (ms *MongoStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
-	// Проверяем, нужно ли вообще сохранять это сообщение (например, исключаем системные)
-	if message == nil || message.Text == "" && message.Caption == "" && message.Voice == nil && message.Audio == nil && message.Video == nil && message.Photo == nil {
-		// Пропускаем сообщения без текстового контента и не являющиеся голосовыми/медиа
-		// (можно расширить логику, если нужно хранить другие типы)
-		if ms.debug {
-			log.Printf("[Mongo AddMessage SKIP] Чат %d: Сообщение ID %d пропущено (нет текста/caption/медиа).", chatID, message.MessageID)
-		}
-		return
-	}
-
-	// Конвертируем в формат MongoDB
-	mongoMsg := convertAPIToMongoMessage(chatID, message)
-	if mongoMsg == nil {
-		log.Printf("[ERROR][Mongo AddMessage] Чат %d: Не удалось конвертировать сообщение ID %d в MongoMessage.", chatID, message.MessageID)
-		return
-	}
-
-	// --- Генерация эмбеддинга перед сохранением ---
-	if ms.cfg.LongTermMemoryEnabled {
-		textToEmbed := ""
-		if mongoMsg.Text != "" {
-			textToEmbed = mongoMsg.Text
-		} else if mongoMsg.Caption != "" {
-			textToEmbed = mongoMsg.Caption
-		}
-
-		if textToEmbed != "" {
-			if ms.embeddingClient != nil { // Проверяем, что embeddingClient инициализирован
-				if ms.debug {
-					log.Printf("[Mongo AddMessage DEBUG] Чат %d: Попытка генерации эмбеддинга для сообщения ID %d...", chatID, mongoMsg.MessageID)
-				}
-				var embedErr error
-				mongoMsg.MessageVector, embedErr = ms.embeddingClient.EmbedContent(textToEmbed) // Используем embeddingClient!
-				if embedErr != nil {
-					log.Printf("[WARN][Mongo AddMessage] Чат %d, Msg %d: Ошибка генерации эмбеддинга при добавлении: %v. Сообщение будет сохранено без вектора.", chatID, mongoMsg.MessageID, embedErr)
-					// Не прерываем сохранение, просто эмбеддинга не будет
-				} else {
-					if ms.debug {
-						log.Printf("[Mongo AddMessage DEBUG] Чат %d: Эмбеддинг для сообщения ID %d успешно сгенерирован.", chatID, mongoMsg.MessageID)
-					}
-				}
-			} else {
-				log.Printf("[WARN][Mongo AddMessage] Чат %d, Msg %d: embeddingClient не инициализирован, пропуск генерации эмбеддинга.", chatID, mongoMsg.MessageID)
-			}
-		} else {
-			if ms.debug {
-				log.Printf("[Mongo AddMessage DEBUG] Чат %d, Msg %d: Нет текста для генерации эмбеддинга.", chatID, mongoMsg.MessageID)
-			}
-		}
-	}
-	// --- Конец генерации эмбеддинга ---
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Таймаут на вставку
-	defer cancel()
-
-	_, err := ms.messagesCollection.InsertOne(ctx, mongoMsg)
-	if err != nil {
-		log.Printf("[ERROR][Mongo AddMessage] Чат %d: Ошибка вставки сообщения ID %d в MongoDB: %v", chatID, message.MessageID, err)
-		// TODO: Обработка ошибок (например, повторная попытка?)
-	} else if ms.debug {
-		log.Printf("[Mongo AddMessage DEBUG] Чат %d: Сообщение ID %d успешно вставлено в MongoDB с ID: %v.", chatID, message.MessageID, mongoMsg.ID)
-	}
+	// ... implementation ...
 }
+*/
 
-// convertAPIToMongoMessage преобразует сообщение из Telegram API в формат для MongoDB
-func convertAPIToMongoMessage(chatID int64, apiMsg *tgbotapi.Message) *MongoMessage {
-	if apiMsg == nil {
-		return nil
-	}
-
-	mongoMsg := &MongoMessage{
-		ChatID:           chatID,
-		MessageID:        apiMsg.MessageID,
-		Text:             apiMsg.Text,
-		Date:             apiMsg.Time(), // Используем time.Time
-		ReplyToMessageID: 0,
-		Entities:         apiMsg.Entities,
-		// Caption и другие поля по аналогии
-	}
-
-	if apiMsg.From != nil {
-		mongoMsg.UserID = apiMsg.From.ID
-		mongoMsg.Username = apiMsg.From.UserName
-		mongoMsg.FirstName = apiMsg.From.FirstName // Сохраняем оригинальные FirstName/LastName в сообщении
-		mongoMsg.LastName = apiMsg.From.LastName
-		mongoMsg.IsBot = apiMsg.From.IsBot
-	}
-
-	if apiMsg.ReplyToMessage != nil {
-		mongoMsg.ReplyToMessageID = apiMsg.ReplyToMessage.MessageID
-		// Можно также сохранять ReplyToMessage как вложенный документ, если нужно
-	}
-
-	// Добавляем обработку Caption для медиа
-	if apiMsg.Caption != "" {
-		mongoMsg.Caption = apiMsg.Caption
-		mongoMsg.CaptionEntities = apiMsg.CaptionEntities
-	}
-
-	// Добавляем информацию о медиа (простой флаг)
-	mongoMsg.HasMedia = mongoMsg.Caption != "" || (apiMsg.Photo != nil || apiMsg.Video != nil || apiMsg.Document != nil || apiMsg.Audio != nil || apiMsg.Voice != nil || apiMsg.Sticker != nil)
-	mongoMsg.IsVoice = apiMsg.Voice != nil // Устанавливаем флаг, если поле Voice не nil
-
-	// --- Добавляем информацию о пересылке ---
-	mongoMsg.IsForward = apiMsg.ForwardDate > 0
-	if mongoMsg.IsForward {
-		mongoMsg.ForwardedDate = time.Unix(int64(apiMsg.ForwardDate), 0)
-		mongoMsg.ForwardedFromMessageID = apiMsg.ForwardFromMessageID
-		if apiMsg.ForwardFrom != nil { // Переслано от пользователя
-			mongoMsg.ForwardedFromUserID = apiMsg.ForwardFrom.ID
-		} else if apiMsg.ForwardFromChat != nil { // Переслано из чата/канала
-			mongoMsg.ForwardedFromChatID = apiMsg.ForwardFromChat.ID
-		}
-		// ForwardedFromUsername не всегда доступен, оставляем его пустым или можно добавить логику его получения, если нужно
-	}
-
-	return mongoMsg
-}
-
-// GetMessages возвращает последние сообщения из MongoDB для указанного chatID
+// Commenting out moved method GetMessages
+/*
 func (ms *MongoStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Message, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Опции для поиска: сортировка по дате (убывание) и лимит
-	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: -1}}).SetLimit(int64(limit)) // Исправлено
-	filter := bson.M{"chat_id": chatID}
-
-	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
-	if err != nil {
-		log.Printf("[MongoStorage GetMessages ERROR] Ошибка поиска сообщений для chatID %d: %v", chatID, err)
-		return nil, err
-	}
-	defer cursor.Close(ctx)
-
-	var results []*tgbotapi.Message
-	for cursor.Next(ctx) {
-		var mongoMsg MongoMessage
-		err := cursor.Decode(&mongoMsg)
-		if err != nil {
-			log.Printf("[MongoStorage GetMessages ERROR] Ошибка декодирования сообщения для chatID %d: %v", chatID, err)
-			continue // Пропускаем некорректные сообщения
-		}
-		apiMsg := convertMongoToAPIMessage(&mongoMsg)
-		results = append(results, apiMsg)
-	}
-
-	if err := cursor.Err(); err != nil {
-		log.Printf("[MongoStorage GetMessages ERROR] Ошибка курсора при чтении сообщений для chatID %d: %v", chatID, err)
-		return nil, err
-	}
-
-	// Результаты уже отсортированы по убыванию даты (новые -> старые) из-за опции find
-	// Но для консистентности с другими хранилищами (где ожидается старые -> новые),
-	// развернем их.
-	for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
-		results[i], results[j] = results[j], results[i]
-	}
-
-	if ms.debug {
-		log.Printf("[MongoStorage GetMessages DEBUG] Загружено %d сообщений для chatID %d с лимитом %d.", len(results), chatID, limit)
-	}
-
-	return results, nil
+	// ... implementation ...
 }
+*/
 
-// GetMessagesSince возвращает сообщения из указанного чата, начиная с определенного времени.
+// Commenting out moved method GetMessagesSince
+/*
 func (ms *MongoStorage) GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Фильтр: ищем сообщения в чате, начиная с времени 'since'
-	filter := bson.M{
-		"chat_id": chatID,
-		"date":    bson.M{"$gte": since},
-	}
-	// Опции: сортируем по дате по возрастанию
-	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: 1}}) // Исправлено
-
-	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
-	if err != nil {
-		log.Printf("[MongoStorage GetMessagesSince ERROR] Ошибка поиска сообщений для chatID %d с %v: %v", chatID, since, err)
-		return nil, err // Возвращаем ошибку
-	}
-	defer cursor.Close(ctx)
-
-	var results []*tgbotapi.Message
-	for cursor.Next(ctx) {
-		var mongoMsg MongoMessage
-		err := cursor.Decode(&mongoMsg)
-		if err != nil {
-			log.Printf("[MongoStorage GetMessagesSince ERROR] Ошибка декодирования сообщения для chatID %d: %v", chatID, err)
-			continue // Пропускаем
-		}
-		apiMsg := convertMongoToAPIMessage(&mongoMsg)
-		results = append(results, apiMsg)
-	}
-
-	if err := cursor.Err(); err != nil {
-		log.Printf("[MongoStorage GetMessagesSince ERROR] Ошибка курсора при чтении сообщений для chatID %d: %v", chatID, err)
-		return nil, err // Возвращаем ошибку
-	}
-
-	if ms.debug {
-		log.Printf("[MongoStorage GetMessagesSince DEBUG] Загружено %d сообщений для chatID %d с %v.", len(results), chatID, since)
-	}
-
-	return results, nil // Возвращаем (slice, nil)
+	// ... implementation ...
 }
+*/
 
+// Commenting out moved method LoadChatHistory
+/*
 func (ms *MongoStorage) LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error) {
-	// MongoDB не требует предварительной загрузки всей истории в память.
-	log.Printf("[Mongo LoadChatHistory STUB] ChatID: %d (неприменимо)", chatID)
-	return nil, nil // Возвращаем nil, nil, как и для PostgreSQL
+	// ... implementation ...
 }
+*/
 
+// Commenting out moved method SaveChatHistory
+/*
 func (ms *MongoStorage) SaveChatHistory(chatID int64) error {
-	// Сохранение происходит при каждом AddMessage.
-	log.Printf("[Mongo SaveChatHistory STUB] ChatID: %d (неприменимо)", chatID)
-	return nil
+	// ... implementation ...
 }
+*/
 
+// Commenting out moved method ClearChatHistory
+/*
 func (ms *MongoStorage) ClearChatHistory(chatID int64) error {
-	// TODO: Реализовать удаление истории чата из MongoDB
-	log.Printf("[Mongo ClearChatHistory STUB] ChatID: %d", chatID)
-	return nil
+	// ... implementation ...
 }
+*/
 
-// AddMessagesToContext добавляет массив сообщений в контекст чата MongoDB.
-// Используется в основном для загрузки истории.
+// Commenting out moved method AddMessagesToContext
+/*
 func (ms *MongoStorage) AddMessagesToContext(chatID int64, messages []*tgbotapi.Message) {
-	if len(messages) == 0 {
-		return // Нечего добавлять
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Увеличим таймаут для возможной долгой вставки
-	defer cancel()
-
-	var mongoMessages []interface{} // InsertMany ожидает []interface{}
-	for _, apiMsg := range messages {
-		if apiMsg == nil {
-			continue
-		}
-		// Конвертируем в MongoMessage
-		mongoMsg := MongoMessage{
-			ChatID:           chatID, // Используем chatID из аргумента функции
-			MessageID:        apiMsg.MessageID,
-			Text:             apiMsg.Text,
-			Date:             apiMsg.Time(), // Используем time.Time
-			ReplyToMessageID: 0,             // Инициализируем нулем
-			Entities:         apiMsg.Entities,
-		}
-		if apiMsg.From != nil {
-			mongoMsg.UserID = apiMsg.From.ID
-			mongoMsg.Username = apiMsg.From.UserName
-			mongoMsg.FirstName = apiMsg.From.FirstName
-			mongoMsg.LastName = apiMsg.From.LastName
-			mongoMsg.IsBot = apiMsg.From.IsBot
-		}
-		if apiMsg.ReplyToMessage != nil {
-			mongoMsg.ReplyToMessageID = apiMsg.ReplyToMessage.MessageID
-		}
-		mongoMessages = append(mongoMessages, mongoMsg)
-	}
-
-	if len(mongoMessages) == 0 {
-		if ms.debug {
-			log.Printf("[Mongo AddToContext DEBUG] Чат %d: Нет валидных сообщений для добавления после конвертации.", chatID)
-		}
-		return
-	}
-
-	_, err := ms.messagesCollection.InsertMany(ctx, mongoMessages)
-	if err != nil {
-		log.Printf("[Mongo AddToContext ERROR] Чат %d: Ошибка вставки %d сообщений: %v", chatID, len(mongoMessages), err)
-	} else {
-		if ms.debug {
-			log.Printf("[Mongo AddToContext DEBUG] Чат %d: Успешно добавлено %d сообщений в MongoDB.", chatID, len(mongoMessages))
-		}
-	}
+	// ... implementation ...
 }
+*/
 
-// GetAllChatIDs возвращает все уникальные chatID из MongoDB.
+// Commenting out moved method GetAllChatIDs
+/*
 func (ms *MongoStorage) GetAllChatIDs() ([]int64, error) {
-	// TODO: Реализовать получение уникальных chat_id из MongoDB
-	log.Printf("[Mongo GetAllChatIDs STUB]")
-	return nil, nil
+	// ... implementation ...
 }
+*/
 
-// --- Методы для профилей пользователей ---
+// === Методы для настроек чатов (перенесены в mongo_settings.go) ===
 
-// GetUserProfile возвращает профиль пользователя из MongoDB.
-func (ms *MongoStorage) GetUserProfile(chatID int64, userID int64) (*UserProfile, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID, "user_id": userID}
-	var profile UserProfile
-
-	err := ms.userProfilesCollection.FindOne(ctx, filter).Decode(&profile)
-	if err != nil {
-		if errors.Is(err, mongo.ErrNoDocuments) {
-			if ms.debug {
-				log.Printf("DEBUG: Профиль пользователя userID %d в чате %d не найден в MongoDB.", userID, chatID)
-			}
-			return nil, nil // Не найдено - не ошибка
-		}
-		log.Printf("ERROR: Ошибка получения профиля пользователя из MongoDB (чат %d, user %d): %v", chatID, userID, err)
-		return nil, fmt.Errorf("ошибка запроса профиля пользователя: %w", err)
-	}
-
-	if ms.debug {
-		log.Printf("DEBUG: Профиль пользователя userID %d в чате %d успешно получен из MongoDB.", userID, chatID)
-	}
-	return &profile, nil
-}
-
-// SetUserProfile создает или обновляет профиль пользователя в MongoDB (UPSERT).
-func (ms *MongoStorage) SetUserProfile(profile *UserProfile) error {
-	if profile == nil || profile.ChatID == 0 || profile.UserID == 0 {
-		log.Printf("[Mongo SetUserProfile WARN] Попытка сохранить невалидный профиль: ChatID=%d, UserID=%d", profile.ChatID, profile.UserID)
-		return fmt.Errorf("невалидный профиль для сохранения (nil, chat_id=0 или user_id=0)")
-	}
-
-	if ms.debug {
-		log.Printf("[Mongo SetUserProfile DEBUG] Попытка сохранения профиля: ChatID=%d, UserID=%d, Username=%s, Alias=%s, Gender=%s, RealName=%s, Bio=%s, LastSeen=%s",
-			profile.ChatID, profile.UserID, profile.Username, profile.Alias, profile.Gender, profile.RealName, profile.Bio, profile.LastSeen)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Фильтр для поиска существующего документа
-	filter := bson.M{"chat_id": profile.ChatID, "user_id": profile.UserID}
-
-	// Данные для обновления или вставки
-	// Используем $set для обновления всех полей, кроме chat_id и user_id, которые в фильтре
-	// Используем $setOnInsert для полей, которые нужно установить только при создании документа
-	update := bson.M{
-		"$set": bson.M{
-			// Обновляем основные данные из Telegram при каждом сохранении
-			"username":  profile.Username, // Может меняться
-			"alias":     profile.Alias,    // Обновляем Alias (бывший FirstName)
-			"gender":    profile.Gender,   // Обновляем Gender (бывший LastName)
-			"last_seen": profile.LastSeen, // Обновляем время последней активности
-			// Обновляем кастомные поля, если они были изменены
-			"real_name": profile.RealName,
-			"bio":       profile.Bio,
-		},
-		"$setOnInsert": bson.M{
-			"chat_id": profile.ChatID,
-			"user_id": profile.UserID,
-		},
-	}
-
-	// Опции для выполнения Upsert (Update or Insert)
-	opts := options.Update().SetUpsert(true)
-
-	if ms.debug {
-		log.Printf("[Mongo SetUserProfile DEBUG] Выполнение Upsert для ChatID=%d, UserID=%d", profile.ChatID, profile.UserID)
-	}
-
-	// Выполняем операцию
-	result, err := ms.userProfilesCollection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[Mongo SetUserProfile ERROR] Ошибка при Upsert профиля ChatID=%d, UserID=%d: %v", profile.ChatID, profile.UserID, err)
-		return fmt.Errorf("ошибка сохранения профиля пользователя: %w", err)
-	}
-
-	if ms.debug {
-		if result.UpsertedCount > 0 {
-			log.Printf("[Mongo SetUserProfile DEBUG] Профиль для ChatID=%d, UserID=%d успешно создан (UpsertedID: %v).", profile.ChatID, profile.UserID, result.UpsertedID)
-		} else if result.ModifiedCount > 0 {
-			log.Printf("[Mongo SetUserProfile DEBUG] Профиль для ChatID=%d, UserID=%d успешно обновлен.", profile.ChatID, profile.UserID)
-		} else if result.MatchedCount > 0 {
-			log.Printf("[Mongo SetUserProfile DEBUG] Профиль для ChatID=%d, UserID=%d найден, но не изменен (данные совпадают).", profile.ChatID, profile.UserID)
-		} else {
-			// Эта ветка не должна достигаться при upsert=true, если не было ошибки
-			log.Printf("[Mongo SetUserProfile WARN] Upsert для ChatID=%d, UserID=%d завершился без ошибки, но результат неопределен: Matched=%d, Modified=%d, Upserted=%d",
-				profile.ChatID, profile.UserID, result.MatchedCount, result.ModifiedCount, result.UpsertedCount)
-		}
-	}
-
-	return nil
-}
-
-// GetAllUserProfiles возвращает все профили пользователей для указанного чата из MongoDB.
-func (ms *MongoStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID}
-	// Сортируем по last_seen для релевантности
-	findOptions := options.Find().SetSort(bson.D{{Key: "last_seen", Value: -1}})
-
-	cursor, err := ms.userProfilesCollection.Find(ctx, filter, findOptions)
-	if err != nil {
-		log.Printf("ERROR: Ошибка получения всех профилей пользователей из MongoDB (чат %d): %v", chatID, err)
-		return nil, fmt.Errorf("ошибка запроса профилей: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var profiles []*UserProfile
-	if err = cursor.All(ctx, &profiles); err != nil {
-		log.Printf("ERROR: Ошибка декодирования профилей пользователей из MongoDB (чат %d): %v", chatID, err)
-		return nil, fmt.Errorf("ошибка декодирования профилей: %w", err)
-	}
-
-	// Важно: если профилей нет, cursor.All вернет пустой слайс и nil ошибку.
-	// Проверка на profiles == nil не нужна.
-
-	if ms.debug {
-		log.Printf("DEBUG: Получено %d профилей пользователей из MongoDB для чата %d.", len(profiles), chatID)
-	}
-	return profiles, nil
-}
-
-// GetStatus для MongoStorage
+// GetStatus возвращает статус хранилища MongoDB
 func (ms *MongoStorage) GetStatus(chatID int64) string {
 	status := "Хранилище: MongoDB. "
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -673,677 +309,43 @@ func (ms *MongoStorage) GetStatus(chatID int64) string {
 	return status
 }
 
-// GetChatSettings получает настройки чата из MongoDB
-func (ms *MongoStorage) GetChatSettings(chatID int64) (*ChatSettings, error) {
-	var settings ChatSettings
-	// Исправлено: Используем поле структуры ms
-	collection := ms.settingsCollection
-	if collection == nil {
-		log.Printf("[ERROR][GetChatSettings] Коллекция настроек (ms.settingsCollection) равна nil для чата %d!", chatID)
-		// Возвращаем ошибку ИЛИ дефолтные настройки? Лучше ошибку, т.к. это проблема инициализации.
-		// Однако, для пользователя может быть лучше вернуть дефолтные. Пока вернем ошибку.
-		return nil, fmt.Errorf("внутренняя ошибка: коллекция настроек не инициализирована")
-	}
+// === Методы для профилей пользователей (перенесены в mongo_profiles.go) ===
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// === Методы для работы с эмбеддингами и долгосрочной памятью (реализация в mongo_embeddings.go) ===
 
-	filter := bson.M{"chat_id": chatID}
-	err := collection.FindOne(ctx, filter).Decode(&settings)
-
-	if err != nil {
-		if errors.Is(err, mongo.ErrNoDocuments) {
-			// Настройки не найдены, создаем и возвращаем дефолтные
-			if ms.debug {
-				log.Printf("[DEBUG][GetChatSettings] Настройки для чата %d не найдены, создаю дефолтные.", chatID)
-			}
-			// Используем метод ensureChatSettings, который теперь использует ms.cfg
-			defaultSettings, createErr := ms.ensureChatSettings(ctx, chatID) // Передаем только chatID
-			if createErr != nil {
-				log.Printf("[ERROR][GetChatSettings] Ошибка при создании дефолтных настроек для чата %d: %v", chatID, createErr)
-				return nil, fmt.Errorf("ошибка создания настроек чата: %w", createErr)
-			}
-			return defaultSettings, nil
-		}
-		// Другая ошибка при поиске
-		log.Printf("[ERROR][GetChatSettings] Ошибка получения настроек для чата %d: %v", chatID, err)
-		return nil, fmt.Errorf("ошибка получения настроек чата: %w", err)
-	}
-
-	// Настройки найдены, проверяем и устанавливаем значения по умолчанию для отсутствующих полей
-	needsUpdate := ms.applyDefaultsToSettings(&settings) // Выносим логику в отдельный метод
-
-	// Если нужно обновить документ в базе с дефолтными значениями
-	if needsUpdate {
-		if ms.debug {
-			log.Printf("[DEBUG][GetChatSettings] Обновляю документ настроек для чата %d с дефолтными значениями.", chatID)
-		}
-		// Запускаем обновление в фоне, чтобы не блокировать основной поток
-		go func(s ChatSettings) { // Передаем копию настроек
-			if err := ms.SetChatSettings(&s); err != nil {
-				log.Printf("[WARN][GetChatSettings Background Update] Ошибка фонового обновления настроек для чата %d: %v", s.ChatID, err)
-			}
-		}(settings) // Передаем копию текущего состояния settings
-	}
-
-	if ms.debug {
-		log.Printf("[DEBUG][GetChatSettings] Настройки для чата %d успешно получены.", chatID)
-	}
-	return &settings, nil
-}
-
-// applyDefaultsToSettings проверяет и устанавливает значения по умолчанию для отсутствующих полей ChatSettings.
-// Возвращает true, если были применены какие-либо дефолтные значения.
-func (ms *MongoStorage) applyDefaultsToSettings(settings *ChatSettings) bool {
-	needsUpdate := false
-	if settings.ConversationStyle == "" {
-		settings.ConversationStyle = ms.cfg.DefaultConversationStyle
-		needsUpdate = true
-	}
-	if settings.Temperature == nil {
-		temp := ms.cfg.DefaultTemperature
-		settings.Temperature = &temp
-		needsUpdate = true
-	}
-	if settings.Model == "" {
-		settings.Model = ms.cfg.DefaultModel
-		needsUpdate = true
-	}
-	if settings.GeminiSafetyThreshold == "" {
-		settings.GeminiSafetyThreshold = ms.cfg.DefaultSafetyThreshold
-		needsUpdate = true
-	}
-	if settings.VoiceTranscriptionEnabled == nil {
-		enabled := ms.cfg.VoiceTranscriptionEnabledDefault
-		settings.VoiceTranscriptionEnabled = &enabled
-		needsUpdate = true
-	}
-	// --- Проверка дефолтов для лимита прямых обращений ---
-	if settings.DirectReplyLimitEnabled == nil {
-		enabled := ms.cfg.DirectReplyLimitEnabledDefault
-		settings.DirectReplyLimitEnabled = &enabled
-		needsUpdate = true
-	}
-	if settings.DirectReplyLimitCount == nil {
-		count := ms.cfg.DirectReplyLimitCountDefault
-		settings.DirectReplyLimitCount = &count
-		needsUpdate = true
-	}
-	if settings.DirectReplyLimitDuration == nil {
-		durationMinutes := int(ms.cfg.DirectReplyLimitDurationDefault.Minutes())
-		settings.DirectReplyLimitDuration = &durationMinutes
-		needsUpdate = true
-	}
-	return needsUpdate
-}
-
-// ensureChatSettings создает или получает настройки чата.
-// Вызывается из GetChatSettings, если документ не найден.
-// Теперь использует ms.cfg напрямую.
-func (ms *MongoStorage) ensureChatSettings(ctx context.Context, chatID int64) (*ChatSettings, error) {
-	// Исправлено: Используем правильный доступ к коллекции через поле структуры ms
-	collection := ms.settingsCollection
-	if collection == nil {
-		log.Printf("[ERROR][ensureChatSettings] Коллекция настроек (ms.settingsCollection) равна nil при попытке создать настройки для чата %d!", chatID)
-		return nil, fmt.Errorf("внутренняя ошибка: коллекция настроек не инициализирована")
-	}
-
-	// Создаем новый документ с дефолтными значениями из конфига ms.cfg
-	defaultTemp := ms.cfg.DefaultTemperature
-	defaultVoiceEnabled := ms.cfg.VoiceTranscriptionEnabledDefault
-	defaultDirectLimitEnabled := ms.cfg.DirectReplyLimitEnabledDefault
-	defaultDirectLimitCount := ms.cfg.DirectReplyLimitCountDefault
-	directLimitDurationMinutes := int(ms.cfg.DirectReplyLimitDurationDefault.Minutes())
-
-	newSettings := ChatSettings{
-		ChatID:                    chatID,
-		ConversationStyle:         ms.cfg.DefaultConversationStyle,
-		Temperature:               &defaultTemp,
-		Model:                     ms.cfg.DefaultModel,
-		GeminiSafetyThreshold:     ms.cfg.DefaultSafetyThreshold,
-		VoiceTranscriptionEnabled: &defaultVoiceEnabled,
-		// --- Добавляем дефолтные значения для лимита ---
-		DirectReplyLimitEnabled:  &defaultDirectLimitEnabled,
-		DirectReplyLimitCount:    &defaultDirectLimitCount,
-		DirectReplyLimitDuration: &directLimitDurationMinutes, // Сохраняем в БД как минуты
-	}
-
-	// Пытаемся вставить новый документ
-	_, insertErr := collection.InsertOne(ctx, newSettings)
-	if insertErr != nil {
-		// Проверяем, возможно, документ уже был создан другим потоком (ошибка дубликата)
-		if mongo.IsDuplicateKeyError(insertErr) {
-			if ms.debug {
-				log.Printf("[DEBUG][ensureChatSettings] Настройки для чата %d уже существуют (ошибка дубликата). Повторно запрашиваю.", chatID)
-			}
-			// Повторно запрашиваем существующие настройки
-			var existingSettings ChatSettings
-			filter := bson.M{"chat_id": chatID}
-			// Используем новый контекст для повторного запроса
-			findCtx, findCancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer findCancel()
-			findErr := collection.FindOne(findCtx, filter).Decode(&existingSettings)
-			if findErr != nil {
-				log.Printf("[ERROR][ensureChatSettings] Ошибка повторного получения настроек для чата %d после ошибки дубликата: %v", chatID, findErr)
-				return nil, fmt.Errorf("ошибка повторного получения настроек: %w", findErr)
-			}
-			// Применяем дефолты к только что полученным настройкам на случай, если они неполные
-			_ = ms.applyDefaultsToSettings(&existingSettings) // Игнорируем needsUpdate здесь
-			return &existingSettings, nil
-		}
-		// Другая ошибка при вставке
-		log.Printf("[ERROR][ensureChatSettings] Ошибка вставки дефолтных настроек для чата %d: %v", chatID, insertErr)
-		return nil, fmt.Errorf("ошибка вставки настроек чата: %w", insertErr)
-	}
-
-	if ms.debug {
-		log.Printf("[DEBUG][ensureChatSettings] Дефолтные настройки для чата %d успешно созданы и вставлены.", chatID)
-	}
-	// Возвращаем только что созданные настройки
-	return &newSettings, nil
-}
-
-// SetChatSettings сохраняет настройки чата в MongoDB (UPSERT)
-func (ms *MongoStorage) SetChatSettings(settings *ChatSettings) error {
-	if settings == nil || settings.ChatID == 0 {
-		return fmt.Errorf("невалидные настройки для сохранения (nil или chat_id=0)")
-	}
-
-	// Исправлено: Используем правильный доступ к коллекции
-	collection := ms.settingsCollection
-	if collection == nil {
-		log.Printf("[ERROR][SetChatSettings] Коллекция настроек (ms.settingsCollection) равна nil для чата %d!", settings.ChatID)
-		return fmt.Errorf("внутренняя ошибка: коллекция настроек не инициализирована")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": settings.ChatID}
-
-	// Формируем обновление. Используем $set для всех полей, чтобы перезаписать их.
-	// Используем reflect для динамического добавления ненулевых полей в $set и $unset
-	updateDoc := bson.M{}
-	unsetDoc := bson.M{} // Документ для $unset
-	v := reflect.ValueOf(*settings)
-	t := v.Type()
-
-	for i := 0; i < v.NumField(); i++ {
-		field := v.Field(i)
-		fieldType := t.Field(i)
-		bsonTag := fieldType.Tag.Get("bson")
-		parts := strings.Split(bsonTag, ",") // Получаем имя поля из bson тега
-		if len(parts) > 0 && parts[0] != "" && parts[0] != "-" {
-			bsonFieldName := parts[0]
-			// Игнорируем chat_id, так как он в фильтре
-			if bsonFieldName != "chat_id" {
-				// Обработка указателей (Temperature, VoiceTranscriptionEnabled, DirectReplyLimit*)
-				if field.Kind() == reflect.Ptr {
-					if !field.IsNil() { // Добавляем в $set только если указатель не nil
-						updateDoc[bsonFieldName] = field.Elem().Interface() // Развертываем указатель
-					} else {
-						// Если указатель nil, добавляем его в $unset, чтобы удалить поле из документа
-						unsetDoc[bsonFieldName] = ""
-					}
-				} else if field.IsValid() && !field.IsZero() { // Добавляем ненулевые значения
-					updateDoc[bsonFieldName] = field.Interface()
-				} else if field.IsValid() && field.IsZero() {
-					// Обработка нулевых значений НЕ-указателей
-					// Для ConversationStyle, Model, GeminiSafetyThreshold пустая строка/0 - валидное значение,
-					// которое должно быть установлено.
-					// Для других полей (если появятся) может понадобиться другая логика.
-					updateDoc[bsonFieldName] = field.Interface()
-				}
-			}
-		}
-	}
-
-	// Собираем итоговый документ для update
-	update := bson.M{}
-	if len(updateDoc) > 0 {
-		update["$set"] = updateDoc
-	}
-	// Добавляем $unset, если он не пустой
-	if len(unsetDoc) > 0 {
-		update["$unset"] = unsetDoc
-	}
-
-	// Если нет ни $set, ни $unset, то обновлять нечего
-	if len(update) == 0 {
-		if ms.debug {
-			log.Printf("[DEBUG][SetChatSettings] Нет полей для обновления настроек чата %d.", settings.ChatID)
-		}
-		return nil // Не ошибка, просто нет изменений
-	}
-
-	opts := options.Update().SetUpsert(true)
-
-	result, err := collection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[ERROR][SetChatSettings] Ошибка сохранения настроек для чата %d: %v", settings.ChatID, err)
-		return fmt.Errorf("ошибка сохранения настроек чата: %w", err)
-	}
-
-	if ms.debug {
-		if result.UpsertedCount > 0 {
-			log.Printf("[DEBUG][SetChatSettings] Настройки для чата %d успешно созданы (UpsertedID: %v).", settings.ChatID, result.UpsertedID)
-		} else if result.ModifiedCount > 0 {
-			log.Printf("[DEBUG][SetChatSettings] Настройки для чата %d успешно обновлены.", settings.ChatID)
-		} else if result.MatchedCount > 0 {
-			log.Printf("[DEBUG][SetChatSettings] Настройки для чата %d не изменились (Matched: %d).", settings.ChatID, result.MatchedCount)
-		} else {
-			log.Printf("[DEBUG][SetChatSettings] Запрос UpdateOne для чата %d завершен без изменений (Upserted: %d, Modified: %d, Matched: %d).", settings.ChatID, result.UpsertedCount, result.ModifiedCount, result.MatchedCount)
-		}
-	}
-
-	return nil
-}
-
-// --- Новые методы для обновления отдельных настроек лимитов ---
-
-// UpdateDirectLimitEnabled обновляет только поле direct_reply_limit_enabled
-func (ms *MongoStorage) UpdateDirectLimitEnabled(chatID int64, enabled bool) error {
-	collection := ms.settingsCollection
-	if collection == nil {
-		return fmt.Errorf("коллекция настроек не инициализирована")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID}
-	update := bson.M{"$set": bson.M{"direct_reply_limit_enabled": enabled}}
-	opts := options.Update().SetUpsert(true) // Upsert на случай, если настроек еще нет
-
-	_, err := collection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[ERROR][UpdateDirectLimitEnabled] Ошибка обновления настройки для чата %d: %v", chatID, err)
-		return fmt.Errorf("ошибка обновления флага лимита: %w", err)
-	}
-	if ms.debug {
-		log.Printf("[DEBUG][UpdateDirectLimitEnabled] Настройка лимита для чата %d установлена в %t.", chatID, enabled)
-	}
-	return nil
-}
-
-// UpdateDirectLimitCount обновляет только поле direct_reply_limit_count
-func (ms *MongoStorage) UpdateDirectLimitCount(chatID int64, count int) error {
-	if count < 0 {
-		return fmt.Errorf("количество должно быть не отрицательным")
-	}
-	collection := ms.settingsCollection
-	if collection == nil {
-		return fmt.Errorf("коллекция настроек не инициализирована")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID}
-	update := bson.M{"$set": bson.M{"direct_reply_limit_count": count}}
-	opts := options.Update().SetUpsert(true) // Upsert на случай, если настроек еще нет
-
-	_, err := collection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[ERROR][UpdateDirectLimitCount] Ошибка обновления настройки для чата %d: %v", chatID, err)
-		return fmt.Errorf("ошибка обновления количества лимита: %w", err)
-	}
-	if ms.debug {
-		log.Printf("[DEBUG][UpdateDirectLimitCount] Количество лимита для чата %d установлено в %d.", chatID, count)
-	}
-	return nil
-}
-
-// UpdateDirectLimitDuration обновляет только поле direct_reply_limit_duration_minutes
-func (ms *MongoStorage) UpdateDirectLimitDuration(chatID int64, duration time.Duration) error {
-	if duration <= 0 {
-		return fmt.Errorf("длительность должна быть положительной")
-	}
-	durationMinutes := int(duration.Minutes()) // Сохраняем в минутах
-
-	collection := ms.settingsCollection
-	if collection == nil {
-		return fmt.Errorf("коллекция настроек не инициализирована")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID}
-	update := bson.M{"$set": bson.M{"direct_reply_limit_duration_minutes": durationMinutes}}
-	opts := options.Update().SetUpsert(true) // Upsert на случай, если настроек еще нет
-
-	_, err := collection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[ERROR][UpdateDirectLimitDuration] Ошибка обновления настройки для чата %d: %v", chatID, err)
-		return fmt.Errorf("ошибка обновления длительности лимита: %w", err)
-	}
-	if ms.debug {
-		log.Printf("[DEBUG][UpdateDirectLimitDuration] Длительность лимита для чата %d установлена в %d минут.", chatID, durationMinutes)
-	}
-	return nil
-}
-
-// UpdateVoiceTranscriptionEnabled обновляет настройку транскрипции голоса
-func (ms *MongoStorage) UpdateVoiceTranscriptionEnabled(chatID int64, enabled bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID}
-	update := bson.M{"$set": bson.M{"voice_transcription_enabled": enabled}}
-	opts := options.Update().SetUpsert(true)
-
-	_, err := ms.settingsCollection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[ERROR][MongoStorage] UpdateVoiceTranscriptionEnabled Chat %d: Ошибка обновления: %v", chatID, err)
-		return err
-	}
-	if ms.debug {
-		log.Printf("[DEBUG][MongoStorage] UpdateVoiceTranscriptionEnabled Chat %d: Установлено значение %t", chatID, enabled)
-	}
-	return nil
-}
-
-// UpdateSrachAnalysisEnabled обновляет настройку анализа срачей
-func (ms *MongoStorage) UpdateSrachAnalysisEnabled(chatID int64, enabled bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	filter := bson.M{"chat_id": chatID}
-	update := bson.M{"$set": bson.M{"srach_analysis_enabled": enabled}}
-	opts := options.Update().SetUpsert(true)
-
-	_, err := ms.settingsCollection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
-		log.Printf("[ERROR][MongoStorage] UpdateSrachAnalysisEnabled Chat %d: Ошибка обновления: %v", chatID, err)
-		return err
-	}
-	if ms.debug {
-		log.Printf("[DEBUG][MongoStorage] UpdateSrachAnalysisEnabled Chat %d: Установлено значение %t", chatID, enabled)
-	}
-	return nil
-}
-
-// SearchRelevantMessages ищет сообщения, семантически близкие к queryText, используя векторный поиск.
-func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
-	if ms.embeddingClient == nil {
-		return nil, fmt.Errorf("embeddingClient не инициализирован в MongoStorage для поиска эмбеддингов")
-	}
-	if ms.cfg.MongoVectorIndexName == "" {
-		return nil, fmt.Errorf("имя векторного индекса (MONGO_VECTOR_INDEX_NAME) не задано в конфигурации")
-	}
-	if queryText == "" {
-		return []*tgbotapi.Message{}, nil // Если запрос пустой, возвращаем пустой результат без ошибки
-	}
-
-	if ms.debug {
-		// Упрощаем лог, убирая truncateString
-		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Запрос поиска %d релевантных сообщений для текста, начинающегося с: '%s...'", chatID, k, queryText[:min(len(queryText), 50)])
-	}
-
-	// 1. Генерируем вектор для запроса
-	queryVector, err := ms.embeddingClient.EmbedContent(queryText)
-	if err != nil {
-		log.Printf("[ERROR][Mongo Vector Search] Chat %d: Ошибка генерации эмбеддинга для запроса: %v", chatID, err)
-		return nil, fmt.Errorf("ошибка генерации эмбеддинга запроса: %w", err)
-	}
-	if len(queryVector) == 0 {
-		log.Printf("[WARN][Mongo Vector Search] Chat %d: Получен пустой эмбеддинг для запроса.", chatID)
-		return []*tgbotapi.Message{}, nil // Пустой эмбеддинг - нет результата
-	}
-
-	if ms.debug {
-		log.Printf("[DEBUG][Mongo Vector Search] Chat %d: Эмбеддинг запроса сгенерирован (размерность %d).", chatID, len(queryVector))
-	}
-
-	// Создаем пайплайн для векторного поиска
-	vectorSearchStage := bson.D{
-		{Key: "$vectorSearch", Value: bson.D{
-			{Key: "index", Value: ms.cfg.MongoVectorIndexName},
-			{Key: "path", Value: "message_vector"},
-			{Key: "queryVector", Value: queryVector},
-			{Key: "numCandidates", Value: k * 10},
-			{Key: "limit", Value: k},
-			{Key: "filter", Value: bson.M{"chat_id": chatID}},
-		}},
-	}
-
-	// Добавляем стадию для проекции полей (выбираем только нужные)
-	projectStage := bson.D{
-		{Key: "$project", Value: bson.D{
-			{Key: "_id", Value: 1},
-			{Key: "chat_id", Value: 1},
-			{Key: "message_id", Value: 1},
-			{Key: "user_id", Value: 1},
-			{Key: "username", Value: 1},
-			{Key: "first_name", Value: 1},
-			{Key: "last_name", Value: 1},
-			{Key: "is_bot", Value: 1},
-			{Key: "date", Value: 1},
-			{Key: "text", Value: 1},
-			{Key: "reply_to_message_id", Value: 1},
-			{Key: "entities", Value: 1},
-			{Key: "caption", Value: 1},
-			{Key: "caption_entities", Value: 1},
-			{Key: "has_media", Value: 1},
-			{Key: "is_voice", Value: 1},
-			// Добавляем поля пересылки
-			{Key: "is_forward", Value: 1},
-			{Key: "forwarded_from_user_id", Value: 1},
-			{Key: "forwarded_from_chat_id", Value: 1},
-			{Key: "forwarded_from_message_id", Value: 1},
-			{Key: "forwarded_date", Value: 1},
-			{Key: "score", Value: bson.D{{Key: "$meta", Value: "vectorSearchScore"}}}, // Исправлено
-		}},
-	}
-
-	// Объединяем стадии
-	pipeline := mongo.Pipeline{vectorSearchStage, projectStage}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	cursor, err := ms.messagesCollection.Aggregate(ctx, pipeline)
-	if err != nil {
-		log.Printf("[MongoStorage SearchRelevantMessages ERROR] Chat %d: Ошибка агрегации: %v", chatID, err)
-		return nil, err
-	}
-	defer cursor.Close(ctx)
-
-	var results []*tgbotapi.Message
-	for cursor.Next(ctx) {
-		// Структура для декодирования результата агрегации (включая score)
-		type AggregateResult struct {
-			MongoMessage `bson:",inline"` // Встраиваем поля MongoMessage
-			Score        float64          `bson:"score"`
-		}
-		var aggResult AggregateResult
-		if err := cursor.Decode(&aggResult); err != nil {
-			log.Printf("[MongoStorage SearchRelevantMessages ERROR] Chat %d: Ошибка декодирования результата: %v", chatID, err)
-			continue
-		}
-
-		// Конвертируем обратно в tgbotapi.Message
-		apiMsg := convertMongoToAPIMessage(&aggResult.MongoMessage)
-		if apiMsg != nil {
-			results = append(results, apiMsg)
-			if ms.debug {
-				log.Printf("[Mongo Search DEBUG] Chat %d: Найдено релевантное сообщение ID %d (Score: %.4f)", chatID, apiMsg.MessageID, aggResult.Score)
-			}
-		}
-	}
-
-	if err := cursor.Err(); err != nil {
-		log.Printf("[MongoStorage SearchRelevantMessages ERROR] Chat %d: Ошибка курсора: %v", chatID, err)
-		return nil, err
-	}
-
-	// Результаты уже отсортированы по релевантности (score) MongoDB Atlas
-	// Разворачивать не нужно, наиболее релевантные первыми
-
-	if ms.debug {
-		log.Printf("[MongoStorage SearchRelevantMessages DEBUG] Chat %d: Найдено %d релевантных сообщений для '%s'", chatID, len(results), truncateString(queryText, 50))
-	}
-
-	return results, nil
-}
-
-// --- Вспомогательные методы для бэкфилла эмбеддингов ---
-
-// GetTotalMessagesCount возвращает примерное общее количество сообщений в чате.
+// GetTotalMessagesCount вызывает реализацию из mongo_embeddings.go.
 func (ms *MongoStorage) GetTotalMessagesCount(chatID int64) (int64, error) {
-	filter := bson.M{"chat_id": chatID}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	count, err := ms.messagesCollection.EstimatedDocumentCount(ctx, options.EstimatedDocumentCount().SetMaxTime(5*time.Second))
-	if err != nil {
-		// Попробуем CountDocuments как fallback (может быть медленнее)
-		count, err = ms.messagesCollection.CountDocuments(ctx, filter)
-		if err != nil {
-			return -1, fmt.Errorf("ошибка подсчета документов: %w", err)
-		}
-	}
-	return count, nil
+	// Вызываем функцию из mongo_embeddings.go
+	return GetTotalMessagesCount(ctx, ms.messagesCollection, chatID)
 }
 
-// FindMessagesWithoutEmbedding ищет до `limit` сообщений в чате, у которых отсутствует поле `message_vector`,
-// и либо поле `text`, либо `caption` существует и не является пустой строкой.
-// Исключает сообщения с message_id из `skipMessageIDs`.
+// FindMessagesWithoutEmbedding вызывает реализацию из mongo_embeddings.go.
 func (ms *MongoStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, skipMessageIDs []int) ([]MongoMessage, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Увеличим таймаут
 	defer cancel()
-
-	filter := bson.M{
-		"chat_id":        chatID,
-		"message_vector": bson.M{"$exists": false},
-		"$or": []bson.M{
-			{"text": bson.M{"$exists": true, "$ne": ""}},
-			{"caption": bson.M{"$exists": true, "$ne": ""}},
-		},
-	}
-
-	// Добавляем условие для исключения ID, если список не пустой
-	if len(skipMessageIDs) > 0 {
-		filter["message_id"] = bson.M{"$nin": skipMessageIDs}
-	}
-
-	opts := options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "date", Value: 1}}) // Сортируем по дате, чтобы обрабатывать старые
-
-	cursor, err := ms.messagesCollection.Find(ctx, filter, opts)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка поиска сообщений без эмбеддинга: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var results []MongoMessage // Возвращаем MongoMessage напрямую
-	if err = cursor.All(ctx, &results); err != nil {
-		return nil, fmt.Errorf("ошибка декодирования сообщений без эмбеддинга: %w", err)
-	}
-
-	return results, nil
+	// Вызываем функцию из mongo_embeddings.go
+	return FindMessagesWithoutEmbedding(ctx, ms.messagesCollection, chatID, limit, skipMessageIDs)
 }
 
-// UpdateMessageEmbedding обновляет поле message_vector для конкретного сообщения.
+// UpdateMessageEmbedding вызывает реализацию из mongo_embeddings.go.
 func (ms *MongoStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
-	filter := bson.M{
-		"chat_id":    chatID,
-		"message_id": messageID,
-	}
-	update := bson.M{
-		"$set": bson.M{"message_vector": vector},
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	result, err := ms.messagesCollection.UpdateOne(ctx, filter, update)
-	if err != nil {
-		log.Printf("[UpdateEmbedding ERROR] Chat %d, Msg %d: Ошибка MongoDB при обновлении: %v", chatID, messageID, err)
-		return fmt.Errorf("ошибка обновления эмбеддинга в MongoDB: %w", err)
-	}
-
-	// Проверяем результат операции
-	if result.MatchedCount == 0 {
-		// Документ с таким chat_id и message_id вообще не найден.
-		log.Printf("[UpdateEmbedding ERROR] Chat %d, Msg %d: Документ не найден для обновления. MatchedCount=0", chatID, messageID)
-		return fmt.Errorf("документ %d не найден в чате %d", messageID, chatID)
-	}
-
-	if result.ModifiedCount == 0 {
-		// Документ найден, но не был изменен. Это может означать, что:
-		// 1. Вектор уже был установлен точно таким же значением (маловероятно с float).
-		// 2. Какая-то проблема с MongoDB.
-		// Считаем это ошибкой для логики бэкфилла, так как обновление не прошло как ожидалось.
-		log.Printf("[UpdateEmbedding WARN/ERROR] Chat %d, Msg %d: Документ найден, но не модифицирован. Возможно, вектор уже установлен или проблема с обновлением. MatchedCount=%d, ModifiedCount=0", chatID, messageID, result.MatchedCount)
-		return fmt.Errorf("документ найден, но не модифицирован (vector уже может существовать)")
-	}
-
-	if ms.debug {
-		log.Printf("[UpdateEmbedding OK] Chat %d, Msg %d: Эмбеддинг успешно обновлен. Matched: %d, Modified: %d", chatID, messageID, result.MatchedCount, result.ModifiedCount)
-	}
-
-	return nil // Успешное обновление
+	// Вызываем функцию из mongo_embeddings.go, передавая ms.debug
+	return UpdateMessageEmbedding(ctx, ms.messagesCollection, chatID, messageID, vector, ms.debug)
 }
 
-// convertMongoToAPIMessage преобразует MongoMessage обратно в *tgbotapi.Message
-func convertMongoToAPIMessage(mongoMsg *MongoMessage) *tgbotapi.Message {
-	if mongoMsg == nil {
-		return nil
-	}
-
-	msg := &tgbotapi.Message{
-		MessageID: mongoMsg.MessageID,
-		From: &tgbotapi.User{
-			ID:        mongoMsg.UserID,
-			IsBot:     mongoMsg.IsBot,
-			FirstName: mongoMsg.FirstName,
-			LastName:  mongoMsg.LastName,
-			UserName:  mongoMsg.Username,
-		},
-		Date:     int(mongoMsg.Date.Unix()),           // Преобразуем time.Time обратно в Unix timestamp
-		Chat:     &tgbotapi.Chat{ID: mongoMsg.ChatID}, // Добавляем ChatID
-		Text:     mongoMsg.Text,
-		Entities: mongoMsg.Entities,
-		Caption:  mongoMsg.Caption,
-		// CaptionEntities не входят в стандартную структуру tgbotapi.Message
-		// HasMedia и IsVoice - это наши внутренние флаги, не стандартные поля
-	}
-
-	// Восстанавливаем ReplyToMessage
-	if mongoMsg.ReplyToMessageID != 0 {
-		msg.ReplyToMessage = &tgbotapi.Message{
-			MessageID: mongoMsg.ReplyToMessageID,
-			Chat:      msg.Chat, // Предполагаем, что ответ в том же чате
-		}
-	}
-
-	// Восстанавливаем информацию о пересылке
-	if mongoMsg.IsForward {
-		msg.ForwardDate = int(mongoMsg.ForwardedDate.Unix())
-		msg.ForwardFromMessageID = mongoMsg.ForwardedFromMessageID
-		if mongoMsg.ForwardedFromUserID != 0 {
-			msg.ForwardFrom = &tgbotapi.User{ID: mongoMsg.ForwardedFromUserID}
-		}
-		if mongoMsg.ForwardedFromChatID != 0 {
-			msg.ForwardFromChat = &tgbotapi.Chat{ID: mongoMsg.ForwardedFromChatID}
-		}
-	}
-
-	// Добавляем префикс для голосовых сообщений (если нужно визуально отличать)
-	// if mongoMsg.IsVoice {
-	// 	msg.Text = fmt.Sprintf("[Голосовое]: %s", msg.Text)
-	// }
-
-	return msg
+// SearchRelevantMessages вызывает реализацию из mongo_embeddings.go.
+func (ms *MongoStorage) SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // Увеличим таймаут для поиска
+	defer cancel()
+	// Вызываем функцию из mongo_embeddings.go, передавая ms.debug
+	// Убедимся, что передаем правильный embeddingClient
+	return SearchRelevantMessages(ctx, ms.cfg, ms.messagesCollection, ms.embeddingClient, chatID, queryText, k, ms.debug)
 }
 
-// --- Вспомогательная функция для усечения строки ---
+// --- Вспомогательная функция для усечения строки (перенесена в utils) ---
 
-// truncateString обрезает строку до максимальной длины, добавляя "..." в конце.
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	if maxLen <= 3 {
-		return "..." // Или вернуть пустую строку или ошибку?
-	}
-	return s[:maxLen-3] + "..."
-}
+// --- Конец реализации интерфейса ChatHistoryStorage ---

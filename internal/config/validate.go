@@ -1,0 +1,143 @@
+package config
+
+import (
+	"fmt"
+	"log" // Нужен для логгирования предупреждений
+)
+
+// ValidateConfig проверяет корректность загруженной конфигурации
+func ValidateConfig(cfg *Config) error {
+	if cfg.TelegramToken == "" {
+		return fmt.Errorf("ошибка конфигурации: TELEGRAM_TOKEN не установлен")
+	}
+
+	// Валидация LLM Provider и ключей
+	switch cfg.LLMProvider {
+	case ProviderGemini:
+		if cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_API_KEY не установлен")
+		}
+		if cfg.GeminiModelName == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_MODEL_NAME не установлен")
+		}
+		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
+			return fmt.Errorf("LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен")
+		}
+	case ProviderDeepSeek:
+		if cfg.DeepSeekAPIKey == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
+		}
+		if cfg.DeepSeekModelName == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_MODEL_NAME не установлен")
+		}
+		// Для DeepSeek также нужен GeminiEmbeddingModelName, если LongTermMemoryEnabled
+		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
+			log.Println("[WARN] LLM_PROVIDER='deepseek' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен. Используется 'embedding-001' по умолчанию.")
+			// Можно установить дефолт здесь или при загрузке
+			if cfg.GeminiEmbeddingModelName == "" {
+				cfg.GeminiEmbeddingModelName = "embedding-001"
+			}
+		}
+		if cfg.LongTermMemoryEnabled && cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("LLM_PROVIDER='deepseek' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_API_KEY не установлен (нужен для эмбеддингов)")
+		}
+	case ProviderOpenRouter:
+		if cfg.OpenRouterAPIKey == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_API_KEY не установлен")
+		}
+		if cfg.OpenRouterModelName == "" {
+			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_MODEL_NAME не установлен")
+		}
+		// Для OpenRouter также нужен GeminiEmbeddingModelName, если LongTermMemoryEnabled
+		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
+			log.Println("[WARN] LLM_PROVIDER='openrouter' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен. Используется 'embedding-001' по умолчанию.")
+			if cfg.GeminiEmbeddingModelName == "" {
+				cfg.GeminiEmbeddingModelName = "embedding-001"
+			}
+		}
+		if cfg.LongTermMemoryEnabled && cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("LLM_PROVIDER='openrouter' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_API_KEY не установлен (нужен для эмбеддингов)")
+		}
+	default:
+		return fmt.Errorf("неизвестный LLM_PROVIDER: '%s'. Допустимые значения: 'gemini', 'deepseek', 'openrouter'", cfg.LLMProvider)
+	}
+
+	// Валидация интервалов
+	if cfg.DailyTakeTime < 0 || cfg.DailyTakeTime > 23 {
+		return fmt.Errorf("ошибка конфигурации: DAILY_TAKE_TIME (%d) должен быть в диапазоне 0-23", cfg.DailyTakeTime)
+	}
+	if cfg.MinMessages < 1 || cfg.MinMessages > cfg.MaxMessages {
+		return fmt.Errorf("ошибка конфигурации: MIN_MESSAGES (%d) должен быть >= 1 и <= MAX_MESSAGES (%d)", cfg.MinMessages, cfg.MaxMessages)
+	}
+	if cfg.MaxMessages < 1 {
+		return fmt.Errorf("ошибка конфигурации: MAX_MESSAGES (%d) должен быть >= 1", cfg.MaxMessages)
+	}
+	if cfg.ContextWindow < 1 {
+		return fmt.Errorf("ошибка конфигурации: CONTEXT_WINDOW (%d) должен быть >= 1", cfg.ContextWindow)
+	}
+	if cfg.SummaryIntervalHours < 0 {
+		return fmt.Errorf("ошибка конфигурации: SUMMARY_INTERVAL_HOURS (%d) должен быть >= 0", cfg.SummaryIntervalHours)
+	}
+
+	// Валидация настроек хранилища
+	switch cfg.StorageType {
+	case StorageTypeFile:
+		// Дополнительных проверок для файла пока нет
+	case StorageTypePostgres:
+		if cfg.PostgresqlHost == "" || cfg.PostgresqlUser == "" || cfg.PostgresqlDbname == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='postgres', но не все POSTGRESQL_* переменные установлены (HOST, USER, DBNAME)")
+		}
+	case StorageTypeMongo:
+		if cfg.MongoDbURI == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_URI не установлен")
+		}
+		if cfg.MongoDbName == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_DBNAME не установлен")
+		}
+		if cfg.MongoDbMessagesCollection == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_MESSAGES_COLLECTION не установлен")
+		}
+		if cfg.MongoDbUserProfilesCollection == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_USER_PROFILES_COLLECTION не установлен")
+		}
+		if cfg.MongoDbSettingsCollection == "" {
+			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_SETTINGS_COLLECTION не установлен")
+		}
+	}
+
+	// Валидация Администраторов
+	if len(cfg.AdminUsernames) == 0 {
+		return fmt.Errorf("ошибка конфигурации: список ADMIN_USERNAMES не должен быть пустым")
+	}
+
+	// Валидация температуры
+	if cfg.DefaultTemperature < 0.0 || cfg.DefaultTemperature > 2.0 {
+		return fmt.Errorf("ошибка конфигурации: DEFAULT_TEMPERATURE (%.2f) должен быть в диапазоне [0.0, 2.0]", cfg.DefaultTemperature)
+	}
+
+	if cfg.SeriousDirectPrompt == "" {
+		return fmt.Errorf("ошибка конфигурации: SERIOUS_DIRECT_PROMPT не должен быть пустым")
+	}
+	if cfg.DirectReplyLimitPrompt == "" {
+		return fmt.Errorf("ошибка конфигурации: DIRECT_REPLY_LIMIT_PROMPT не должен быть пустым")
+	}
+	if cfg.PromptEnterDirectLimitCount == "" {
+		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_COUNT не должен быть пустым")
+	}
+	if cfg.PromptEnterDirectLimitDuration == "" {
+		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_DURATION не должен быть пустым")
+	}
+
+	// Проверка ключа Gemini, если включена долгосрочная память или транскрипция
+	if cfg.LongTermMemoryEnabled || cfg.VoiceTranscriptionEnabledDefault {
+		if cfg.GeminiAPIKey == "" {
+			return fmt.Errorf("GEMINI_API_KEY должен быть установлен, так как включена долгосрочная память или транскрипция голоса по умолчанию")
+		}
+		if cfg.GeminiEmbeddingModelName == "" {
+			log.Println("Предупреждение: GEMINI_EMBEDDING_MODEL_NAME не установлен, используется модель по умолчанию 'embedding-001' для эмбеддингов.")
+			cfg.GeminiEmbeddingModelName = "embedding-001" // Установим дефолтное значение, если не задано
+		}
+	}
+
+	return nil
+}

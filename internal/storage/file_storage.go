@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -209,7 +210,8 @@ func (fs *FileStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Message
 }
 
 // GetMessagesSince возвращает сообщения из указанного чата, начиная с определенного времени.
-func (fs *FileStorage) GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
+// Добавляем context.Context как первый параметр (хотя он не используется)
+func (fs *FileStorage) GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
 	fs.mutex.RLock()
 	defer fs.mutex.RUnlock()
 
@@ -496,7 +498,16 @@ func (fs *FileStorage) FindMessagesWithoutEmbedding(chatID int64, limit int, ski
 	return nil, fmt.Errorf("операции с эмбеддингами не поддерживаются FileStorage")
 }
 
+// UpdateMessageEmbedding - Заглушка для FileStorage
 func (fs *FileStorage) UpdateMessageEmbedding(chatID int64, messageID int, vector []float32) error {
-	log.Printf("[FileStorage WARN] UpdateMessageEmbedding не поддерживается FileStorage для chatID %d, messageID %d", chatID, messageID)
-	return fmt.Errorf("операции с эмбеддингами не поддерживаются FileStorage")
+	log.Printf("[FileStorage WARN] UpdateMessageEmbedding не реализован для файлового хранилища.")
+	return fmt.Errorf("UpdateMessageEmbedding не реализован для FileStorage")
+}
+
+// GetReplyChain - Заглушка для FileStorage
+func (fs *FileStorage) GetReplyChain(ctx context.Context, chatID int64, messageID int, maxDepth int) ([]*tgbotapi.Message, error) {
+	log.Printf("[FileStorage WARN] GetReplyChain не реализован для файлового хранилища.")
+	// FileStorage хранит данные в памяти, можно было бы реализовать поиск по ReplyToMessageID
+	// но для простоты вернем ошибку.
+	return nil, fmt.Errorf("GetReplyChain не реализован для FileStorage")
 }

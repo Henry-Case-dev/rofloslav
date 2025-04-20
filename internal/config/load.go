@@ -3,125 +3,15 @@ package config
 import (
 	"fmt"
 	"log"
+	"net/url" // Нужен для maskSecretURI
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/utils"
 	"github.com/joho/godotenv"
 )
-
-// LLMProvider определяет тип для выбора LLM провайдера
-type LLMProvider string
-
-const (
-	// Константы для типов LLM провайдеров
-	ProviderGemini     LLMProvider = "gemini"
-	ProviderDeepSeek   LLMProvider = "deepseek"
-	ProviderOpenRouter LLMProvider = "openrouter"
-)
-
-// StorageType определяет тип используемого хранилища.
-type StorageType string
-
-const (
-	StorageTypeFile     StorageType = "file"
-	StorageTypePostgres StorageType = "postgres"
-	StorageTypeMongo    StorageType = "mongo"
-)
-
-// Config содержит все параметры конфигурации бота
-type Config struct {
-	TelegramToken string
-	// Общие настройки LLM
-	LLMProvider   LLMProvider
-	DefaultPrompt string
-	DirectPrompt  string
-	// --- Новые промпты для классификации и серьезного ответа ---
-	ClassifyDirectMessagePrompt string
-	SeriousDirectPrompt         string
-	// --- Конец новых промптов ---
-	DailyTakePrompt string
-	SummaryPrompt   string
-	// --- Новые поля для настроек по умолчанию ---
-	DefaultConversationStyle string  // Стиль общения по умолчанию
-	DefaultTemperature       float64 // Температура по умолчанию
-	DefaultModel             string  // Модель LLM по умолчанию // ПРИМЕЧАНИЕ: Это поле больше не используется напрямую для выбора модели LLM! Используются специфичные для провайдера поля ниже.
-	DefaultSafetyThreshold   string  // Уровень безопасности Gemini по умолчанию
-	// --- Конец новых полей ---
-	// Настройки Gemini
-	GeminiAPIKey    string
-	GeminiModelName string
-	// Настройки DeepSeek
-	DeepSeekAPIKey    string
-	DeepSeekModelName string
-	DeepSeekBaseURL   string // Опционально, для кастомного URL
-	// --- НОВЫЕ Настройки OpenRouter ---
-	OpenRouterAPIKey    string
-	OpenRouterModelName string
-	OpenRouterSiteURL   string // Optional HTTP-Referer
-	OpenRouterSiteTitle string // Optional X-Title
-	// --- КОНЕЦ Настроек OpenRouter ---
-	// Настройки поведения бота
-	RateLimitStaticText string // Статический текст для сообщения о лимите
-	RateLimitPrompt     string // Промпт для LLM для сообщения о лимите
-	// Промпты для ввода настроек
-	PromptEnterMinMessages     string
-	PromptEnterMaxMessages     string
-	PromptEnterDailyTime       string
-	PromptEnterSummaryInterval string
-	// Промпты для анализа срачей
-	SRACH_WARNING_PROMPT  string
-	SRACH_ANALYSIS_PROMPT string
-	SRACH_CONFIRM_PROMPT  string
-	SrachKeywords         []string
-	SrachAnalysisEnabled  bool // Значение по умолчанию из .env
-	// Настройки времени и интервалов
-	DailyTakeTime        int
-	TimeZone             string
-	SummaryIntervalHours int
-	MinMessages          int
-	MaxMessages          int
-	ContextWindow        int
-	Debug                bool
-	// Настройки базы данных PostgreSQL - ИСПОЛЬЗУЕМ ПРЕФИКС POSTGRESQL_
-	PostgresqlHost     string
-	PostgresqlPort     string
-	PostgresqlUser     string
-	PostgresqlPassword string
-	PostgresqlDbname   string
-	// Настройки MongoDB
-	MongoDbURI                    string // Строка подключения MongoDB
-	MongoDbName                   string // Имя базы данных MongoDB
-	MongoDbMessagesCollection     string // Имя коллекции для сообщений MongoDB
-	MongoDbUserProfilesCollection string // Имя коллекции для профилей MongoDB
-	MongoDbSettingsCollection     string // Имя коллекции для настроек чатов MongoDB
-	// Тип хранилища ("file", "postgres" или "mongo")
-	StorageType StorageType
-	// Список администраторов бота (через запятую)
-	AdminUsernames []string
-	// Промпт для приветствия
-	WelcomePrompt string
-	// Промпт для форматирования голоса
-	VoiceFormatPrompt string
-	// Включена ли авто-транскрипция голоса по умолчанию
-	VoiceTranscriptionEnabledDefault bool
-	// --- Настройки лимита прямых обращений (дефолтные) ---
-	DirectReplyLimitEnabledDefault  bool
-	DirectReplyLimitCountDefault    int
-	DirectReplyLimitDurationDefault time.Duration // Храним сразу как Duration
-	DirectReplyLimitPrompt          string
-	PromptEnterDirectLimitCount     string
-	PromptEnterDirectLimitDuration  string
-	// --- Настройки долгосрочной памяти ---
-	LongTermMemoryEnabled    bool   // Включить/выключить долгосрочную память
-	GeminiEmbeddingModelName string // Модель Gemini для создания эмбеддингов
-	MongoVectorIndexName     string // Имя векторного индекса в MongoDB Atlas
-	LongTermMemoryFetchK     int    // Сколько релевантных сообщений извлекать
-	// --- Настройки бэкфилла эмбеддингов ---
-	BackfillBatchSize         int           // Размер пакета для бэкфилла
-	BackfillBatchDelaySeconds time.Duration // Задержка между пакетами бэкфилла
-}
 
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
 func Load() (*Config, error) {
@@ -213,18 +103,22 @@ func Load() (*Config, error) {
 	promptEnterDirectCount := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_COUNT", "Введите макс. кол-во обращений за период:")
 	promptEnterDirectDuration := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_DURATION", "Введите период лимита в минутах:")
 
+	// --- Загрузка настроек бэкфилла --- (ДОБАВЛЕНО)
+	backfillBatchSizeStr := getEnvOrDefault("BACKFILL_BATCH_SIZE", "200")
+	backfillBatchDelayStr := getEnvOrDefault("BACKFILL_BATCH_DELAY_SECONDS", "5") // Имя env-переменной оставляем старым
+
 	// --- Логирование загруженных значений (до парсинга чисел) ---
-	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", truncateStringEnd(telegramToken, 5), len(telegramToken))
+	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", utils.TruncateString(telegramToken, 5), len(telegramToken))
 	log.Printf("[Config Load] LLM_PROVIDER: %s", llmProviderStr)
 	log.Printf("[Config Load] --- Gemini Settings ---")
-	log.Printf("[Config Load] GEMINI_API_KEY: ...%s (len %d)", truncateStringEnd(geminiAPIKey, 5), len(geminiAPIKey))
+	log.Printf("[Config Load] GEMINI_API_KEY: ...%s (len %d)", utils.TruncateString(geminiAPIKey, 5), len(geminiAPIKey))
 	log.Printf("[Config Load] GEMINI_MODEL_NAME: %s", geminiModelName)
 	log.Printf("[Config Load] --- DeepSeek Settings ---")
-	log.Printf("[Config Load] DEEPSEEK_API_KEY: ...%s (len %d)", truncateStringEnd(deepSeekAPIKey, 5), len(deepSeekAPIKey))
+	log.Printf("[Config Load] DEEPSEEK_API_KEY: ...%s (len %d)", utils.TruncateString(deepSeekAPIKey, 5), len(deepSeekAPIKey))
 	log.Printf("[Config Load] DEEPSEEK_MODEL_NAME: %s", deepSeekModelName)
 	log.Printf("[Config Load] DEEPSEEK_BASE_URL: %s", deepSeekBaseURL)
 	log.Printf("[Config Load] --- OpenRouter Settings ---")
-	log.Printf("[Config Load] OPENROUTER_API_KEY: ...%s (len %d)", truncateStringEnd(openRouterAPIKey, 5), len(openRouterAPIKey))
+	log.Printf("[Config Load] OPENROUTER_API_KEY: ...%s (len %d)", utils.TruncateString(openRouterAPIKey, 5), len(openRouterAPIKey))
 	log.Printf("[Config Load] OPENROUTER_MODEL_NAME: %s", openRouterModelName)
 	log.Printf("[Config Load] OPENROUTER_SITE_URL: %s", openRouterSiteURL)
 	log.Printf("[Config Load] OPENROUTER_SITE_TITLE: %s", openRouterSiteTitle)
@@ -234,7 +128,7 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] POSTGRESQL_HOST: %s", dbHost)
 	log.Printf("[Config Load] POSTGRESQL_PORT: %s", dbPort)
 	log.Printf("[Config Load] POSTGRESQL_USER: %s", dbUser)
-	log.Printf("[Config Load] POSTGRESQL_PASSWORD: ...%s (len %d)", truncateStringEnd(dbPassword, 3), len(dbPassword))
+	log.Printf("[Config Load] POSTGRESQL_PASSWORD: ...%s (len %d)", utils.TruncateString(dbPassword, 3), len(dbPassword))
 	log.Printf("[Config Load] POSTGRESQL_DBNAME: %s", dbName)
 	// Логирование MongoDB
 	log.Printf("[Config Load] MONGODB_URI: %s", maskSecretURI(mongoURI))
@@ -243,14 +137,14 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] MONGODB_USER_PROFILES_COLLECTION: %s", mongoUserProfilesCollection)
 	log.Printf("[Config Load] MONGODB_SETTINGS_COLLECTION: %s", mongoSettingsCollection) // Логируем новую коллекцию
 	log.Printf("[Config Load] --- Prompts & Behavior ---")
-	log.Printf("[Config Load] DEFAULT_PROMPT: %s...", truncateString(defaultPrompt, 50))
-	log.Printf("[Config Load] DIRECT_PROMPT: %s...", truncateString(directPrompt, 50))
-	log.Printf("[Config Load] DAILY_TAKE_PROMPT: %s...", truncateString(dailyTakePrompt, 50))
-	log.Printf("[Config Load] SUMMARY_PROMPT: %s...", truncateString(summaryPrompt, 50))
-	log.Printf("[Config Load] RATE_LIMIT_ERROR_MESSAGE: %s...", truncateString(rateLimitErrorMsg, 50))
-	log.Printf("[Config Load] SRACH_WARNING_PROMPT: %s...", truncateString(srachWarningPrompt, 50))
-	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", truncateString(srachAnalysisPrompt, 50))
-	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", truncateString(srachConfirmPrompt, 50))
+	log.Printf("[Config Load] DEFAULT_PROMPT: %s...", utils.TruncateString(defaultPrompt, 50))
+	log.Printf("[Config Load] DIRECT_PROMPT: %s...", utils.TruncateString(directPrompt, 50))
+	log.Printf("[Config Load] DAILY_TAKE_PROMPT: %s...", utils.TruncateString(dailyTakePrompt, 50))
+	log.Printf("[Config Load] SUMMARY_PROMPT: %s...", utils.TruncateString(summaryPrompt, 50))
+	log.Printf("[Config Load] RATE_LIMIT_ERROR_MESSAGE: %s...", utils.TruncateString(rateLimitErrorMsg, 50))
+	log.Printf("[Config Load] SRACH_WARNING_PROMPT: %s...", utils.TruncateString(srachWarningPrompt, 50))
+	log.Printf("[Config Load] SRACH_ANALYSIS_PROMPT: %s...", utils.TruncateString(srachAnalysisPrompt, 50))
+	log.Printf("[Config Load] SRACH_CONFIRM_PROMPT: %s...", utils.TruncateString(srachConfirmPrompt, 50))
 	// --- Логирование новых дефолтных настроек ---
 	log.Printf("[Config Load] DEFAULT_CONVERSATION_STYLE: %s", defaultConvStyle)
 	log.Printf("[Config Load] DEFAULT_TEMPERATURE: %s", defaultTempStr)
@@ -260,18 +154,18 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] --- Timing & Limits ---")
 	log.Printf("[Config Load] TIME_ZONE: %s", timeZone)
 	log.Printf("[Config Load] DEBUG: %s", debugStr)
-	log.Printf("[Config Load] WELCOME_PROMPT: %s...", truncateString(welcomePrompt, 50))
-	log.Printf("[Config Load] VOICE_FORMAT_PROMPT: %s...", truncateString(voiceFormatPrompt, 50))
+	log.Printf("[Config Load] WELCOME_PROMPT: %s...", utils.TruncateString(welcomePrompt, 50))
+	log.Printf("[Config Load] VOICE_FORMAT_PROMPT: %s...", utils.TruncateString(voiceFormatPrompt, 50))
 	log.Printf("[Config Load] VOICE_TRANSCRIPTION_ENABLED_DEFAULT: %s", voiceTranscriptionEnabledDefaultStr)
-	log.Printf("[Config Load] CLASSIFY_DIRECT_MESSAGE_PROMPT: %s...", truncateString(classifyDirectMessagePrompt, 50))
-	log.Printf("[Config Load] SERIOUS_DIRECT_PROMPT: %s...", truncateString(seriousDirectPrompt, 50))
+	log.Printf("[Config Load] CLASSIFY_DIRECT_MESSAGE_PROMPT: %s...", utils.TruncateString(classifyDirectMessagePrompt, 50))
+	log.Printf("[Config Load] SERIOUS_DIRECT_PROMPT: %s...", utils.TruncateString(seriousDirectPrompt, 50))
 	log.Printf("[Config Load] --- Direct Reply Limit Settings ---")
 	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_ENABLED_DEFAULT: %s", directLimitEnabledStr)
 	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_COUNT_DEFAULT: %s", directLimitCountStr)
 	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT: %s", directLimitDurationStr)
-	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_PROMPT: %s...", truncateString(directLimitPrompt, 50))
-	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_COUNT: %s...", truncateString(promptEnterDirectCount, 50))
-	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_DURATION: %s...", truncateString(promptEnterDirectDuration, 50))
+	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_PROMPT: %s...", utils.TruncateString(directLimitPrompt, 50))
+	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_COUNT: %s...", utils.TruncateString(promptEnterDirectCount, 50))
+	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_DURATION: %s...", utils.TruncateString(promptEnterDirectDuration, 50))
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -385,12 +279,18 @@ func Load() (*Config, error) {
 	longTermMemoryFetchKStr := getEnvOrDefault("LONG_TERM_MEMORY_FETCH_K", "3")
 	longTermMemoryFetchK, _ := strconv.Atoi(longTermMemoryFetchKStr)
 
-	// Загружаем настройки бэкфилла
-	backfillBatchSizeStr := getEnvOrDefault("BACKFILL_BATCH_SIZE", "50")
-	backfillBatchSize, _ := strconv.Atoi(backfillBatchSizeStr)
-	backfillDelaySecStr := getEnvOrDefault("BACKFILL_BATCH_DELAY_SECONDS", "65")
-	backfillDelaySec, _ := strconv.Atoi(backfillDelaySecStr)
-	backfillBatchDelaySeconds := time.Duration(backfillDelaySec) * time.Second
+	// --- Преобразование строковых значений в нужные типы ---
+	backfillBatchSize, err := strconv.Atoi(backfillBatchSizeStr)
+	if err != nil {
+		log.Printf("Ошибка парсинга BACKFILL_BATCH_SIZE: %v, используем 200", err)
+		backfillBatchSize = 200
+	}
+	backfillBatchDelayInt, err := strconv.Atoi(backfillBatchDelayStr)
+	if err != nil {
+		log.Printf("Ошибка парсинга BACKFILL_BATCH_DELAY_SECONDS: %v, используем 5", err)
+		backfillBatchDelayInt = 5
+	}
+	backfillBatchDelay := time.Duration(backfillBatchDelayInt) * time.Second
 
 	cfg := Config{
 		TelegramToken: telegramToken,
@@ -458,8 +358,8 @@ func Load() (*Config, error) {
 		MongoVectorIndexName:     mongoVectorIndexName,
 		LongTermMemoryFetchK:     longTermMemoryFetchK,
 		// --- Настройки бэкфилла эмбеддингов ---
-		BackfillBatchSize:         backfillBatchSize,
-		BackfillBatchDelaySeconds: backfillBatchDelaySeconds,
+		BackfillBatchSize:  backfillBatchSize,
+		BackfillBatchDelay: backfillBatchDelay,
 		// --- Новые поля для OpenRouter ---
 		OpenRouterAPIKey:    openRouterAPIKey,
 		OpenRouterModelName: openRouterModelName,
@@ -575,281 +475,40 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// logLoadedConfig выводит загруженную конфигурацию в лог (маскируя секреты)
-func logLoadedConfig(cfg *Config) {
-	log.Println("--- Загруженная конфигурация ---")
-	log.Printf("Telegram Token: %s", maskSecret(cfg.TelegramToken))
-	log.Printf("LLM Provider: %s", cfg.LLMProvider)
-	log.Printf("  Default Prompt: %s...", truncateStringEnd(cfg.DefaultPrompt, 80))
-	log.Printf("  Direct Prompt: %s...", truncateStringEnd(cfg.DirectPrompt, 80))
-	log.Printf("  Classify Direct Prompt: %s...", truncateStringEnd(cfg.ClassifyDirectMessagePrompt, 80))
-	log.Printf("  Serious Direct Prompt: %s...", truncateStringEnd(cfg.SeriousDirectPrompt, 80))
-	log.Printf("  Daily Take Prompt: %s...", truncateStringEnd(cfg.DailyTakePrompt, 80))
-	log.Printf("  Summary Prompt: %s...", truncateStringEnd(cfg.SummaryPrompt, 80))
-	// --- Логирование новых дефолтных настроек ---
-	log.Printf("  Default Conversation Style: %s", cfg.DefaultConversationStyle)
-	log.Printf("  Default Temperature: %.2f", cfg.DefaultTemperature)
-	log.Printf("  Default Model: %s", cfg.DefaultModel)
-	log.Printf("  Default Safety Threshold: %s", cfg.DefaultSafetyThreshold)
-	// --- Конец логирования новых дефолтных настроек ---
-
-	switch cfg.LLMProvider {
-	case ProviderGemini:
-		log.Printf("  Gemini API Key: %s", maskSecret(cfg.GeminiAPIKey))
-		log.Printf("  Gemini Model: %s", cfg.GeminiModelName)
-	case ProviderDeepSeek:
-		log.Printf("  DeepSeek API Key: %s", maskSecret(cfg.DeepSeekAPIKey))
-		log.Printf("  DeepSeek Model: %s", cfg.DeepSeekModelName)
-		log.Printf("  DeepSeek Base URL: %s", cfg.DeepSeekBaseURL)
-	case ProviderOpenRouter:
-		log.Printf("  OpenRouter API Key: %s", maskSecret(cfg.OpenRouterAPIKey))
-		log.Printf("  OpenRouter Model Name: %s", cfg.OpenRouterModelName)
-		log.Printf("  OpenRouter Site URL: %s", cfg.OpenRouterSiteURL)
-		log.Printf("  OpenRouter Site Title: %s", cfg.OpenRouterSiteTitle)
-	}
-
-	log.Printf("Rate Limit Static Text: %s", cfg.RateLimitStaticText)
-	log.Printf("Rate Limit Prompt: %s...", truncateStringEnd(cfg.RateLimitPrompt, 80))
-	log.Printf("Prompt Min Messages: %s", cfg.PromptEnterMinMessages)
-	log.Printf("Prompt Max Messages: %s", cfg.PromptEnterMaxMessages)
-	log.Printf("Prompt Daily Time: %s", cfg.PromptEnterDailyTime)
-	log.Printf("Prompt Summary Interval: %s", cfg.PromptEnterSummaryInterval)
-	log.Printf("Srach Warning Prompt: %s...", truncateStringEnd(cfg.SRACH_WARNING_PROMPT, 80))
-	log.Printf("Srach Analysis Prompt: %s...", truncateStringEnd(cfg.SRACH_ANALYSIS_PROMPT, 80))
-	log.Printf("Srach Confirm Prompt: %s...", truncateStringEnd(cfg.SRACH_CONFIRM_PROMPT, 80))
-	log.Printf("Srach Keywords: %d слов", len(cfg.SrachKeywords))
-	log.Printf("Srach Analysis Enabled by default: %t", cfg.SrachAnalysisEnabled)
-	log.Printf("Welcome Prompt: %s...", truncateStringEnd(cfg.WelcomePrompt, 80))
-	log.Printf("Daily Take Time: %d", cfg.DailyTakeTime)
-	log.Printf("Time Zone: %s", cfg.TimeZone)
-	log.Printf("Summary Interval: %d hours", cfg.SummaryIntervalHours)
-	log.Printf("Messages Interval: %d-%d", cfg.MinMessages, cfg.MaxMessages)
-	log.Printf("Context Window: %d", cfg.ContextWindow)
-	log.Printf("Debug Mode: %t", cfg.Debug)
-	log.Printf("Storage Type: %s", cfg.StorageType)
-	log.Printf(" - Voice Format Prompt: %s", truncateStringEnd(cfg.VoiceFormatPrompt, 100))
-	log.Printf(" - Voice Transcription Default: %t", cfg.VoiceTranscriptionEnabledDefault)
-	log.Printf("  --- Direct Reply Limit Defaults ---")
-	log.Printf("  Direct Limit Enabled Default: %t", cfg.DirectReplyLimitEnabledDefault)
-	log.Printf("  Direct Limit Count Default: %d", cfg.DirectReplyLimitCountDefault)
-	log.Printf("  Direct Limit Duration Default: %v", cfg.DirectReplyLimitDurationDefault)
-	log.Printf("  Direct Limit Prompt: %s...", truncateStringEnd(cfg.DirectReplyLimitPrompt, 80))
-	log.Printf("  Prompt Enter Direct Limit Count: %s...", truncateStringEnd(cfg.PromptEnterDirectLimitCount, 80))
-	log.Printf("  Prompt Enter Direct Limit Duration: %s...", truncateStringEnd(cfg.PromptEnterDirectLimitDuration, 80))
-	log.Printf("  Direct Reply Limit: Enabled=%t, Count=%d, Duration=%v", cfg.DirectReplyLimitEnabledDefault, cfg.DirectReplyLimitCountDefault, cfg.DirectReplyLimitDurationDefault)
-	log.Printf("  Long-Term Memory: Enabled=%t, EmbeddingModel=%s, VectorIndex=%s, FetchK=%d", cfg.LongTermMemoryEnabled, cfg.GeminiEmbeddingModelName, cfg.MongoVectorIndexName, cfg.LongTermMemoryFetchK)
-	log.Printf("  Backfill Settings: BatchSize=%d, BatchDelay=%v", cfg.BackfillBatchSize, cfg.BackfillBatchDelaySeconds)
-	log.Println("--- End Loaded Config ---")
-
-	switch cfg.StorageType {
-	case StorageTypePostgres:
-		log.Printf("  PostgreSQL Host: %s", cfg.PostgresqlHost)
-		log.Printf("  PostgreSQL Port: %s", cfg.PostgresqlPort)
-		log.Printf("  PostgreSQL User: %s", cfg.PostgresqlUser)
-		log.Printf("  PostgreSQL Password: %s", maskSecret(cfg.PostgresqlPassword))
-		log.Printf("  PostgreSQL DB Name: %s", cfg.PostgresqlDbname)
-	case StorageTypeMongo:
-		log.Printf("  MongoDB URI: %s", maskSecretURI(cfg.MongoDbURI))
-		log.Printf("  MongoDB DB Name: %s", cfg.MongoDbName)
-		log.Printf("  MongoDB Messages Collection: %s", cfg.MongoDbMessagesCollection)
-		log.Printf("  MongoDB User Profiles Collection: %s", cfg.MongoDbUserProfilesCollection)
-		log.Printf("  MongoDB Settings Collection: %s", cfg.MongoDbSettingsCollection) // Логируем новую коллекцию
-	case StorageTypeFile:
-		log.Printf("  File Storage Path: /data/chat_*.json")
-	}
-	log.Printf("Admin Usernames: %v", cfg.AdminUsernames) // Логируем администраторов
-	log.Println("---------------------------------")
-}
-
-// getEnvOrDefault возвращает значение переменной окружения или значение по умолчанию
+// getEnvOrDefault читает переменную окружения или возвращает значение по умолчанию
 func getEnvOrDefault(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
 	}
-	if defaultValue != "" { // Логируем только если значение не пустое
-		// Уменьшил уровень детализации для значений по умолчанию БД и секретов
-		if !strings.HasPrefix(key, "POSTGRESQL_") && !strings.HasPrefix(key, "MONGODB_") && key != "GEMINI_API_KEY" && key != "DEEPSEEK_API_KEY" && key != "OPENROUTER_API_KEY" && key != "OPENROUTER_MODEL_NAME" {
-			log.Printf("Переменная окружения %s не установлена, используется значение по умолчанию: %s", key, defaultValue)
-		} else if key == "POSTGRESQL_PASSWORD" || key == "GEMINI_API_KEY" || key == "DEEPSEEK_API_KEY" || key == "OPENROUTER_API_KEY" || key == "MONGODB_URI" || key == "OPENROUTER_SITE_URL" || key == "OPENROUTER_SITE_TITLE" {
-			log.Printf("Переменная окружения %s не установлена.", key) // Не логируем секретные значения по умолчанию
-		} else {
-			// Не логируем хост, юзера, имя БД если они пустые по умолчанию
-		}
-	}
 	return defaultValue
 }
 
-// Вспомогательные функции для логирования
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen]
-}
-
-func truncateStringEnd(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[len(s)-maxLen:]
-}
-
-// maskSecret маскирует строку секрета
+// maskSecret заменяет большую часть строки звездочками для безопасного логирования
 func maskSecret(s string) string {
-	if len(s) > 4 {
-		return "****" + s[len(s)-4:]
-	}
-	return "****"
-}
-
-// maskSecretURI маскирует строку секретного URI, скрывая пароль и хост
-func maskSecretURI(uri string) string {
-	// Простой вариант: если строка содержит "@", скрыть часть до "@"
-	if idx := strings.Index(uri, "@"); idx != -1 {
-		if startIdx := strings.Index(uri, "://"); startIdx != -1 {
-			return uri[:startIdx+3] + "****" + uri[idx:]
-		}
-	}
-	// Если "@" нет, но строка длинная, скрыть часть
-	if len(uri) > 15 {
-		return uri[:8] + "****" + uri[len(uri)-4:]
-	}
-	// Иначе вернуть как есть или просто "****"
-	if len(uri) > 0 {
+	if len(s) < 4 {
 		return "****"
 	}
-	return ""
+	visiblePart := 2 // Сколько символов оставить видимыми с каждого конца
+	if len(s) < visiblePart*2 {
+		visiblePart = 1
+	}
+	if len(s) < visiblePart*2 {
+		return "****"
+	}
+	return s[:visiblePart] + "****" + s[len(s)-visiblePart:]
 }
 
-// ValidateConfig проверяет корректность загруженной конфигурации
-func ValidateConfig(cfg *Config) error {
-	// Валидация LLM Provider и ключей
-	switch cfg.LLMProvider {
-	case ProviderGemini:
-		if cfg.GeminiAPIKey == "" {
-			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_API_KEY не установлен")
-		}
-		if cfg.GeminiModelName == "" {
-			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_MODEL_NAME не установлен")
-		}
-		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
-			return fmt.Errorf("LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен")
-		}
-	case ProviderDeepSeek:
-		if cfg.DeepSeekAPIKey == "" {
-			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
-		}
-		if cfg.DeepSeekModelName == "" {
-			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_MODEL_NAME не установлен")
-		}
-		// Для DeepSeek также нужен GeminiEmbeddingModelName, если LongTermMemoryEnabled
-		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
-			log.Println("[WARN] LLM_PROVIDER='deepseek' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен. Используется 'embedding-001' по умолчанию.")
-			// Можно установить дефолт здесь или при загрузке
-			if cfg.GeminiEmbeddingModelName == "" {
-				cfg.GeminiEmbeddingModelName = "embedding-001"
-			}
-		}
-		if cfg.LongTermMemoryEnabled && cfg.GeminiAPIKey == "" {
-			return fmt.Errorf("LLM_PROVIDER='deepseek' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_API_KEY не установлен (нужен для эмбеддингов)")
-		}
-	case ProviderOpenRouter:
-		if cfg.OpenRouterAPIKey == "" {
-			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_API_KEY не установлен")
-		}
-		if cfg.OpenRouterModelName == "" {
-			return fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_MODEL_NAME не установлен")
-		}
-		// Для OpenRouter также нужен GeminiEmbeddingModelName, если LongTermMemoryEnabled
-		if cfg.LongTermMemoryEnabled && cfg.GeminiEmbeddingModelName == "" {
-			log.Println("[WARN] LLM_PROVIDER='openrouter' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_EMBEDDING_MODEL_NAME не установлен. Используется 'embedding-001' по умолчанию.")
-			if cfg.GeminiEmbeddingModelName == "" {
-				cfg.GeminiEmbeddingModelName = "embedding-001"
-			}
-		}
-		if cfg.LongTermMemoryEnabled && cfg.GeminiAPIKey == "" {
-			return fmt.Errorf("LLM_PROVIDER='openrouter' и LONG_TERM_MEMORY_ENABLED=true, но GEMINI_API_KEY не установлен (нужен для эмбеддингов)")
-		}
-	default:
-		return fmt.Errorf("неизвестный LLM_PROVIDER: '%s'. Допустимые значения: 'gemini', 'deepseek', 'openrouter'", cfg.LLMProvider)
+// maskSecretURI маскирует пароль в URI
+func maskSecretURI(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return maskSecret(uri) // Если парсинг не удался, маскируем как обычную строку
 	}
-
-	// Валидация интервалов
-	if cfg.DailyTakeTime < 0 || cfg.DailyTakeTime > 23 {
-		return fmt.Errorf("ошибка конфигурации: DAILY_TAKE_TIME (%d) должен быть в диапазоне 0-23", cfg.DailyTakeTime)
+	if u.User != nil {
+		username := u.User.Username()
+		// Пароль маскируем полностью
+		u.User = url.UserPassword(username, "********")
+		return u.String()
 	}
-	if cfg.MinMessages < 1 || cfg.MinMessages > cfg.MaxMessages {
-		return fmt.Errorf("ошибка конфигурации: MIN_MESSAGES (%d) должен быть >= 1 и <= MAX_MESSAGES (%d)", cfg.MinMessages, cfg.MaxMessages)
-	}
-	if cfg.MaxMessages < 1 {
-		return fmt.Errorf("ошибка конфигурации: MAX_MESSAGES (%d) должен быть >= 1", cfg.MaxMessages)
-	}
-	if cfg.ContextWindow < 1 {
-		return fmt.Errorf("ошибка конфигурации: CONTEXT_WINDOW (%d) должен быть >= 1", cfg.ContextWindow)
-	}
-	if cfg.SummaryIntervalHours < 0 {
-		return fmt.Errorf("ошибка конфигурации: SUMMARY_INTERVAL_HOURS (%d) должен быть в диапазоне 0-24", cfg.SummaryIntervalHours)
-	}
-
-	// Валидация настроек хранилища
-	switch cfg.StorageType {
-	case StorageTypeFile:
-		// Дополнительных проверок для файла пока нет
-	case StorageTypePostgres:
-		if cfg.PostgresqlHost == "" || cfg.PostgresqlUser == "" || cfg.PostgresqlDbname == "" {
-			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='postgres', но не все POSTGRESQL_* переменные установлены (HOST, USER, DBNAME)")
-		}
-	case StorageTypeMongo:
-		if cfg.MongoDbURI == "" {
-			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_URI не установлен")
-		}
-		if cfg.MongoDbName == "" {
-			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_DBNAME не установлен")
-		}
-		if cfg.MongoDbMessagesCollection == "" {
-			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_MESSAGES_COLLECTION не установлен")
-		}
-		if cfg.MongoDbUserProfilesCollection == "" {
-			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_USER_PROFILES_COLLECTION не установлен")
-		}
-		if cfg.MongoDbSettingsCollection == "" {
-			return fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_SETTINGS_COLLECTION не установлен")
-		}
-	}
-
-	// Валидация Администраторов
-	if len(cfg.AdminUsernames) == 0 {
-		return fmt.Errorf("ошибка конфигурации: список ADMIN_USERNAMES не должен быть пустым")
-	}
-
-	// Валидация температуры
-	if cfg.DefaultTemperature < 0.0 || cfg.DefaultTemperature > 2.0 {
-		return fmt.Errorf("ошибка конфигурации: DEFAULT_TEMPERATURE (%.2f) должен быть в диапазоне [0.0, 2.0]", cfg.DefaultTemperature)
-	}
-
-	if cfg.SeriousDirectPrompt == "" {
-		return fmt.Errorf("ошибка конфигурации: SERIOUS_DIRECT_PROMPT не должен быть пустым")
-	}
-	if cfg.DirectReplyLimitPrompt == "" {
-		return fmt.Errorf("ошибка конфигурации: DIRECT_REPLY_LIMIT_PROMPT не должен быть пустым")
-	}
-	if cfg.PromptEnterDirectLimitCount == "" {
-		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_COUNT не должен быть пустым")
-	}
-	if cfg.PromptEnterDirectLimitDuration == "" {
-		return fmt.Errorf("ошибка конфигурации: PROMPT_ENTER_DIRECT_LIMIT_DURATION не должен быть пустым")
-	}
-
-	// Проверка ключа Gemini, если включена долгосрочная память или транскрипция
-	if cfg.LongTermMemoryEnabled || cfg.VoiceTranscriptionEnabledDefault {
-		if cfg.GeminiAPIKey == "" {
-			return fmt.Errorf("GEMINI_API_KEY должен быть установлен, так как включена долгосрочная память или транскрипция голоса по умолчанию")
-		}
-		if cfg.GeminiEmbeddingModelName == "" {
-			log.Println("Предупреждение: GEMINI_EMBEDDING_MODEL_NAME не установлен, используется модель по умолчанию 'embedding-001' для эмбеддингов.")
-			cfg.GeminiEmbeddingModelName = "embedding-001" // Установим дефолтное значение, если не задано
-		}
-	}
-
-	return nil
+	return uri // Возвращаем как есть, если нет UserInfo
 }

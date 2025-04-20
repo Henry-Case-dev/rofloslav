@@ -9,6 +9,7 @@ import (
 
 	// Added for checking nil pointer inside EnsureIndexes
 
+	"context"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -38,7 +39,7 @@ type ChatHistoryStorage interface {
 	AddMessage(chatID int64, message *tgbotapi.Message)
 	// GetMessages извлекает последние N сообщений для указанного чата, где N = limit.
 	GetMessages(chatID int64, limit int) ([]*tgbotapi.Message, error)
-	GetMessagesSince(chatID int64, since time.Time) ([]*tgbotapi.Message, error)
+	GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error)
 	LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error)
 	SaveChatHistory(chatID int64) error
 	ClearChatHistory(chatID int64) error
@@ -91,6 +92,11 @@ type ChatHistoryStorage interface {
 	// SearchRelevantMessages ищет сообщения, семантически близкие к queryText, используя векторный поиск.
 	// Возвращает до k наиболее релевантных сообщений.
 	SearchRelevantMessages(chatID int64, queryText string, k int) ([]*tgbotapi.Message, error)
+
+	// === НОВЫЙ МЕТОД для получения ветки ответов ===
+	// GetReplyChain извлекает цепочку сообщений, на которые отвечали, начиная с messageID.
+	// Возвращает сообщения в хронологическом порядке (старые -> новые).
+	GetReplyChain(ctx context.Context, chatID int64, messageID int, maxDepth int) ([]*tgbotapi.Message, error)
 }
 
 // FileStorage реализует ChatHistoryStorage с использованием файлов.

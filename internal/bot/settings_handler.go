@@ -183,23 +183,3 @@ func (b *Bot) updateSettingsKeyboard(query *tgbotapi.CallbackQuery) {
 		b.answerCallback(query.ID, "Ошибка обновления настроек.")
 	}
 }
-
-// setSrachAnalysis включает или выключает анализ срачей для чата
-func (b *Bot) setSrachAnalysis(chatID int64, enabled bool) {
-	b.settingsMutex.Lock()
-	defer b.settingsMutex.Unlock()
-
-	if settings, exists := b.chatSettings[chatID]; exists {
-		if settings.SrachAnalysisEnabled != enabled {
-			settings.SrachAnalysisEnabled = enabled
-			log.Printf("Чат %d: Анализ срачей %s.", chatID, getEnabledStatusText(settings.SrachAnalysisEnabled))
-			// Сбрасываем состояние срача при изменении настройки
-			settings.SrachState = "none"
-			settings.SrachMessages = nil
-		} else {
-			log.Printf("Чат %d: Анализ срачей уже был %s.", chatID, getEnabledStatusText(settings.SrachAnalysisEnabled))
-		}
-	} else {
-		log.Printf("setSrachAnalysis: Настройки для чата %d не найдены!", chatID)
-	}
-}

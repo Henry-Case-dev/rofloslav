@@ -3,8 +3,6 @@ package bot
 import (
 	"fmt"
 	"log"
-	"sync"
-	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -95,65 +93,15 @@ func (b *Bot) loadChatHistory(chatID int64) {
 }
 
 // sendReplyReturnMsg - вспомогательная функция для отправки сообщения и возврата его объекта
+/*
 func (b *Bot) sendReplyReturnMsg(chatID int64, text string) (*tgbotapi.Message, error) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown" // Можно убрать, если тут не нужен Markdown
-	sentMsg, err := b.api.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка отправки сообщения в чат %d: %v", chatID, err)
-		return nil, err
-	}
-	return &sentMsg, nil
+	// ... implementation ...
 }
+*/
 
 // sendReplyAndDeleteInitial - отправляет итоговое сообщение и удаляет исходное
+/*
 func (b *Bot) sendReplyAndDeleteInitial(chatID int64, finalMsgText string, initialMsgID int) {
-	// Отправляем итоговое сообщение
-	b.sendReply(chatID, finalMsgText) // sendReply уже существует
-
-	// Удаляем начальное сообщение, если его ID был сохранен
-	if initialMsgID != 0 {
-		b.deleteMessage(chatID, initialMsgID)
-	}
+	// ... implementation ...
 }
-
-// scheduleHistorySaving запускает планировщик для периодического сохранения истории
-func (b *Bot) scheduleHistorySaving() {
-	ticker := time.NewTicker(30 * time.Minute) // Сохраняем каждые 30 минут
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			b.saveAllChatHistories()
-		case <-b.stop:
-			// При остановке бота сохраняем все истории
-			b.saveAllChatHistories()
-			return
-		}
-	}
-}
-
-// saveAllChatHistories сохраняет историю всех активных чатов
-func (b *Bot) saveAllChatHistories() {
-	b.settingsMutex.RLock()
-	chats := make([]int64, 0, len(b.chatSettings))
-	for chatID := range b.chatSettings {
-		chats = append(chats, chatID)
-	}
-	b.settingsMutex.RUnlock()
-
-	log.Printf("[Save All] Начинаю сохранение истории для %d чатов...", len(chats))
-	var wg sync.WaitGroup
-	for _, chatID := range chats {
-		wg.Add(1)
-		go func(cid int64) {
-			defer wg.Done()
-			if err := b.storage.SaveChatHistory(cid); err != nil {
-				log.Printf("[Save All ERROR] Ошибка сохранения истории для чата %d: %v", cid, err)
-			}
-		}(chatID)
-	}
-	wg.Wait() // Ждем завершения всех сохранений
-	log.Printf("[Save All] Сохранение истории для всех чатов завершено.")
-}
+*/

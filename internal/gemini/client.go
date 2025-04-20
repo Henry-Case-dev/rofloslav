@@ -13,6 +13,8 @@ import (
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
+
+	"github.com/Henry-Case-dev/rofloslav/internal/utils"
 )
 
 var botUserID int64
@@ -91,7 +93,7 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 			Parts: []genai.Part{genai.Text(systemPrompt)},
 		}
 		if c.debug {
-			log.Printf("[DEBUG] Gemini Запрос: Установлен SystemInstruction: %s...", truncateString(systemPrompt, 100))
+			log.Printf("[DEBUG] Gemini Запрос: Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
 		}
 	}
 
@@ -117,7 +119,7 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 	if lastMessageText != "" {
 		contentToSend = genai.Text(lastMessageText)
 		if c.debug {
-			log.Printf("[DEBUG] Gemini Запрос: Текст lastMessage для отправки: %s...", truncateString(lastMessageText, 50))
+			log.Printf("[DEBUG] Gemini Запрос: Текст lastMessage для отправки: %s...", utils.TruncateString(lastMessageText, 50))
 		}
 	} else {
 		// Если lastMessage пустой (например, стикер или медиа без текста/caption), что отправлять?
@@ -160,7 +162,7 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 
 	finalResponse := responseText.String()
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Ответ: %s...", truncateString(finalResponse, 100))
+		log.Printf("[DEBUG] Gemini Ответ: %s...", utils.TruncateString(finalResponse, 100))
 	}
 
 	return finalResponse, nil
@@ -282,7 +284,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 			Parts: []genai.Part{genai.Text(systemPrompt)},
 		}
 		if c.debug {
-			log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Установлен SystemInstruction: %s...", truncateString(systemPrompt, 100))
+			log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
 		}
 	}
 
@@ -291,7 +293,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 	contentToSend := genai.Text(contextText) // Формируем контент только из contextText
 
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Текст для отправки: %s...", truncateString(contextText, 150))
+		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Текст для отправки: %s...", utils.TruncateString(contextText, 150))
 		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Модель %s, Temp: %v, TopP: %v, MaxTokens: %v",
 			c.modelName, model.Temperature, model.TopP, model.MaxOutputTokens)
 	}
@@ -320,7 +322,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 
 	finalResponse := responseText.String()
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Ответ (Arbitrary): %s...", truncateString(finalResponse, 100))
+		log.Printf("[DEBUG] Gemini Ответ (Arbitrary): %s...", utils.TruncateString(finalResponse, 100))
 	}
 
 	return finalResponse, nil
@@ -382,7 +384,7 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 		finishReason := resp.Candidates[0].FinishReason
 		tokenCount := resp.Candidates[0].TokenCount
 		log.Printf("[DEBUG] Gemini Ответ (Text Context): Причина завершения: %s, Токенов: %d", finishReason, tokenCount)
-		log.Printf("[DEBUG] Gemini Ответ (Text Context): %s...", truncateString(finalResponse, 100))
+		log.Printf("[DEBUG] Gemini Ответ (Text Context): %s...", utils.TruncateString(finalResponse, 100))
 	}
 
 	if resp.Candidates[0].FinishReason == genai.FinishReasonSafety || resp.Candidates[0].FinishReason == genai.FinishReasonRecitation {
@@ -393,37 +395,30 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 	return finalResponse, nil
 }
 
-// truncateString обрезает строку до указанной длины, добавляя многоточие
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen]
-}
-
 // TranscribeAudio транскрибирует аудиоданные с помощью Gemini API
 func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, error) {
 	// Проверяем, поддерживает ли модель аудио (хотя бы по названию)
-	if !strings.Contains(c.modelName, "1.5") {
-		log.Printf("[WARN][TranscribeAudio] Текущая модель '%s' может не поддерживать аудио. Для транскрибации рекомендуется Gemini 1.5 Flash/Pro.", c.modelName)
+	if !strings.Contains(c.modelName, "1.5") && !strings.Contains(c.modelName, "flash") { // Обновил проверку, flash тоже должен работать
+		log.Printf("[WARN][TranscribeAudio] Текущая модель '%s' может не поддерживать аудио. Для транскрибации рекомендуется Gemini 1.5/2.0 Flash/Pro.", c.modelName)
 		// Можно либо вернуть ошибку, либо попытаться использовать 1.5 Flash по умолчанию
 		// return "", fmt.Errorf("модель %s не поддерживает транскрибацию аудио", c.modelName)
 	}
 
 	ctx := context.Background()
-	// Используем модель, указанную при инициализации клиента, или 1.5 Flash как fallback
-	// model := c.genaiClient.GenerativeModel(c.modelName)
-	// TODO: Решить, как обрабатывать модели без поддержки аудио. Пока оставляем текущую.
-	model := c.genaiClient.GenerativeModel(c.modelName)
+	model := c.genaiClient.GenerativeModel(c.modelName) // Используем основную модель клиента
 
 	if c.debug {
 		log.Printf("[DEBUG][TranscribeAudio] Используется модель: %s, MIME-тип: %s, Размер данных: %d байт", c.modelName, mimeType, len(audioData))
+		log.Printf("[DEBUG][TranscribeAudio PRE-CALL] Вызов GenerateContent с моделью: %s", c.modelName)
 	}
 
-	// Формируем запрос с аудиоданными и простым промптом для транскрибации
-	prompt := genai.Text("Transcribe this audio:")
+	// Формируем запрос СОГЛАСНО ДОКУМЕНТАЦИИ для транскрипции:
+	// Промпт для запроса транскрипции
+	prompt := genai.Text("Транскрибируй текст аудио как есть") // Исправленный промпт
+	// Аудиоданные как genai.Blob (возвращаемся к Blob)
 	audioPart := genai.Blob{MIMEType: mimeType, Data: audioData}
 
+	// Отправляем запрос только с промптом и аудио
 	resp, err := model.GenerateContent(ctx, prompt, audioPart)
 	if err != nil {
 		if c.debug {
@@ -444,12 +439,15 @@ func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, err
 		if c.debug {
 			log.Println("[DEBUG][TranscribeAudio] Gemini не вернул валидный ответ или текст.")
 		}
-		return "", fmt.Errorf("Gemini не вернул текст транскрибации")
+		// Возвращаем пустую строку, если транскрипции нет, но нет и ошибки API
+		// Это может случиться, если аудио пустое или содержит только тишину/шум
+		log.Printf("[WARN][TranscribeAudio] Gemini вернул пустой ответ без ошибки API. Аудио могло быть пустым.")
+		return "", nil // Не считаем это ошибкой приложения
 	}
 
 	finalTranscript := transcript.String()
 	if c.debug {
-		log.Printf("[DEBUG][TranscribeAudio] Успешная транскрибация: %s...", truncateString(finalTranscript, 100))
+		log.Printf("[DEBUG][TranscribeAudio] Успешная транскрипция: %s...", utils.TruncateString(finalTranscript, 100))
 	}
 
 	return finalTranscript, nil
@@ -464,7 +462,7 @@ func (c *Client) EmbedContent(text string) ([]float32, error) {
 	}
 
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Embed Запрос: Модель %s, Текст: %s...", c.embeddingModelName, truncateString(text, 50))
+		log.Printf("[DEBUG] Gemini Embed Запрос: Модель %s, Текст: %s...", c.embeddingModelName, utils.TruncateString(text, 50))
 	}
 
 	res, err := em.EmbedContent(ctx, genai.Text(text))

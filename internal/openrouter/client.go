@@ -13,6 +13,7 @@ import (
 
 	"github.com/Henry-Case-dev/rofloslav/internal/config" // Нужен для Debug флага
 	"github.com/Henry-Case-dev/rofloslav/internal/llm"    // Импортируем наш интерфейс
+	"github.com/Henry-Case-dev/rofloslav/internal/utils"  // Добавляем импорт
 
 	// НЕ ИСПОЛЬЗУЕМ tgbotapi здесь, интерфейс работает с текстом
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5" // Добавляем импорт
@@ -226,6 +227,10 @@ func (c *Client) sendRequest(payload ChatCompletionRequest) (string, error) {
 		log.Printf("[DEBUG] OpenRouter Запрос: URL=%s, Модель=%s", req.URL.String(), payload.Model)
 		// Логирование тела запроса может быть объемным, делаем это осторожно
 		// log.Printf("[DEBUG] OpenRouter Запрос Тело: %s", string(jsonData))
+		log.Printf("[DEBUG] OpenRouter Request Payload: Model=%s, Messages=%d", payload.Model, len(payload.Messages))
+		if len(payload.Messages) > 0 {
+			log.Printf("[DEBUG] OpenRouter Last Message: Role=%s, Content=%s...", payload.Messages[len(payload.Messages)-1].Role, utils.TruncateString(payload.Messages[len(payload.Messages)-1].Content, 150))
+		}
 	}
 
 	resp, err := c.httpClient.Do(req)
