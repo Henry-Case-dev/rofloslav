@@ -2,7 +2,10 @@ package bot
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,121 +18,220 @@ import (
 
 // sendDirectResponse обрабатывает прямое упоминание или ответ на сообщение бота
 func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
-	// --- Получение данных для контекста ---
-	ctx := context.Background() // Используем общий контекст для запросов к хранилищу
+	startTime := time.Now()
+	defer func() {
+		log.Printf("[DEBUG][Timing] Генерация DirectResponse (ReplyID: %d) для чата %d заняла %s",
+			message.MessageID, chatID, time.Since(startTime))
+	}()
 
-	// 1. Релевантные сообщения из долгосрочной памяти (RAG)
-	var relevantMessages []*tgbotapi.Message
-	var errRAG error
-	if b.config.LongTermMemoryEnabled && message.Text != "" { // Ищем только если включено и есть текст
-		log.Printf("[DEBUG][sendDirectResponse] Chat %d: Searching relevant messages (RAG) for query: '%s'", chatID, message.Text)
-		// Контекст не передается в SearchRelevantMessages по интерфейсу
-		// ragCtx, ragCancel := context.WithTimeout(ctx, 10*time.Second)
-		relevantMessages, errRAG = b.storage.SearchRelevantMessages(chatID, message.Text, b.config.LongTermMemoryFetchK) // << Без контекста
-		// ragCancel()
-		if errRAG != nil {
-			log.Printf("[ERROR][sendDirectResponse] Chat %d: Ошибка RAG поиска: %v", chatID, errRAG)
-			relevantMessages = nil
-		} else {
-			log.Printf("[DEBUG][sendDirectResponse] Chat %d: Found %d relevant messages (RAG).", chatID, len(relevantMessages))
+	if message == nil {
+		log.Printf("[ERROR][DR] Chat %d: Невозможно отправить прямой ответ, сообщение nil", chatID)
+		return
+	}
+
+	log.Printf("[INFO][DR] Chat %d: Получен прямой запрос от %s (ID: %d)", chatID, message.From.UserName, message.From.ID)
+
+	// Проверяем наличие фотографии в сообщении
+	hasPhoto := message.Photo != nil && len(message.Photo) > 0
+
+	// Если в сообщении есть фотография, сначала обрабатываем её чтобы сохранить описание в хранилище
+	photoDescription := ""
+	if hasPhoto {
+		log.Printf("[INFO][DR] Chat %d: Обнаружена фотография в прямом обращении", chatID)
+
+		// Получаем настройки чата для проверки включения анализа фото
+		settings, err := b.storage.GetChatSettings(chatID)
+		photoAnalysisEnabled := b.config.PhotoAnalysisEnabled
+		if err == nil && settings != nil && settings.PhotoAnalysisEnabled != nil {
+			photoAnalysisEnabled = *settings.PhotoAnalysisEnabled
 		}
-	}
 
-	// 2. История сообщений (общий контекст)
-	// Контекст не передается в GetMessages по интерфейсу
-	// commonCtx, commonCancel := context.WithTimeout(ctx, 5*time.Second)
-	commonContextMessages, errCommon := b.storage.GetMessages(chatID, b.config.ContextWindow) // << Без контекста
-	// commonCancel()
-	if errCommon != nil {
-		log.Printf("[ERROR][sendDirectResponse] Ошибка получения общего контекста для чата %d: %v", chatID, errCommon)
-		b.sendReply(chatID, "Не могу получить историю, чтобы ответить.")
-		return
-	}
+		// Анализируем изображение только если включен PhotoAnalysisEnabled
+		if photoAnalysisEnabled && b.embeddingClient != nil && b.config.GeminiAPIKey != "" {
+			// Получаем самую большую фотографию (последнюю в массиве)
+			photoSize := message.Photo[len(message.Photo)-1]
 
-	// 3. Ветка ответов (Reply Chain)
-	var replyChainMessages []*tgbotapi.Message
-	var errChain error
-	// Определяем стартовое сообщение для цепочки
-	startMsgID := message.MessageID
-	// Максимальная глубина цепочки (можно вынести в конфиг)
-	maxChainDepth := 15
-	log.Printf("[DEBUG][sendDirectResponse] Chat %d: Fetching reply chain starting from message %d (max depth %d).", chatID, startMsgID, maxChainDepth)
-	// Используем контекст с таймаутом
-	chainCtx, chainCancel := context.WithTimeout(ctx, 15*time.Second) // Больший таймаут для цепочки
-	replyChainMessages, errChain = b.storage.GetReplyChain(chainCtx, chatID, startMsgID, maxChainDepth)
-	chainCancel()
-	if errChain != nil {
-		log.Printf("[ERROR][sendDirectResponse] Chat %d: Ошибка получения ветки ответов для сообщения %d: %v", chatID, startMsgID, errChain)
-		// Не критично, продолжим без ветки
-		replyChainMessages = nil
-	} else {
-		log.Printf("[DEBUG][sendDirectResponse] Chat %d: Fetched %d messages in reply chain.", chatID, len(replyChainMessages))
-	}
+			// Получаем информацию о файле
+			fileConfig := tgbotapi.FileConfig{
+				FileID: photoSize.FileID,
+			}
+			file, err := b.api.GetFile(fileConfig)
+			if err != nil {
+				log.Printf("[ERROR][DR] Chat %d: Не удалось получить информацию о фото: %v", chatID, err)
+			} else {
+				// Загружаем файл
+				fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", b.api.Token, file.FilePath)
+				client := &http.Client{}
+				resp, err := client.Get(fileURL)
+				if err != nil {
+					log.Printf("[ERROR][DR] Chat %d: Не удалось загрузить фото: %v", chatID, err)
+				} else {
+					defer resp.Body.Close()
 
-	// --- Формирование финального контекста ---
-	log.Printf("[DEBUG][sendDirectResponse] Chat %d: Formatting combined context...", chatID)
-	contextText := formatDirectReplyContext(
-		chatID,
-		replyChainMessages,    // Ветка ответов
-		commonContextMessages, // Общий контекст
-		relevantMessages,      // RAG
-		b.storage,
-		b.config,
-		b.config.TimeZone,
-	)
+					// Читаем содержимое файла
+					photoFileBytes, err := io.ReadAll(resp.Body)
+					if err != nil {
+						log.Printf("[ERROR][DR] Chat %d: Не удалось прочитать содержимое фото: %v", chatID, err)
+					} else {
+						// Анализируем фото с помощью Gemini
+						photoDescription, err = b.analyzeImageWithGemini(context.Background(), photoFileBytes, message.Caption)
+						if err != nil {
+							log.Printf("[ERROR][DR] Chat %d: Ошибка при анализе фото: %v", chatID, err)
+						} else {
+							log.Printf("[INFO][DR] Chat %d: Успешно проанализирована фотография в прямом обращении", chatID)
 
-	if contextText == "" {
-		log.Printf("[WARN][sendDirectResponse] Чат %d: Финальный контекст для прямого ответа пуст.", chatID)
-		b.sendReply(chatID, "Не могу сформировать контекст для ответа.")
-		return
-	}
-
-	if b.config.Debug {
-		log.Printf("[DEBUG][sendDirectResponse] Chat %d: Final context for LLM:\n%s", chatID, contextText) // Логируем весь контекст в дебаге
-	}
-
-	// Определяем, какой промпт использовать (обычный прямой или серьезный)
-	finalPrompt := b.config.DirectPrompt // Промпт по умолчанию
-	classification := "casual"           // Предполагаем несерьезный ответ
-
-	// Классификация сообщения (если есть текст)
-	if message.Text != "" {
-		classifyPrompt := b.config.ClassifyDirectMessagePrompt + "\n\n" + message.Text
-		llmResponse, classifyErr := b.llm.GenerateArbitraryResponse(classifyPrompt, "")
-		if classifyErr != nil {
-			log.Printf("[WARN][sendDirectResponse] Chat %d: Ошибка классификации сообщения: %v", chatID, classifyErr)
-			// Продолжаем с 'casual' по умолчанию
-		} else {
-			classification = strings.ToLower(strings.TrimSpace(llmResponse))
-			if b.config.Debug {
-				log.Printf("[DEBUG][sendDirectResponse] Chat %d: Классификация прямого ответа: '%s'", chatID, classification)
+							// Сохраняем текстовое описание изображения в хранилище
+							textMessage := &tgbotapi.Message{
+								MessageID: message.MessageID,
+								From:      message.From,
+								Chat:      message.Chat,
+								Date:      message.Date,
+								Text:      "[Анализ изображения]: " + photoDescription,
+							}
+							b.storage.AddMessage(chatID, textMessage)
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// Выбираем финальный промпт
-	if classification == "serious" {
-		finalPrompt = b.config.SeriousDirectPrompt
-	} // Иначе остается DirectPrompt
-
-	if b.config.Debug {
-		log.Printf("[DEBUG][sendDirectResponse] Chat %d: Используется финальный промпт: %s...", chatID, utils.TruncateString(finalPrompt, 150))
-	}
-
-	// Генерируем ответ LLM, используя НОВЫЙ contextText
-	response, err := b.llm.GenerateResponseFromTextContext(finalPrompt, contextText)
+	// Получаем последние сообщения из чата для контекста
+	messages, err := b.storage.GetMessages(chatID, b.config.ContextWindow)
 	if err != nil {
-		log.Printf("[ERROR][sendDirectResponse] Ошибка генерации прямого ответа для чата %d: %v", chatID, err)
-		b.sendReply(chatID, "Не могу придумать ответ.")
+		log.Printf("[ERROR][DR] Chat %d: Ошибка при получении истории сообщений: %v", chatID, err)
+		// Отправляем ошибку пользователю
+		errMsg := tgbotapi.NewMessage(chatID, "⚠️ Извините, произошла ошибка при обработке вашего запроса.")
+		errMsg.ReplyToMessageID = message.MessageID
+		b.api.Send(errMsg)
 		return
 	}
 
-	// ОТПРАВЛЯЕМ СООБЩЕНИЕ КАК ОТВЕТ
-	msg := tgbotapi.NewMessage(chatID, response)
-	msg.ReplyToMessageID = message.MessageID // Устанавливаем ID сообщения для ответа
-	_, errSend := b.api.Send(msg)
-	if errSend != nil {
-		log.Printf("[ERROR][sendDirectResponse] Ошибка отправки прямого ответа (как reply) в чат %d: %v", chatID, errSend)
+	// Получаем цепочку сообщений, на которые отвечали
+	var replyChain []*tgbotapi.Message
+	if message.ReplyToMessage != nil {
+		// Ограничиваем глубину цепочки ответов до 5
+		replyChain, err = b.storage.GetReplyChain(context.Background(), chatID, message.ReplyToMessage.MessageID, 5)
+		if err != nil {
+			log.Printf("[WARN][DR] Chat %d: Ошибка при получении цепочки ответов: %v", chatID, err)
+			// Продолжаем работу даже если не удалось получить цепочку ответов
+		}
+	}
+
+	// Получаем релевантные сообщения с использованием долгосрочной памяти, если она включена
+	var relevantMessages []*tgbotapi.Message
+	if b.config.LongTermMemoryEnabled {
+		// Объединяем текст сообщения с описанием фотографии, если оно есть
+		queryText := message.Text
+		if hasPhoto && photoDescription != "" {
+			if queryText != "" {
+				queryText += "\n\n" + photoDescription
+			} else {
+				queryText = photoDescription
+			}
+		}
+
+		// Если текст пустой (например, только фото без подписи), используем базовый текст
+		if queryText == "" {
+			queryText = "фотография"
+		}
+
+		// Ищем релевантные сообщения
+		relevantMsgs, err := b.storage.SearchRelevantMessages(chatID, queryText, b.config.LongTermMemoryFetchK)
+		if err != nil {
+			log.Printf("[WARN][DR] Chat %d: Ошибка при поиске релевантных сообщений: %v", chatID, err)
+		} else {
+			relevantMessages = relevantMsgs
+			if b.config.Debug {
+				log.Printf("[DEBUG][DR] Chat %d: Найдено %d релевантных сообщений", chatID, len(relevantMessages))
+			}
+		}
+	}
+
+	// Форматируем контекст
+	formattedContext := formatDirectReplyContext(chatID, message, replyChain, messages, relevantMessages, b.storage, b.config, b.config.TimeZone)
+
+	// Если в сообщении есть фотография, добавляем информацию о ней в контекст
+	if hasPhoto && photoDescription != "" {
+		// Добавляем описание фотографии в контекст
+		userInfo := fmt.Sprintf("Пользователь %s прикрепил к сообщению фотографию", message.From.UserName)
+		if message.Caption != "" {
+			userInfo += fmt.Sprintf(" с подписью: \"%s\"", message.Caption)
+		}
+		photoInfo := fmt.Sprintf("%s\nОписание фотографии: %s", userInfo, photoDescription)
+
+		// Добавляем информацию о фотографии в начало контекста
+		formattedContext = photoInfo + "\n\n" + formattedContext
+	}
+
+	// Начинаем анализ типа сообщения - серьезное или обычное
+	msgType := "regular"
+
+	// Классифицируем только если есть не-пустой текст или если есть фотография с описанием
+	if message.Text != "" || (hasPhoto && photoDescription != "") {
+		// Формируем входной текст для классификации, объединяя текст сообщения и описание фотографии
+		classifyInput := message.Text
+		if hasPhoto && photoDescription != "" {
+			if classifyInput != "" {
+				classifyInput += "\n\n[Содержимое фотографии]: " + photoDescription
+			} else {
+				classifyInput = "[Содержимое фотографии]: " + photoDescription
+			}
+		}
+
+		if b.config.ClassifyDirectMessagePrompt != "" {
+			// Классифицируем сообщение
+			classifyResult, err := b.llm.GenerateArbitraryResponse(
+				b.config.ClassifyDirectMessagePrompt,
+				classifyInput,
+			)
+			if err != nil {
+				log.Printf("[WARN][DR] Chat %d: Ошибка при классификации сообщения: %v", chatID, err)
+			} else {
+				// Проверяем результат классификации
+				lower := strings.ToLower(strings.TrimSpace(classifyResult))
+				if strings.Contains(lower, "serious") {
+					msgType = "serious"
+					log.Printf("[DEBUG][DR] Chat %d: Сообщение классифицировано как SERIOUS", chatID)
+				} else {
+					log.Printf("[DEBUG][DR] Chat %d: Сообщение классифицировано как REGULAR", chatID)
+				}
+			}
+		}
+	}
+
+	// Выбираем промпт в зависимости от типа сообщения
+	var responsePrompt string
+	if msgType == "serious" && b.config.SeriousDirectPrompt != "" {
+		responsePrompt = b.config.SeriousDirectPrompt
+		log.Printf("[INFO][DR] Chat %d: Используем SERIOUS_DIRECT_PROMPT", chatID)
+	} else {
+		responsePrompt = b.config.DirectPrompt
+		log.Printf("[INFO][DR] Chat %d: Используем стандартный DIRECT_PROMPT", chatID)
+	}
+
+	// Генерируем ответ
+	responseText, err := b.llm.GenerateResponseFromTextContext(responsePrompt, formattedContext)
+	if err != nil {
+		log.Printf("[ERROR][DR] Chat %d: Ошибка при генерации ответа: %v", chatID, err)
+		// Отправляем ошибку пользователю
+		errMsg := tgbotapi.NewMessage(chatID, "⚠️ Извините, возникла проблема при генерации ответа.")
+		errMsg.ReplyToMessageID = message.MessageID
+		b.api.Send(errMsg)
+		return
+	}
+
+	// Ограничиваем длину ответа для Telegram
+	if len(responseText) > 4096 {
+		responseText = responseText[:4093] + "..."
+	}
+
+	// Отправляем ответ
+	msg := tgbotapi.NewMessage(chatID, responseText)
+	msg.ReplyToMessageID = message.MessageID
+	_, err = b.api.Send(msg)
+	if err != nil {
+		log.Printf("[ERROR][DR] Chat %d: Ошибка при отправке сообщения: %v", chatID, err)
 	}
 }
 
@@ -186,11 +288,11 @@ func (b *Bot) sendAIResponse(chatID int64) {
 
 	// 3. Формируем финальный структурированный контекст
 	log.Printf("[DEBUG][sendAIResponse] Chat %d: Formatting combined context...", chatID)
-	contextText := formatDirectReplyContext( // Используем ту же функцию форматирования
-		chatID,
-		nil,                   // Нет ветки ответов для интервального сообщения
-		commonContextMessages, // Общий контекст
-		relevantMessages,      // RAG
+	contextText := formatDirectReplyContext(chatID,
+		nil,
+		nil,
+		commonContextMessages,
+		relevantMessages,
 		b.storage,
 		b.config,
 		b.config.TimeZone,
@@ -246,66 +348,71 @@ func (b *Bot) getDirectReplyLimitSettings(chatID int64) (enabled bool, count int
 	return
 }
 
-// checkAndRecordDirectReply проверяет лимит и записывает метку времени, если лимит не превышен.
-// Возвращает true, если лимит превышен, иначе false.
-func (b *Bot) checkAndRecordDirectReply(chatID int64, userID int64) bool {
-	enabled, limitCount, limitDuration := b.getDirectReplyLimitSettings(chatID)
-
-	// Если лимит выключен для чата ИЛИ count некорректен (<=0), сразу выходим
-	if !enabled || limitCount <= 0 {
-		if b.config.Debug {
-			log.Printf("[Direct Limit Check] Chat %d, User %d: Limit is disabled (Enabled: %t, Count: %d). Returning false (not exceeded).", chatID, userID, enabled, limitCount)
-		}
-		return false // Лимит не превышен
+// checkDirectReplyLimit проверяет, превышен ли лимит прямых обращений к боту для пользователя.
+// Возвращает true, если лимит ПРЕВЫШЕН.
+// Переписано для корректной и безопасной работы с мьютексом и картой.
+func (b *Bot) checkDirectReplyLimit(chatID int64, userID int64) bool {
+	// Получаем актуальные настройки из хранилища
+	settings, err := b.storage.GetChatSettings(chatID)
+	if err != nil {
+		log.Printf("[ERROR][checkDirectReplyLimit] Не удалось получить настройки чата %d: %v. Пропускаю проверку.", chatID, err)
+		return false // Считаем, что лимит не превышен
 	}
 
-	b.settingsMutex.Lock() // Используем Lock для чтения и записи
-	defer b.settingsMutex.Unlock()
+	// Проверяем, включен ли лимит
+	limitEnabled := b.config.DirectReplyLimitEnabledDefault
+	if settings != nil && settings.DirectReplyLimitEnabled != nil {
+		limitEnabled = *settings.DirectReplyLimitEnabled
+	}
+	if !limitEnabled {
+		return false // Лимит выключен
+	}
 
+	// Получаем значения лимита
+	limitCount := b.config.DirectReplyLimitCountDefault
+	if settings != nil && settings.DirectReplyLimitCount != nil {
+		limitCount = *settings.DirectReplyLimitCount
+	}
+	limitDuration := b.config.DirectReplyLimitDurationDefault
+	if settings != nil && settings.DirectReplyLimitDuration != nil {
+		limitDuration = time.Duration(*settings.DirectReplyLimitDuration) * time.Minute
+	}
+
+	// Используем полную блокировку для безопасного чтения и возможной записи
+	b.settingsMutex.Lock()
+	defer b.settingsMutex.Unlock() // Гарантируем разблокировку
+
+	// 1. Проверяем и инициализируем карту для чата, если нужно
+	userMap, chatExists := b.directReplyTimestamps[chatID]
+	if !chatExists {
+		userMap = make(map[int64][]time.Time)
+		b.directReplyTimestamps[chatID] = userMap
+	}
+
+	// 2. Получаем таймстампы для пользователя
+	timestamps := userMap[userID] // timestamps может быть nil
+
+	// 3. Фильтруем устаревшие таймстампы
 	now := time.Now()
-	limitWindowStart := now.Add(-limitDuration)
-
-	// Инициализируем map'ы, если их нет
-	if b.directReplyTimestamps == nil {
-		b.directReplyTimestamps = make(map[int64]map[int64][]time.Time)
-	}
-	if b.directReplyTimestamps[chatID] == nil {
-		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
-	}
-	userTimestamps := b.directReplyTimestamps[chatID][userID]
-
-	// Фильтруем метки, оставляем только те, что в пределах окна
-	validTimestamps := make([]time.Time, 0, len(userTimestamps))
-	for _, ts := range userTimestamps {
-		if ts.After(limitWindowStart) {
+	validTimestamps := []time.Time{}
+	for _, ts := range timestamps { // Безопасно итерироваться по nil слайсу
+		if now.Sub(ts) <= limitDuration {
 			validTimestamps = append(validTimestamps, ts)
 		}
 	}
 
-	// Проверяем количество меток
+	// 4. Проверяем лимит
 	limitExceeded := len(validTimestamps) >= limitCount
 
-	if b.config.Debug {
-		log.Printf("[Direct Limit Check] Chat %d, User %d: Enabled=%t, Count=%d, Duration=%v. Timestamps in window: %d. Limit exceeded: %t",
-			chatID, userID, enabled, limitCount, limitDuration, len(validTimestamps), limitExceeded)
-	}
-
-	// Обновляем метки пользователя ТОЛЬКО если лимит НЕ превышен
+	// 5. Если лимит НЕ превышен, добавляем текущий таймстамп
 	if !limitExceeded {
 		validTimestamps = append(validTimestamps, now)
-		b.directReplyTimestamps[chatID][userID] = validTimestamps // Теперь запись под Lock() безопасна
-		if b.config.Debug {
-			log.Printf("[Direct Limit Check] Chat %d, User %d: Timestamp added. Total in window now: %d", chatID, userID, len(validTimestamps))
-		}
-	} else {
-		if b.config.Debug {
-			log.Printf("[Direct Limit Check] Chat %d, User %d: Limit exceeded, timestamp NOT added.", chatID, userID)
-		}
-		// Очищаем старые метки, даже если лимит превышен, чтобы не накапливать мусор
-		b.directReplyTimestamps[chatID][userID] = validTimestamps
+		// Обновляем карту новыми валидными таймстампами (включая текущий)
+		userMap[userID] = validTimestamps
 	}
+	// Если лимит превышен, не добавляем новый таймстамп и не обновляем userMap[userID]
 
-	return limitExceeded // Возвращаем true если лимит ПРЕВЫШЕН
+	return limitExceeded
 }
 
 // sendDirectLimitExceededReply отправляет сообщение о превышении лимита прямых обращений.

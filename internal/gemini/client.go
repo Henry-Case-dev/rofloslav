@@ -495,3 +495,100 @@ func (c *Client) EmbedContent(text string) ([]float32, error) {
 
 	return res.Embedding.Values, nil
 }
+
+// GenerateContentWithImage генерирует ответ на основе изображения и текстового промпта
+func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt string, imageData []byte, caption string) (string, error) {
+	model := c.genaiClient.GenerativeModel(c.modelName)
+
+	// Настройки модели
+	model.SetTemperature(1)
+	model.SetTopP(0.95)
+	model.SetMaxOutputTokens(8192)
+
+	// Устанавливаем системный промпт
+	if systemPrompt != "" {
+		model.SystemInstruction = &genai.Content{
+			Parts: []genai.Part{genai.Text(systemPrompt)},
+		}
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Image Запрос: Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
+		}
+	}
+
+	// Определяем MIME тип на основе начальных байтов изображения
+	mimeType := detectMimeType(imageData)
+	if mimeType == "" {
+		mimeType = "image/jpeg" // По умолчанию
+	}
+
+	// Создаем части запроса: текст и изображение
+	var parts []genai.Part
+
+	// Сначала добавляем текст (если есть)
+	if caption != "" {
+		parts = append(parts, genai.Text(caption))
+	}
+
+	// Добавляем изображение
+	parts = append(parts, genai.Blob{
+		MIMEType: mimeType,
+		Data:     imageData,
+	})
+
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Image Запрос: MIME: %s, Caption: %s, Image Size: %d bytes",
+			mimeType, utils.TruncateString(caption, 50), len(imageData))
+	}
+
+	// Отправляем запрос
+	resp, err := model.GenerateContent(ctx, parts...)
+	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Image Ошибка: %v", err)
+		}
+		return "", fmt.Errorf("ошибка генерации анализа изображения: %w", err)
+	}
+
+	// Извлекаем ответ
+	var responseText strings.Builder
+	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
+		for _, part := range resp.Candidates[0].Content.Parts {
+			if textPart, ok := part.(genai.Text); ok {
+				responseText.WriteString(string(textPart))
+			}
+		}
+	} else {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Image Ответ: Получен пустой ответ или нет кандидатов.")
+		}
+		return "", fmt.Errorf("Gemini не вернул валидный ответ для изображения")
+	}
+
+	finalResponse := responseText.String()
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Image Ответ: %s...", utils.TruncateString(finalResponse, 100))
+	}
+
+	return finalResponse, nil
+}
+
+// detectMimeType определяет MIME-тип изображения на основе его заголовка (magic bytes)
+func detectMimeType(data []byte) string {
+	if len(data) < 12 {
+		return ""
+	}
+
+	// Определяем по первым байтам
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "image/jpeg"
+	} else if data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' {
+		return "image/png"
+	} else if data[0] == 'G' && data[1] == 'I' && data[2] == 'F' {
+		return "image/gif"
+	} else if data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+		data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P' {
+		return "image/webp"
+	}
+
+	return ""
+}

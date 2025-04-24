@@ -240,8 +240,18 @@ func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, err
 	return "", fmt.Errorf("транскрибация аудио не поддерживается DeepSeek API")
 }
 
-// EmbedContent (Заглушка для DeepSeek)
-// DeepSeek API не предоставляет стандартного метода для генерации эмбеддингов.
+// EmbedContent реализация для интерфейса, но DeepSeek не поддерживает эмбеддинги
 func (c *Client) EmbedContent(text string) ([]float32, error) {
-	return nil, fmt.Errorf("генерация эмбеддингов не поддерживается DeepSeek API")
+	if c.debug {
+		log.Printf("[DEBUG] DeepSeek не поддерживает эмбеддинги.")
+	}
+	return nil, errors.New("DeepSeek не поддерживает эмбеддинги")
+}
+
+// GenerateContentWithImage реализация для интерфейса, но DeepSeek не поддерживает обработку изображений
+func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt string, imageData []byte, caption string) (string, error) {
+	if c.debug {
+		log.Printf("[DEBUG] DeepSeek не поддерживает обработку изображений.")
+	}
+	return "", errors.New("DeepSeek не поддерживает обработку изображений")
 }

@@ -116,6 +116,8 @@ type ChatSettings struct {
 	DirectReplyLimitDuration *int  `bson:"direct_reply_limit_duration_minutes,omitempty" db:"direct_reply_limit_duration_minutes"` // Длительность периода (в минутах)
 	// --- Настройка анализа срачей ---
 	SrachAnalysisEnabled *bool `bson:"srach_analysis_enabled,omitempty" db:"srach_analysis_enabled"` // Включен ли анализ срачей для чата
+	// --- Настройка анализа фотографий ---
+	PhotoAnalysisEnabled *bool `bson:"photo_analysis_enabled,omitempty" db:"photo_analysis_enabled"` // Включен ли анализ фотографий для чата
 	// Другие настройки чата можно добавить сюда
 }
 

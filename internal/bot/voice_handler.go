@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -119,6 +120,9 @@ func (b *Bot) handleVoiceMessage(message *tgbotapi.Message) error {
 	} else {
 		log.Printf("[DEBUG][VoiceHandler] Chat %d: VoiceFormatPrompt пуст, пропускаем форматирование LLM.", chatID)
 	}
+
+	// !!! ВАЖНО: Заменяем литералы \n на пробелы !!!
+	formattedText = strings.ReplaceAll(formattedText, "\\n", " ")
 
 	// 8. Формируем текст для отправки в чат
 

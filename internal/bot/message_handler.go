@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"log"
 	"strings"
 	"time"
@@ -41,16 +42,27 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		// Поэтому мы НЕ выходим из handleMessage, а просто устанавливаем textMessage = message
 		textMessage = message // Используем оригинальное сообщение для сохранения в БД
 		log.Printf("[DEBUG][MH] Voice message %d processed and sent by handleVoiceMessage. Proceeding to save original message.", message.MessageID)
+	} else if message.Photo != nil && len(message.Photo) > 0 {
+		// === Обработка фотографий ===
+		err := b.handlePhotoMessage(context.Background(), message)
+		if err != nil {
+			log.Printf("[ERROR][MH] Error handling photo message %d in chat %d: %v", message.MessageID, message.Chat.ID, err)
+			// Ошибка уже должна быть отправлена пользователю в handlePhotoMessage
+			return // Прекращаем дальнейшую обработку
+		}
+		// Аналогично голосовым сообщениям, сохраняем оригинальное сообщение
+		textMessage = message
+		log.Printf("[DEBUG][MH] Photo message %d processed and sent by handlePhotoMessage. Proceeding to save original message.", message.MessageID)
 	} else {
-		// Если это не голосовое, используем оригинальное сообщение
+		// Если это не голосовое и не фото, используем оригинальное сообщение
 		textMessage = message
 	}
-	// === Конец обработки голосовых ===
+	// === Конец обработки голосовых и фото ===
 
 	// Теперь используем textMessage для дальнейшей обработки
-	// (В случае голоса это будет оригинальное сообщение для сохранения)
+	// (В случае голоса/фото это будет оригинальное сообщение для сохранения)
 	if textMessage == nil {
-		log.Printf("[ERROR][MH] textMessage is nil after voice handling check for update %d", update.UpdateID)
+		log.Printf("[ERROR][MH] textMessage is nil after voice/photo handling check for update %d", update.UpdateID)
 		return
 	}
 
@@ -198,9 +210,9 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		if b.config.Debug {
 			log.Printf("[DEBUG][MH] Chat %d: IsReplyToBot: %t, MentionsBot: %t. Checking direct reply limit.", chatID, isReplyToBot, mentionsBot)
 		}
-		// Используем новую функцию checkAndRecordDirectReply
+		// Используем функцию checkDirectReplyLimit
 		// Она возвращает true, если лимит ПРЕВЫШЕН
-		if b.checkAndRecordDirectReply(chatID, message.From.ID) {
+		if b.checkDirectReplyLimit(chatID, message.From.ID) {
 			// Лимит превышен
 			if b.config.Debug {
 				log.Printf("[DEBUG][MH] Chat %d: Direct reply limit EXCEEDED.", chatID)

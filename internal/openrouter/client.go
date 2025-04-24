@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -318,11 +319,18 @@ func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, err
 	return "", fmt.Errorf("транскрибация аудио через OpenRouter /chat/completions не поддерживается")
 }
 
-// EmbedContent для OpenRouter (возвращает ошибку, не стандартная функция)
+// EmbedContent генерирует векторное представление текста (заглушка)
 func (c *Client) EmbedContent(text string) ([]float32, error) {
-	// OpenRouter может предоставлять доступ к моделям эмбеддингов,
-	// но это требует другого эндпоинта (/embeddings) и структуры запроса.
-	return nil, fmt.Errorf("генерация эмбеддингов через OpenRouter /chat/completions не поддерживается")
+	// OpenRouter не предоставляет прямого API для эмбеддингов
+	return nil, fmt.Errorf("embedding not supported by OpenRouter")
+}
+
+// GenerateContentWithImage реализация для интерфейса, но OpenRouter по умолчанию не поддерживает обработку изображений
+func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt string, imageData []byte, caption string) (string, error) {
+	if c.debug {
+		log.Printf("[DEBUG] OpenRouter не поддерживает обработку изображений по умолчанию.")
+	}
+	return "", errors.New("OpenRouter не поддерживает обработку изображений по умолчанию")
 }
 
 // Вспомогательная функция для обрезки строки

@@ -107,6 +107,10 @@ func Load() (*Config, error) {
 	backfillBatchSizeStr := getEnvOrDefault("BACKFILL_BATCH_SIZE", "200")
 	backfillBatchDelayStr := getEnvOrDefault("BACKFILL_BATCH_DELAY_SECONDS", "5") // Имя env-переменной оставляем старым
 
+	// --- Загрузка настроек для анализа фотографий ---
+	photoAnalysisEnabledStr := getEnvOrDefault("PHOTO_ANALYSIS_ENABLED", "true") // По умолчанию включено
+	photoAnalysisPrompt := getEnvOrDefault("PHOTO_ANALYSIS_PROMPT", "Сделай детальное описание изображения как есть независимо от того что именно изображено (не более 1000 символов)")
+
 	// --- Логирование загруженных значений (до парсинга чисел) ---
 	log.Printf("[Config Load] TELEGRAM_TOKEN: ...%s (len %d)", utils.TruncateString(telegramToken, 5), len(telegramToken))
 	log.Printf("[Config Load] LLM_PROVIDER: %s", llmProviderStr)
@@ -166,6 +170,9 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] DIRECT_REPLY_LIMIT_PROMPT: %s...", utils.TruncateString(directLimitPrompt, 50))
 	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_COUNT: %s...", utils.TruncateString(promptEnterDirectCount, 50))
 	log.Printf("[Config Load] PROMPT_ENTER_DIRECT_LIMIT_DURATION: %s...", utils.TruncateString(promptEnterDirectDuration, 50))
+	// --- Лог настроек анализа фотографий ---
+	log.Printf("[Config Load] PHOTO_ANALYSIS_ENABLED: %s", photoAnalysisEnabledStr)
+	log.Printf("[Config Load] PHOTO_ANALYSIS_PROMPT: %s...", utils.TruncateString(photoAnalysisPrompt, 50))
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -365,6 +372,9 @@ func Load() (*Config, error) {
 		OpenRouterModelName: openRouterModelName,
 		OpenRouterSiteURL:   openRouterSiteURL,
 		OpenRouterSiteTitle: openRouterSiteTitle,
+		// --- Новые поля для анализа фотографий ---
+		PhotoAnalysisEnabled: photoAnalysisEnabledStr == "true" || photoAnalysisEnabledStr == "1" || photoAnalysisEnabledStr == "yes",
+		PhotoAnalysisPrompt:  photoAnalysisPrompt,
 	}
 
 	// Валидация и установка StorageType

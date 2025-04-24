@@ -112,4 +112,7 @@ type Config struct {
 	// --- Настройки бэкфилла эмбеддингов ---
 	BackfillBatchSize  int           // Размер пакета для бэкфилла
 	BackfillBatchDelay time.Duration // Задержка между пакетами бэкфилла
+	// --- Настройки для обработки фотографий ---
+	PhotoAnalysisEnabled bool   // Включить/выключить анализ фотографий с помощью Gemini
+	PhotoAnalysisPrompt  string // Промпт для анализа изображений через Gemini
 }

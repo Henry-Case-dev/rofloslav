@@ -1,6 +1,8 @@
 package llm
 
 import (
+	"context"
+
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -26,6 +28,10 @@ type LLMClient interface {
 
 	// EmbedContent генерирует векторное представление (эмбеддинг) для заданного текста.
 	EmbedContent(text string) ([]float32, error)
+
+	// GenerateContentWithImage генерирует ответ на основе изображения и текстового промпта.
+	// Возвращает текстовое описание изображения и ошибку.
+	GenerateContentWithImage(ctx context.Context, systemPrompt string, imageData []byte, caption string) (string, error)
 
 	// Close освобождает ресурсы, связанные с клиентом (если необходимо).
 	Close() error

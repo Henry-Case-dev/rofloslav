@@ -277,9 +277,10 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 	return formattedHistory.String()
 }
 
-// formatDirectReplyContext формирует структурированный контекст для прямого ответа,
-// объединяя ветку ответов, общий контекст и релевантные сообщения (RAG).
+// formatDirectReplyContext форматирует контекст для прямого ответа боту.
+// Включает: сообщение пользователя, цепочку ответов, недавние сообщения и релевантные сообщения из долгосрочной памяти.
 func formatDirectReplyContext(chatID int64,
+	triggeringMessage *tgbotapi.Message, // Сообщение, вызвавшее ответ
 	replyChain []*tgbotapi.Message,
 	commonContext []*tgbotapi.Message,
 	relevantMessages []*tgbotapi.Message,
@@ -287,45 +288,71 @@ func formatDirectReplyContext(chatID int64,
 	cfg *config.Config,
 	timeZone string) string {
 
-	var builder strings.Builder
+	var contextBuilder strings.Builder
 	seenMessageIDs := make(map[int]bool) // Для отслеживания дубликатов
 
-	// --- 1. Ветка ответов (Приоритет) ---
-	builder.WriteString("=== НЕПОСРЕДСТВЕННЫЙ ДИАЛОГ (Ветка ответов) ===\n")
-	if len(replyChain) > 0 {
-		formattedChain := formatMessagesWithProfilesInternal(chatID, replyChain, store, cfg, timeZone, seenMessageIDs)
-		builder.WriteString(formattedChain)
-	} else {
-		builder.WriteString("(Нет сообщений в прямой ветке ответа)\n")
-	}
-	builder.WriteString("\n") // Отступ между секциями
-
-	// --- 2. Общий контекст чата (Недавние сообщения) ---
-	builder.WriteString("=== ОБЩИЙ КОНТЕКСТ ЧАТА (Недавние сообщения) ===\n")
-	if len(commonContext) > 0 {
-		formattedCommon := formatMessagesWithProfilesInternal(chatID, commonContext, store, cfg, timeZone, seenMessageIDs)
-		if formattedCommon != "" { // Если остались сообщения после удаления дубликатов
-			builder.WriteString(formattedCommon)
-		} else {
-			builder.WriteString("(Все недавние сообщения уже присутствуют в ветке диалога)\n")
+	// 1. Форматируем сообщение, на которое нужно ответить (triggeringMessage)
+	triggerFormatted := ""
+	if triggeringMessage != nil {
+		// Используем копию seenMessageIDs, чтобы форматирование триггера
+		// не повлияло на обработку дубликатов в остальном контексте,
+		// если триггерное сообщение уже есть в истории (маловероятно, но возможно)
+		triggerSeenIDs := make(map[int]bool)
+		for k, v := range seenMessageIDs {
+			triggerSeenIDs[k] = v
 		}
-	} else {
-		builder.WriteString("(Нет недавних сообщений в общем контексте)\n")
+		triggerFormatted = formatMessagesWithProfilesInternal(chatID, []*tgbotapi.Message{triggeringMessage}, store, cfg, timeZone, triggerSeenIDs)
 	}
-	builder.WriteString("\n")
 
-	// --- 3. Релевантные сообщения из прошлого (Долгосрочная память/RAG) ---
-	if cfg.LongTermMemoryEnabled && len(relevantMessages) > 0 { // Показываем секцию только если RAG включен и что-то найдено
-		builder.WriteString("=== РЕЛЕВАНТНЫЕ СООБЩЕНИЯ ИЗ ПРОШЛОГО (Долгосрочная память) ===\n")
-		formattedRelevant := formatMessagesWithProfilesInternal(chatID, relevantMessages, store, cfg, timeZone, seenMessageIDs)
-		if formattedRelevant != "" { // Если остались сообщения после удаления дубликатов
-			builder.WriteString(formattedRelevant)
-		} else {
-			builder.WriteString("(Все найденные релевантные сообщения уже присутствуют в ветке диалога или общем контексте)\n")
+	// 2. Форматируем остальной контекст (цепочка, недавние, релевантные)
+	// Используем ОСНОВНОЙ seenMessageIDs, чтобы избежать дублирования между секциями
+	replyChainFormatted := formatMessagesWithProfilesInternal(chatID, replyChain, store, cfg, timeZone, seenMessageIDs)
+	commonContextFormatted := formatMessagesWithProfilesInternal(chatID, commonContext, store, cfg, timeZone, seenMessageIDs)
+	relevantMessagesFormatted := formatMessagesWithProfilesInternal(chatID, relevantMessages, store, cfg, timeZone, seenMessageIDs)
+
+	// 3. Собираем финальный контекст с маркерами
+	if triggerFormatted != "" {
+		contextBuilder.WriteString("=== ПОЛЬЗОВАТЕЛЬ ОБРАЩАЕТСЯ К ТЕБЕ С ЭТИМ СООБЩЕНИЕМ: ===\n")
+		contextBuilder.WriteString(triggerFormatted) // triggerFormatted уже содержит \n в конце
+		contextBuilder.WriteString("\n=== ПРЕДЫДУЩИЙ КОНТЕКСТ ДИАЛОГА: ===\n")
+	} else {
+		// Если триггерного сообщения нет (например, при обычном ответе AI), начинаем сразу с контекста
+		contextBuilder.WriteString("=== КОНТЕКСТ ДИАЛОГА: ===\n")
+	}
+
+	// Добавляем цепочку ответов
+	contextBuilder.WriteString(replyChainFormatted)
+
+	// Добавляем разделитель, если были сообщения в недавнем контексте и есть релевантные или триггерное
+	if len(commonContext) > 0 && (len(relevantMessages) > 0 || triggeringMessage != nil) {
+		// Проверяем, что последний символ не разделитель, чтобы не дублировать
+		if !strings.HasSuffix(contextBuilder.String(), "---\n") {
+			contextBuilder.WriteString("---\n")
 		}
 	}
 
-	return builder.String()
+	// Добавляем недавний контекст
+	contextBuilder.WriteString(commonContextFormatted)
+
+	// Добавляем разделитель, если были сообщения в недавнем контексте и есть релевантные или триггерное
+	if len(commonContext) > 0 && (len(relevantMessages) > 0 || triggeringMessage != nil) {
+		// Проверяем, что последний символ не разделитель, чтобы не дублировать
+		if !strings.HasSuffix(contextBuilder.String(), "---\n") {
+			contextBuilder.WriteString("---\n")
+		}
+	}
+
+	// Добавляем релевантные сообщения
+	contextBuilder.WriteString(relevantMessagesFormatted)
+
+	// Добавляем разделитель перед триггерным сообщением, если оно есть и что-то было до него
+	if triggeringMessage != nil && contextBuilder.Len() > 0 {
+		if !strings.HasSuffix(contextBuilder.String(), "---\n") {
+			contextBuilder.WriteString("---\n")
+		}
+	}
+
+	return contextBuilder.String()
 }
 
 // Вспомогательная функция для форматирования сообщений с учетом профилей и дубликатов
@@ -408,12 +435,21 @@ func formatMessagesWithProfilesInternal(chatID int64, messages []*tgbotapi.Messa
 			replyIndicator = fmt.Sprintf(" (в ответ на #%d)", msg.ReplyToMessage.MessageID)
 		}
 
-		builder.WriteString(fmt.Sprintf("%s (%s)%s%s:%s %s\n",
+		// Формируем строку с ID пользователя
+		userIDStr := ""
+		if msg.From != nil {
+			userIDStr = fmt.Sprintf(" (ID:%d)", msg.From.ID) // Добавлен пробел
+		} else if msg.SenderChat != nil {
+			userIDStr = fmt.Sprintf(" (ID:%d)", msg.SenderChat.ID) // Для каналов используем ID чата, добавлен пробел
+		}
+
+		builder.WriteString(fmt.Sprintf("%s (%s%s)%s%s:%s %s\n",
 			formattedTime,
 			authorAlias,
-			profileInfo,    // Добавлено инфо о Bio
-			replyIndicator, // Добавлено инфо об ответе
-			voiceIndicator, // Добавлен индикатор голоса
+			userIDStr,      // UserID добавлен сюда
+			profileInfo,    // Инфо о Bio
+			replyIndicator, // Инфо об ответе
+			voiceIndicator, // Индикатор голоса
 			msgText,
 		))
 
