@@ -83,5 +83,17 @@ func logLoadedConfig(cfg *Config) {
 	}
 	log.Printf("  BackfillBatchSize: %d", cfg.BackfillBatchSize)
 	log.Printf("  BackfillBatchDelay: %v", cfg.BackfillBatchDelay)
+	log.Printf("  PhotoAnalysisEnabled: %t", cfg.PhotoAnalysisEnabled)
+	log.Printf("  PhotoAnalysisPrompt: %s...", utils.TruncateString(cfg.PhotoAnalysisPrompt, 100))
+
+	// --- Логгирование настроек автоочистки MongoDB ---
+	log.Printf("  MongoCleanupEnabled: %t", cfg.MongoCleanupEnabled)
+	if cfg.MongoCleanupEnabled {
+		log.Printf("    MongoCleanupSizeLimitMB: %d", cfg.MongoCleanupSizeLimitMB)
+		log.Printf("    MongoCleanupIntervalMinutes: %d", cfg.MongoCleanupIntervalMinutes)
+		log.Printf("    MongoCleanupChunkDurationHours: %d", cfg.MongoCleanupChunkDurationHours)
+	}
+	// --- Конец логгирования ---
+
 	log.Println("--- Конфигурация завершена ---")
 }

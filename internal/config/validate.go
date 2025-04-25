@@ -129,15 +129,28 @@ func ValidateConfig(cfg *Config) error {
 	}
 
 	// Проверка ключа Gemini, если включена долгосрочная память или транскрипция
-	if cfg.LongTermMemoryEnabled || cfg.VoiceTranscriptionEnabledDefault {
+	if cfg.LongTermMemoryEnabled || cfg.VoiceTranscriptionEnabledDefault || cfg.PhotoAnalysisEnabled {
 		if cfg.GeminiAPIKey == "" {
-			return fmt.Errorf("GEMINI_API_KEY должен быть установлен, так как включена долгосрочная память или транскрипция голоса по умолчанию")
-		}
-		if cfg.GeminiEmbeddingModelName == "" {
-			log.Println("Предупреждение: GEMINI_EMBEDDING_MODEL_NAME не установлен, используется модель по умолчанию 'embedding-001' для эмбеддингов.")
-			cfg.GeminiEmbeddingModelName = "embedding-001" // Установим дефолтное значение, если не задано
+			return fmt.Errorf("GEMINI_API_KEY должен быть установлен, так как включена долгосрочная память, транскрипция голоса или анализ фото")
 		}
 	}
+
+	// --- Валидация настроек автоочистки MongoDB ---
+	if cfg.MongoCleanupEnabled {
+		if cfg.StorageType != StorageTypeMongo {
+			return fmt.Errorf("MONGO_CLEANUP_ENABLED=true, но STORAGE_TYPE не 'mongo'")
+		}
+		if cfg.MongoCleanupSizeLimitMB <= 0 {
+			return fmt.Errorf("MONGO_CLEANUP_SIZE_LIMIT_MB (%d) должен быть > 0", cfg.MongoCleanupSizeLimitMB)
+		}
+		if cfg.MongoCleanupIntervalMinutes <= 0 {
+			return fmt.Errorf("MONGO_CLEANUP_INTERVAL_MINUTES (%d) должен быть > 0", cfg.MongoCleanupIntervalMinutes)
+		}
+		if cfg.MongoCleanupChunkDurationHours <= 0 {
+			return fmt.Errorf("MONGO_CLEANUP_CHUNK_DURATION_HOURS (%d) должен быть > 0", cfg.MongoCleanupChunkDurationHours)
+		}
+	}
+	// --- Конец валидации ---
 
 	return nil
 }

@@ -299,6 +299,34 @@ func Load() (*Config, error) {
 	}
 	backfillBatchDelay := time.Duration(backfillBatchDelayInt) * time.Second
 
+	// --- Загрузка настроек автоочистки MongoDB ---
+	mongoCleanupEnabledStr := getEnvOrDefault("MONGO_CLEANUP_ENABLED", "false")
+	mongoCleanupEnabled, err := strconv.ParseBool(mongoCleanupEnabledStr)
+	if err != nil {
+		log.Printf("Предупреждение: Неверное значение для MONGO_CLEANUP_ENABLED ('%s'), используется false: %v", mongoCleanupEnabledStr, err)
+		mongoCleanupEnabled = false
+	}
+
+	mongoCleanupSizeLimitMBStr := getEnvOrDefault("MONGO_CLEANUP_SIZE_LIMIT_MB", "500")
+	mongoCleanupSizeLimitMB, err := strconv.Atoi(mongoCleanupSizeLimitMBStr)
+	if err != nil || mongoCleanupSizeLimitMB <= 0 {
+		log.Printf("Предупреждение: Неверное значение для MONGO_CLEANUP_SIZE_LIMIT_MB ('%s'), используется 500: %v", mongoCleanupSizeLimitMBStr, err)
+	}
+
+	mongoCleanupIntervalMinutesStr := getEnvOrDefault("MONGO_CLEANUP_INTERVAL_MINUTES", "60")
+	mongoCleanupIntervalMinutes, err := strconv.Atoi(mongoCleanupIntervalMinutesStr)
+	if err != nil || mongoCleanupIntervalMinutes <= 0 {
+		log.Printf("Предупреждение: Неверное значение для MONGO_CLEANUP_INTERVAL_MINUTES ('%s'), используется 60: %v", mongoCleanupIntervalMinutesStr, err)
+	}
+
+	mongoCleanupChunkDurationHoursStr := getEnvOrDefault("MONGO_CLEANUP_CHUNK_DURATION_HOURS", "24")
+	mongoCleanupChunkDurationHours, err := strconv.Atoi(mongoCleanupChunkDurationHoursStr)
+	if err != nil || mongoCleanupChunkDurationHours <= 0 {
+		log.Printf("Предупреждение: Неверное значение для MONGO_CLEANUP_CHUNK_DURATION_HOURS ('%s'), используется 24: %v", mongoCleanupChunkDurationHoursStr, err)
+	}
+
+	// --- Конец загрузки настроек автоочистки MongoDB ---
+
 	cfg := Config{
 		TelegramToken: telegramToken,
 		LLMProvider:   llmProvider,
@@ -375,6 +403,25 @@ func Load() (*Config, error) {
 		// --- Новые поля для анализа фотографий ---
 		PhotoAnalysisEnabled: photoAnalysisEnabledStr == "true" || photoAnalysisEnabledStr == "1" || photoAnalysisEnabledStr == "yes",
 		PhotoAnalysisPrompt:  photoAnalysisPrompt,
+		// --- Инициализация полей автоочистки MongoDB значениями из парсинга (могут быть 0) ---
+		MongoCleanupEnabled:            mongoCleanupEnabled,
+		MongoCleanupSizeLimitMB:        mongoCleanupSizeLimitMB,        // Может быть 0 или отрицательным, если парсинг не удался
+		MongoCleanupIntervalMinutes:    mongoCleanupIntervalMinutes,    // Может быть 0 или отрицательным, если парсинг не удался
+		MongoCleanupChunkDurationHours: mongoCleanupChunkDurationHours, // Может быть 0 или отрицательным, если парсинг не удался
+	}
+
+	// --- Установка значений по умолчанию для MongoDB cleanup, если они не были установлены или невалидны ---
+	if cfg.MongoCleanupSizeLimitMB <= 0 {
+		cfg.MongoCleanupSizeLimitMB = 500 // Дефолтное значение
+		log.Println("[Config Load] MONGO_CLEANUP_SIZE_LIMIT_MB не установлен или невалиден, используется значение по умолчанию: 500")
+	}
+	if cfg.MongoCleanupIntervalMinutes <= 0 {
+		cfg.MongoCleanupIntervalMinutes = 60 // Дефолтное значение
+		log.Println("[Config Load] MONGO_CLEANUP_INTERVAL_MINUTES не установлен или невалиден, используется значение по умолчанию: 60")
+	}
+	if cfg.MongoCleanupChunkDurationHours <= 0 {
+		cfg.MongoCleanupChunkDurationHours = 24 // Дефолтное значение
+		log.Println("[Config Load] MONGO_CLEANUP_CHUNK_DURATION_HOURS не установлен или невалиден, используется значение по умолчанию: 24")
 	}
 
 	// Валидация и установка StorageType

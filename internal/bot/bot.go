@@ -192,7 +192,77 @@ func (b *Bot) Start() error {
 
 	// Запуск планировщиков
 	go b.scheduleDailyTake(b.config.DailyTakeTime, b.config.TimeZone)
-	go b.scheduleAutoSummary()
+	if b.config.SummaryIntervalHours > 0 {
+		go b.scheduleAutoSummary() // Используем настройки из config
+	} else {
+		log.Println("Автоматическое саммари отключено (SUMMARY_INTERVAL_HOURS <= 0).")
+	}
+
+	// Запуск автоочистки MongoDB (ПЕРЕД циклом)
+	if b.config.StorageType == config.StorageTypeMongo && b.config.MongoCleanupEnabled {
+		log.Println("Запуск фоновой задачи автоочистки MongoDB...")
+		go func() {
+			// Используем начальную задержку, чтобы не стартовать сразу при запуске бота
+			initialDelay := time.Duration(1) * time.Minute
+			select {
+			case <-time.After(initialDelay):
+				log.Println("[Cleanup] Начало периодической проверки коллекций MongoDB.")
+			case <-b.stop:
+				log.Println("[Cleanup] Остановка до начала первой проверки.")
+				return
+			}
+
+			ticker := time.NewTicker(time.Duration(b.config.MongoCleanupIntervalMinutes) * time.Minute)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					if b.config.Debug {
+						log.Println("[Cleanup DEBUG] Начало цикла проверки автоочистки.")
+					}
+					chatIDs, err := b.storage.GetAllChatIDs()
+					if err != nil {
+						log.Printf("[Cleanup ERROR] Ошибка получения ID чатов: %v", err)
+						continue
+					}
+					if b.config.Debug {
+						log.Printf("[Cleanup DEBUG] Получено ID чатов для проверки: %v (Количество: %d)", chatIDs, len(chatIDs))
+					}
+					mongoStore, ok := b.storage.(*storage.MongoStorage)
+					if !ok {
+						// Эта проверка избыточна, т.к. мы уже проверили StorageType, но оставим для надежности
+						log.Printf("[Cleanup ERROR] Хранилище не является MongoStorage, очистка невозможна.")
+						return // Выходим из горутины, если тип не тот
+					}
+
+					for _, chatID := range chatIDs {
+						// Запускаем очистку для каждого чата в отдельной горутине,
+						// чтобы долгая очистка одного чата не блокировала проверку других.
+						go func(cID int64) {
+							if b.config.Debug {
+								log.Printf("[Cleanup DEBUG] Запуск CleanupOldMessagesForChat для chatID: %d", cID)
+							}
+							if err := mongoStore.CleanupOldMessagesForChat(cID, b.config); err != nil {
+								log.Printf("[Cleanup ERROR] Чат %d: Ошибка во время очистки: %v", cID, err)
+							} else if b.config.Debug {
+								log.Printf("[Cleanup DEBUG] Завершена проверка/очистка для chatID: %d", cID)
+							}
+						}(chatID)
+						// Небольшая пауза между запусками горутин очистки, чтобы не создавать пиковую нагрузку
+						time.Sleep(100 * time.Millisecond)
+					}
+
+				case <-b.stop:
+					log.Println("[Cleanup] Остановка планировщика автоочистки.")
+					return // Выход из горутины автоочистки
+				}
+			}
+		}()
+	} else {
+		log.Println("Автоочистка MongoDB отключена.")
+	}
+	// --- Конец запуска автоочистки ---
 
 	// Настройка получения обновлений
 	u := tgbotapi.NewUpdate(0)

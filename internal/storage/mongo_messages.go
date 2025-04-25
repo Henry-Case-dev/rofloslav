@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	// Нужен для debug
@@ -58,14 +60,17 @@ func (ms *MongoStorage) AddMessage(chatID int64, message *tgbotapi.Message) {
 	}
 	// --- Конец генерации эмбеддинга ---
 
-	// Используем UpdateOne с Upsert=true и фильтром по chat_id и message_id
+	// Получаем *правильную* коллекцию для этого чата
+	coll := ms.getMessagesCollection(chatID)
+
+	// Используем coll вместо ms.messagesCollection
 	filter := bson.M{"chat_id": chatID, "message_id": message.MessageID}
 	update := bson.M{"$set": mongoMsg} // Перезаписываем весь документ, если он существует
 	ops := options.Update().SetUpsert(true)
 
-	result, err := ms.messagesCollection.UpdateOne(ctx, filter, update, ops)
+	result, err := coll.UpdateOne(ctx, filter, update, ops)
 	if err != nil {
-		log.Printf("[Mongo AddMessage ERROR] Чат %d: Ошибка сохранения сообщения ID %d в MongoDB: %v", chatID, message.MessageID, err)
+		log.Printf("[Mongo AddMessage ERROR] Чат %d: Ошибка сохранения сообщения ID %d в коллекцию '%s': %v", chatID, message.MessageID, coll.Name(), err)
 		return
 	}
 
@@ -131,13 +136,17 @@ func (ms *MongoStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Messag
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// Получаем *правильную* коллекцию для этого чата
+	coll := ms.getMessagesCollection(chatID)
+
 	filter := bson.M{"chat_id": chatID}
 	// Сортируем по дате в обратном порядке и берем limit
 	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: -1}}).SetLimit(int64(limit))
 
-	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
+	// Используем coll вместо ms.messagesCollection
+	cursor, err := coll.Find(ctx, filter, findOptions)
 	if err != nil {
-		log.Printf("[GetMessages ERROR] Чат %d: Ошибка получения сообщений из MongoDB: %v", chatID, err)
+		log.Printf("[GetMessages ERROR] Чат %d: Ошибка получения сообщений из MongoDB (коллекция '%s'): %v", chatID, coll.Name(), err)
 		return nil, fmt.Errorf("ошибка получения сообщений: %w", err)
 	}
 	defer cursor.Close(ctx)
@@ -169,9 +178,8 @@ func (ms *MongoStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Messag
 // GetMessagesSince извлекает сообщения из MongoDB, начиная с указанного времени.
 // Добавляем context.Context как первый параметр
 func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
-	// Убираем создание контекста с таймаутом, используем переданный ctx
-	// ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	// defer cancel()
+	// Получаем *правильную* коллекцию для этого чата
+	coll := ms.getMessagesCollection(chatID)
 
 	filter := bson.M{
 		"chat_id": chatID,
@@ -180,10 +188,10 @@ func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, sinc
 	// Сортируем по дате в прямом порядке
 	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: 1}})
 
-	// Используем переданный ctx
-	cursor, err := ms.messagesCollection.Find(ctx, filter, findOptions)
+	// Используем coll вместо ms.messagesCollection
+	cursor, err := coll.Find(ctx, filter, findOptions)
 	if err != nil {
-		log.Printf("[GetMessagesSince ERROR] Чат %d: Ошибка получения сообщений (since %v) из MongoDB: %v", chatID, since, err)
+		log.Printf("[GetMessagesSince ERROR] Чат %d: Ошибка получения сообщений (since %v) из MongoDB (коллекция '%s'): %v", chatID, since, coll.Name(), err)
 		return nil, fmt.Errorf("ошибка получения сообщений: %w", err)
 	}
 	defer cursor.Close(ctx)
@@ -228,17 +236,23 @@ func (ms *MongoStorage) SaveChatHistory(chatID int64) error {
 // ClearChatHistory удаляет все сообщения для указанного чата из MongoDB.
 // ОСТОРОЖНО: Эта операция необратима!
 func (ms *MongoStorage) ClearChatHistory(chatID int64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Больше времени для удаления
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	filter := bson.M{"chat_id": chatID}
-	result, err := ms.messagesCollection.DeleteMany(ctx, filter)
+	// Получаем *правильную* коллекцию для этого чата
+	coll := ms.getMessagesCollection(chatID)
+
+	// Удаляем все документы из коллекции для данного chatID
+	// ВАЖНО: Теперь просто удаляем все из коллекции coll, т.к. она уже специфична для чата
+	_, err := coll.DeleteMany(ctx, bson.M{})
 	if err != nil {
-		log.Printf("[ClearChatHistory ERROR] Чат %d: Ошибка удаления сообщений из MongoDB: %v", chatID, err)
-		return fmt.Errorf("ошибка удаления истории чата: %w", err)
+		log.Printf("[ClearChatHistory ERROR] Чат %d: Ошибка очистки истории в MongoDB (коллекция '%s'): %v", chatID, coll.Name(), err)
+		return fmt.Errorf("ошибка очистки истории: %w", err)
 	}
 
-	log.Printf("[ClearChatHistory INFO] Чат %d: Успешно удалено %d сообщений из MongoDB.", chatID, result.DeletedCount)
+	if ms.debug {
+		log.Printf("[ClearChatHistory DEBUG] Чат %d: История в MongoDB (коллекция '%s') успешно очищена.", chatID, coll.Name())
+	}
 	return nil
 }
 
@@ -252,35 +266,59 @@ func (ms *MongoStorage) AddMessagesToContext(chatID int64, messages []*tgbotapi.
 	// Можно добавить логирование для отладки, если нужно.
 }
 
-// GetAllChatIDs возвращает список всех уникальных chat_id из коллекции сообщений MongoDB.
+// GetAllChatIDs возвращает список всех уникальных chatID, для которых существуют коллекции сообщений.
+// Для MongoDB это реализовано через перечисление коллекций с префиксом.
 func (ms *MongoStorage) GetAllChatIDs() ([]int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Используем Distinct для получения уникальных chat_id
-	results, err := ms.messagesCollection.Distinct(ctx, "chat_id", bson.M{})
-	if err != nil {
-		log.Printf("[GetAllChatIDs ERROR] Ошибка получения уникальных chat_id из MongoDB: %v", err)
-		return nil, fmt.Errorf("ошибка получения списка чатов: %w", err)
-	}
+	collectionPrefix := "chat_messages_"
+	filter := bson.M{"name": bson.M{"$regex": "^" + collectionPrefix}}
 
-	chatIDs := make([]int64, 0, len(results))
-	for _, res := range results {
-		if chatID, ok := res.(int64); ok {
-			chatIDs = append(chatIDs, chatID)
-		} else {
-			// Попытка преобразовать из int32 (MongoDB может хранить int как 32 или 64)
-			if chatID32, ok32 := res.(int32); ok32 {
-				chatIDs = append(chatIDs, int64(chatID32))
-			} else {
-				log.Printf("[GetAllChatIDs WARN] Не удалось преобразовать chat_id '%v' (%T) в int64.", res, res)
+	cursor, err := ms.database.ListCollections(ctx, filter)
+	if err != nil {
+		log.Printf("[GetAllChatIDs ERROR] Ошибка получения списка коллекций: %v", err)
+		return nil, fmt.Errorf("ошибка получения списка коллекций: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var chatIDs []int64
+	seenIDs := make(map[int64]bool) // Для дедупликации на всякий случай
+
+	for cursor.Next(ctx) {
+		var result struct {
+			Name string `bson:"name"`
+		}
+		if err := cursor.Decode(&result); err != nil {
+			log.Printf("[GetAllChatIDs WARN] Ошибка декодирования имени коллекции: %v", err)
+			continue // Пропускаем эту коллекцию
+		}
+
+		if strings.HasPrefix(result.Name, collectionPrefix) {
+			chatIDStr := strings.TrimPrefix(result.Name, collectionPrefix)
+			chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+			if err != nil {
+				log.Printf("[GetAllChatIDs WARN] Не удалось распарсить chatID из имени коллекции '%s': %v", result.Name, err)
+				continue // Пропускаем
+			}
+
+			if !seenIDs[chatID] {
+				chatIDs = append(chatIDs, chatID)
+				seenIDs[chatID] = true
 			}
 		}
 	}
 
-	if ms.debug {
-		log.Printf("[GetAllChatIDs DEBUG] Успешно получено %d уникальных chat_id из MongoDB.", len(chatIDs))
+	if err := cursor.Err(); err != nil {
+		log.Printf("[GetAllChatIDs ERROR] Ошибка итерации по курсору коллекций: %v", err)
+		// Возвращаем то, что успели собрать, и ошибку
+		return chatIDs, fmt.Errorf("ошибка итерации по курсору коллекций: %w", err)
 	}
+
+	if ms.debug {
+		log.Printf("[GetAllChatIDs DEBUG] Успешно получено %d уникальных chat_id из имен коллекций MongoDB.", len(chatIDs))
+	}
+
 	return chatIDs, nil
 }
 
@@ -347,6 +385,9 @@ func convertMongoToAPIMessage(mongoMsg *MongoMessage) *tgbotapi.Message {
 // двигаясь вверх по цепочке до maxDepth или до сообщения без ReplyToMessageID.
 // Возвращает сообщения в хронологическом порядке (старые -> новые).
 func (ms *MongoStorage) GetReplyChain(ctx context.Context, chatID int64, startMessageID int, maxDepth int) ([]*tgbotapi.Message, error) {
+	// Получаем *правильную* коллекцию для этого чата
+	coll := ms.getMessagesCollection(chatID)
+
 	replyChainMongo := make([]*MongoMessage, 0)
 	currentMessageID := startMessageID
 	currentDepth := 0
@@ -357,7 +398,7 @@ func (ms *MongoStorage) GetReplyChain(ctx context.Context, chatID int64, startMe
 
 		var msg MongoMessage
 		filter := bson.M{"chat_id": chatID, "message_id": currentMessageID}
-		err := ms.messagesCollection.FindOne(findCtx, filter).Decode(&msg)
+		err := coll.FindOne(findCtx, filter).Decode(&msg)
 
 		cancel() // Освобождаем ресурсы контекста запроса
 

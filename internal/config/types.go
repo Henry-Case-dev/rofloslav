@@ -115,4 +115,9 @@ type Config struct {
 	// --- Настройки для обработки фотографий ---
 	PhotoAnalysisEnabled bool   // Включить/выключить анализ фотографий с помощью Gemini
 	PhotoAnalysisPrompt  string // Промпт для анализа изображений через Gemini
+	// --- Настройки автоочистки MongoDB ---
+	MongoCleanupEnabled            bool // Включить/выключить автоочистку MongoDB
+	MongoCleanupSizeLimitMB        int  // Максимальный размер коллекции в МБ перед очисткой
+	MongoCleanupIntervalMinutes    int  // Интервал проверки коллекций в минутах
+	MongoCleanupChunkDurationHours int  // Длительность удаляемого "куска" старых сообщений в часах
 }
