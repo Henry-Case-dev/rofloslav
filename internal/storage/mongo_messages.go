@@ -180,9 +180,10 @@ func (ms *MongoStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Messag
 	return apiMessages, nil
 }
 
-// GetMessagesSince извлекает сообщения из MongoDB, начиная с указанного времени.
-// Добавляем context.Context как первый параметр
-func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
+// GetMessagesSince извлекает сообщения из MongoDB, начиная с указанного времени,
+// для конкретного пользователя и с ограничением по количеству.
+// Возвращает сообщения в хронологическом порядке (старые -> новые).
+func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, userID int64, since time.Time, limit int) ([]*tgbotapi.Message, error) {
 	// Получаем *правильную* коллекцию для этого чата
 	coll := ms.getMessagesCollection(chatID)
 
@@ -190,25 +191,35 @@ func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, sinc
 		"chat_id": chatID,
 		"date":    bson.M{"$gte": since},
 	}
-	// Сортируем по дате в прямом порядке
-	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: 1}})
+
+	// Добавляем фильтр по userID только если он не равен 0
+	if userID != 0 {
+		filter["user_id"] = userID
+	}
+
+	// Сортируем по дате в ОБРАТНОМ порядке (новые сначала), чтобы применить лимит к последним сообщениям
+	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: -1}})
+
+	// Применяем лимит, если он > 0
+	if limit > 0 {
+		findOptions.SetLimit(int64(limit))
+	}
 
 	// --- Добавляем проекцию для исключения message_vector ---
 	projection := bson.D{{"message_vector", 0}}
 	findOptions.SetProjection(projection)
 	// --- Конец добавления проекции ---
 
-	// Используем coll вместо ms.messagesCollection
 	cursor, err := coll.Find(ctx, filter, findOptions)
 	if err != nil {
-		log.Printf("[GetMessagesSince ERROR] Чат %d: Ошибка получения сообщений (since %v) из MongoDB (коллекция '%s'): %v", chatID, since, coll.Name(), err)
-		return nil, fmt.Errorf("ошибка получения сообщений: %w", err)
+		log.Printf("[GetMessagesSince ERROR] Чат %d, User %d: Ошибка получения сообщений (since %v, limit %d) из MongoDB: %v", chatID, userID, since, limit, err)
+		return nil, fmt.Errorf("ошибка получения сообщений пользователя: %w", err)
 	}
 	defer cursor.Close(ctx)
 
 	var mongoMessages []*MongoMessage
 	if err = cursor.All(ctx, &mongoMessages); err != nil {
-		log.Printf("[GetMessagesSince ERROR] Чат %d: Ошибка декодирования сообщений (since %v) из MongoDB: %v", chatID, since, err)
+		log.Printf("[GetMessagesSince ERROR] Чат %d, User %d: Ошибка декодирования сообщений (since %v, limit %d) из MongoDB: %v", chatID, userID, since, limit, err)
 		return nil, fmt.Errorf("ошибка декодирования сообщений: %w", err)
 	}
 
@@ -218,10 +229,14 @@ func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, sinc
 		apiMessages = append(apiMessages, convertMongoToAPIMessage(mongoMsg))
 	}
 
-	// Сортировка уже правильная (по возрастанию даты)
+	// Так как мы получали в обратном порядке (новые сначала),
+	// нужно развернуть слайс для возврата в хронологическом порядке (старые -> новые).
+	sort.SliceStable(apiMessages, func(i, j int) bool {
+		return apiMessages[i].Date < apiMessages[j].Date
+	})
 
 	if ms.debug {
-		log.Printf("[GetMessagesSince DEBUG] Чат %d: Успешно получено %d сообщений (since %v) из MongoDB.", chatID, len(apiMessages), since)
+		log.Printf("[GetMessagesSince DEBUG] Чат %d, User %d: Успешно получено %d сообщений (since %v, limit %d) из MongoDB.", chatID, userID, len(apiMessages), since, limit)
 	}
 	return apiMessages, nil
 }

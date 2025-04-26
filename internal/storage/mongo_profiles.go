@@ -61,13 +61,15 @@ func (ms *MongoStorage) SetUserProfile(profile *UserProfile) error {
 	// $setOnInsert установит время создания только при первой вставке.
 	update := bson.M{
 		"$set": bson.M{
-			"username":   profile.Username,
-			"alias":      profile.Alias,
-			"gender":     profile.Gender,
-			"real_name":  profile.RealName,
-			"bio":        profile.Bio,
-			"last_seen":  profile.LastSeen, // Используем LastSeen из профиля (например, время последнего сообщения)
-			"updated_at": profile.UpdatedAt,
+			"username":             profile.Username,
+			"alias":                profile.Alias,
+			"gender":               profile.Gender,
+			"real_name":            profile.RealName,
+			"bio":                  profile.Bio,
+			"last_seen":            profile.LastSeen, // Используем LastSeen из профиля (например, время последнего сообщения)
+			"updated_at":           profile.UpdatedAt,
+			"auto_bio":             profile.AutoBio,
+			"last_auto_bio_update": profile.LastAutoBioUpdate,
 		},
 		"$setOnInsert": bson.M{
 			"created_at": time.Now(), // Устанавливаем время создания только при вставке
@@ -120,4 +122,29 @@ func (ms *MongoStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error)
 	}
 
 	return profiles, nil
+}
+
+// ResetAutoBioTimestamps сбрасывает LastAutoBioUpdate для всех пользователей в указанном чате.
+func (ms *MongoStorage) ResetAutoBioTimestamps(chatID int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	filter := bson.M{"chat_id": chatID}
+	update := bson.M{
+		"$set": bson.M{
+			"last_auto_bio_update": time.Time{}, // Устанавливаем нулевое значение времени
+		},
+	}
+
+	result, err := ms.userProfilesCollection.UpdateMany(ctx, filter, update)
+	if err != nil {
+		log.Printf("[ERROR][ResetAutoBio] Chat %d: Ошибка сброса времени AutoBio: %v", chatID, err)
+		return fmt.Errorf("ошибка сброса времени AutoBio: %w", err)
+	}
+
+	if ms.debug {
+		log.Printf("[DEBUG][ResetAutoBio] Chat %d: Успешно сброшено время AutoBio для %d профилей.", chatID, result.ModifiedCount)
+	}
+
+	return nil
 }

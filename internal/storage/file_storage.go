@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -154,6 +155,7 @@ type FileStorage struct {
 	contextWindow int
 	mutex         sync.RWMutex
 	autoSave      bool
+	debug         bool
 }
 
 // Убедимся, что FileStorage реализует интерфейс ChatHistoryStorage.
@@ -211,7 +213,12 @@ func (fs *FileStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Message
 
 // GetMessagesSince возвращает сообщения из указанного чата, начиная с определенного времени.
 // Добавляем context.Context как первый параметр (хотя он не используется)
-func (fs *FileStorage) GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
+// Добавляем userID и limit для соответствия интерфейсу, но они не используются.
+func (fs *FileStorage) GetMessagesSince(ctx context.Context, chatID int64, userID int64, since time.Time, limit int) ([]*tgbotapi.Message, error) {
+	// Игнорируем userID и limit, так как FileStorage не поддерживает эту фильтрацию.
+	if fs.debug {
+		log.Printf("[FileStorage GetMessagesSince DEBUG] Called for chat %d, user %d, since %v, limit %d (userID/limit ignored)", chatID, userID, since, limit)
+	}
 	fs.mutex.RLock()
 	defer fs.mutex.RUnlock()
 
@@ -504,10 +511,32 @@ func (fs *FileStorage) UpdateMessageEmbedding(chatID int64, messageID int, vecto
 	return fmt.Errorf("UpdateMessageEmbedding не реализован для FileStorage")
 }
 
-// GetReplyChain - Заглушка для FileStorage
+// GetReplyChain - Заглушка для FileStorage.
 func (fs *FileStorage) GetReplyChain(ctx context.Context, chatID int64, messageID int, maxDepth int) ([]*tgbotapi.Message, error) {
-	log.Printf("[FileStorage WARN] GetReplyChain не реализован для файлового хранилища.")
-	// FileStorage хранит данные в памяти, можно было бы реализовать поиск по ReplyToMessageID
-	// но для простоты вернем ошибку.
-	return nil, fmt.Errorf("GetReplyChain не реализован для FileStorage")
+	log.Printf("[WARN] GetReplyChain не реализован для FileStorage.")
+	return nil, errors.New("GetReplyChain не реализован для FileStorage")
+}
+
+// ResetAutoBioTimestamps сбрасывает LastAutoBioUpdate для всех пользователей в указанном чате.
+func (fs *FileStorage) ResetAutoBioTimestamps(chatID int64) error {
+	fs.mutex.Lock()
+	defer fs.mutex.Unlock()
+
+	count := 0
+	if chatProfiles, ok := fs.userProfiles[chatID]; ok {
+		for _, profile := range chatProfiles {
+			if profile != nil {
+				profile.LastAutoBioUpdate = time.Time{}
+				count++
+			}
+		}
+	}
+
+	if fs.debug {
+		log.Printf("[DEBUG][ResetAutoBio] Chat %d: Успешно сброшено время AutoBio для %d профилей в FileStorage.", chatID, count)
+	}
+
+	// В FileStorage нет необходимости в отдельном сохранении, т.к. работаем с памятью.
+	// Автосохранение (если включено) сработает при добавлении/закрытии.
+	return nil
 }

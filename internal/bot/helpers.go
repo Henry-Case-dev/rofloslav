@@ -372,6 +372,7 @@ func formatMessagesWithProfilesInternal(chatID int64, messages []*tgbotapi.Messa
 		// Получаем профиль, форматируем время, текст и т.д.
 		var authorAlias string
 		var authorBio string
+		var authorAutoBio string
 		var profileInfo string
 
 		if msg.From != nil {
@@ -403,7 +404,23 @@ func formatMessagesWithProfilesInternal(chatID int64, messages []*tgbotapi.Messa
 			// Получаем Bio, если есть
 			if profile != nil && profile.Bio != "" {
 				authorBio = profile.Bio
-				profileInfo = fmt.Sprintf(" (Bio: %s)", utils.TruncateString(authorBio, 100)) // Добавляем инфо о Bio
+			}
+
+			// Получаем AutoBio, если есть
+			if profile != nil && profile.AutoBio != "" {
+				authorAutoBio = profile.AutoBio
+			}
+
+			// Формируем строку с доп. информацией
+			profileInfoParts := []string{}
+			if authorBio != "" {
+				profileInfoParts = append(profileInfoParts, fmt.Sprintf("Bio: %s", utils.TruncateString(authorBio, 70)))
+			}
+			if authorAutoBio != "" {
+				profileInfoParts = append(profileInfoParts, fmt.Sprintf("AutoBio: %s", utils.TruncateString(authorAutoBio, 70)))
+			}
+			if len(profileInfoParts) > 0 {
+				profileInfo = fmt.Sprintf(" (%s)", strings.Join(profileInfoParts, "; "))
 			}
 		} else if msg.SenderChat != nil { // Сообщение от имени канала/чата
 			authorAlias = msg.SenderChat.Title

@@ -97,3 +97,43 @@ func logLoadedConfig(cfg *Config) {
 
 	log.Println("--- Конфигурация завершена ---")
 }
+
+/* // Комментируем или удаляем ошибочно размещенный код
+func validateConfig(cfg *Config) error {
+	if cfg.MongoCleanupChunkDurationHours <= 0 {
+		return fmt.Errorf("MONGO_CLEANUP_CHUNK_DURATION_HOURS (%d) должен быть > 0", cfg.MongoCleanupChunkDurationHours)
+	}
+
+	// --- Валидация настроек Auto Bio ---
+	if cfg.AutoBioEnabled {
+		if cfg.AutoBioIntervalHours <= 0 {
+			return fmt.Errorf("AUTO_BIO_INTERVAL_HOURS (%d) должен быть > 0, если AutoBio включен", cfg.AutoBioIntervalHours)
+		}
+		if cfg.AutoBioInitialAnalysisPrompt == "" {
+			return fmt.Errorf("AUTO_BIO_INITIAL_ANALYSIS_PROMPT не должен быть пустым, если AutoBio включен")
+		}
+		if cfg.AutoBioUpdatePrompt == "" {
+			return fmt.Errorf("AUTO_BIO_UPDATE_PROMPT не должен быть пустым, если AutoBio включен")
+		}
+		if cfg.AutoBioMessagesLookbackDays <= 0 {
+			return fmt.Errorf("AUTO_BIO_MESSAGES_LOOKBACK_DAYS (%d) должен быть > 0", cfg.AutoBioMessagesLookbackDays)
+		}
+		if cfg.AutoBioMinMessagesForAnalysis < 0 { // Может быть 0, если хотим анализировать даже с одним сообщением
+			return fmt.Errorf("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS (%d) должен быть >= 0", cfg.AutoBioMinMessagesForAnalysis)
+		}
+		// Дополнительно: Проверить, что промпты содержат нужные плейсхолдеры? (пока опционально)
+		// Проверим наличие плейсхолдеров %s
+		if cfg.AutoBioInitialAnalysisPrompt != "" && (!strings.Contains(cfg.AutoBioInitialAnalysisPrompt, "%s")) {
+			log.Println("[WARN] AUTO_BIO_INITIAL_ANALYSIS_PROMPT не содержит плейсхолдеры %s для имени и сообщений.")
+		}
+		if cfg.AutoBioUpdatePrompt != "" && (!strings.Contains(cfg.AutoBioUpdatePrompt, "%s") || strings.Count(cfg.AutoBioUpdatePrompt, "%s") < 3) {
+			log.Println("[WARN] AUTO_BIO_UPDATE_PROMPT не содержит плейсхолдеры %s для имени, старого био и новых сообщений.")
+		}
+		log.Printf("    AutoBioMinMessagesForAnalysis: %d", cfg.AutoBioMinMessagesForAnalysis)
+		log.Printf("    AutoBioMaxMessagesForAnalysis: %d", cfg.AutoBioMaxMessagesForAnalysis)
+	}
+	// --- Конец валидации Auto Bio ---
+
+	return nil
+}
+*/

@@ -33,8 +33,9 @@ type Bot struct {
 	stop                  chan struct{}
 	summaryMutex          sync.RWMutex
 	lastSummaryRequest    map[int64]time.Time
-	autoSummaryTicker     *time.Ticker // Оставляем для авто-саммари
-	randSource            *rand.Rand   // Источник случайных чисел
+	autoSummaryTicker     *time.Ticker  // Оставляем для авто-саммари
+	randSource            *rand.Rand    // Источник случайных чисел
+	autoBioSemaphore      chan struct{} // Семафор для ограничения параллельного анализа AutoBio
 }
 
 // New создает и инициализирует новый экземпляр бота
@@ -154,6 +155,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		lastSummaryRequest:    make(map[int64]time.Time),
 		autoSummaryTicker:     nil,
 		randSource:            randGen,
+		autoBioSemaphore:      make(chan struct{}, 1), // Инициализация семафора
 	}
 
 	// Загрузка всех настроек чатов при старте
@@ -197,6 +199,9 @@ func (b *Bot) Start() error {
 	} else {
 		log.Println("Автоматическое саммари отключено (SUMMARY_INTERVAL_HOURS <= 0).")
 	}
+
+	// Запуск планировщика Auto Bio Analysis
+	go b.scheduleAutoBioAnalysis()
 
 	// Запуск автоочистки MongoDB (ПЕРЕД циклом)
 	if b.config.StorageType == config.StorageTypeMongo && b.config.MongoCleanupEnabled {

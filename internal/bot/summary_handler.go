@@ -52,25 +52,26 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	var editText, sendText string // Тексты для редактирования и отправки
 	var parseMode string = ""     // ParseMode для отправки/редактирования
 
-	// --- Получаем историю сообщений за последние 24 часа ---
-	since := time.Now().Add(-24 * time.Hour)
-
-	// Создаем контекст с таймаутом, например, 60 секунд
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel() // Важно освободить ресурсы контекста
-
-	// Передаем контекст в вызов хранилища
-	messages, errMsgs := b.storage.GetMessagesSince(ctx, chatID, since)
-	if errMsgs != nil {
-		// Проверяем, не была ли ошибка из-за таймаута контекста
-		if ctx.Err() == context.DeadlineExceeded {
-			log.Printf("[ERROR][createAndSendSummary] Чат %d: Таймаут (%v) при получении сообщений: %v", chatID, 60*time.Second, errMsgs)
-			editText = fmt.Sprintf("❌ Таймаут (%v) при получении сообщений для саммари.", 60*time.Second)
-		} else {
-			log.Printf("[ERROR][createAndSendSummary] Чат %d: Ошибка получения сообщений: %v", chatID, errMsgs)
-			editText = fmt.Sprintf("❌ Ошибка при получении сообщений для саммари: %v", errMsgs)
+	// 2. Получаем сообщения за последние 24 часа (или с момента последнего авто-саммари, если есть)
+	sinceTime := time.Now().Add(-24 * time.Hour)
+	b.settingsMutex.RLock()
+	if settings, exists := b.chatSettings[chatID]; exists {
+		if !settings.LastAutoSummaryTime.IsZero() && settings.LastAutoSummaryTime.After(sinceTime) {
+			sinceTime = settings.LastAutoSummaryTime
 		}
-		sendText = editText                                                  // Используем тот же текст для отправки нового сообщения
+	}
+	b.settingsMutex.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// Передаем 0 как userID и b.config.MaxMessages как лимит
+	messages, err := b.storage.GetMessagesSince(ctx, chatID, 0, sinceTime, b.config.MaxMessages)
+	if err != nil {
+		log.Printf("[ERROR][createAndSendSummary] Chat %d: Ошибка получения сообщений: %v", chatID, err)
+		b.sendReply(chatID, "❌ Ошибка при получении сообщений для саммари.")
+		editText = fmt.Sprintf("❌ Ошибка при получении сообщений для саммари: %v", err)
+		sendText = editText
 		b.updateOrSendMessage(chatID, lastInfoMsgID, editText, sendText, "") // Заменяем вызов
 		return
 	}

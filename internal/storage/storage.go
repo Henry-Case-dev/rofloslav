@@ -31,6 +31,10 @@ type UserProfile struct {
 	// Можно добавить другие поля по необходимости
 	CreatedAt time.Time `bson:"created_at" db:"created_at"` // Время создания записи
 	UpdatedAt time.Time `bson:"updated_at" db:"updated_at"` // Время последнего обновления
+	// --- Новые поля для Auto Bio ---
+	AutoBio           string    `bson:"auto_bio,omitempty" db:"auto_bio"`
+	LastAutoBioUpdate time.Time `bson:"last_auto_bio_update,omitempty" db:"last_auto_bio_update"`
+	// --- Конец новых полей ---
 }
 
 // ChatHistoryStorage определяет интерфейс для работы с историей сообщений и профилями.
@@ -39,7 +43,9 @@ type ChatHistoryStorage interface {
 	AddMessage(chatID int64, message *tgbotapi.Message)
 	// GetMessages извлекает последние N сообщений для указанного чата, где N = limit.
 	GetMessages(chatID int64, limit int) ([]*tgbotapi.Message, error)
-	GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error)
+	// GetMessagesSince извлекает сообщения из указанного чата, для указанного пользователя,
+	// начиная с определенного времени и с ограничением по количеству.
+	GetMessagesSince(ctx context.Context, chatID int64, userID int64, since time.Time, limit int) ([]*tgbotapi.Message, error)
 	LoadChatHistory(chatID int64) ([]*tgbotapi.Message, error)
 	SaveChatHistory(chatID int64) error
 	ClearChatHistory(chatID int64) error
@@ -97,6 +103,10 @@ type ChatHistoryStorage interface {
 	// GetReplyChain извлекает цепочку сообщений, на которые отвечали, начиная с messageID.
 	// Возвращает сообщения в хронологическом порядке (старые -> новые).
 	GetReplyChain(ctx context.Context, chatID int64, messageID int, maxDepth int) ([]*tgbotapi.Message, error)
+
+	// === НОВЫЙ МЕТОД для сброса времени AutoBio ===
+	// ResetAutoBioTimestamps сбрасывает LastAutoBioUpdate для всех пользователей в чате.
+	ResetAutoBioTimestamps(chatID int64) error
 }
 
 // FileStorage реализует ChatHistoryStorage с использованием файлов.

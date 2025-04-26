@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log" // Нужен для логгирования предупреждений
+	"strings"
 )
 
 // ValidateConfig проверяет корректность загруженной конфигурации
@@ -151,6 +152,37 @@ func ValidateConfig(cfg *Config) error {
 		}
 	}
 	// --- Конец валидации ---
+
+	// --- Валидация настроек Auto Bio ---
+	if cfg.AutoBioEnabled {
+		if cfg.AutoBioIntervalHours <= 0 {
+			return fmt.Errorf("AUTO_BIO_INTERVAL_HOURS (%d) должен быть > 0, если AutoBio включен", cfg.AutoBioIntervalHours)
+		}
+		if cfg.AutoBioInitialAnalysisPrompt == "" {
+			return fmt.Errorf("AUTO_BIO_INITIAL_ANALYSIS_PROMPT не должен быть пустым, если AutoBio включен")
+		}
+		if cfg.AutoBioUpdatePrompt == "" {
+			return fmt.Errorf("AUTO_BIO_UPDATE_PROMPT не должен быть пустым, если AutoBio включен")
+		}
+		if cfg.AutoBioMessagesLookbackDays <= 0 {
+			return fmt.Errorf("AUTO_BIO_MESSAGES_LOOKBACK_DAYS (%d) должен быть > 0", cfg.AutoBioMessagesLookbackDays)
+		}
+		if cfg.AutoBioMinMessagesForAnalysis < 0 { // Может быть 0, если хотим анализировать даже с одним сообщением
+			return fmt.Errorf("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS (%d) должен быть >= 0", cfg.AutoBioMinMessagesForAnalysis)
+		}
+		if cfg.AutoBioMaxMessagesForAnalysis <= 0 {
+			return fmt.Errorf("AUTO_BIO_MAX_MESSAGES_FOR_ANALYSIS (%d) должен быть > 0", cfg.AutoBioMaxMessagesForAnalysis)
+		}
+		// Дополнительно: Проверить, что промпты содержат нужные плейсхолдеры? (пока опционально)
+		// Проверим наличие плейсхолдеров %s
+		if cfg.AutoBioInitialAnalysisPrompt != "" && (!strings.Contains(cfg.AutoBioInitialAnalysisPrompt, "%s")) {
+			log.Println("[WARN] AUTO_BIO_INITIAL_ANALYSIS_PROMPT не содержит плейсхолдеры %s для имени и сообщений.")
+		}
+		if cfg.AutoBioUpdatePrompt != "" && (!strings.Contains(cfg.AutoBioUpdatePrompt, "%s") || strings.Count(cfg.AutoBioUpdatePrompt, "%s") < 3) {
+			log.Println("[WARN] AUTO_BIO_UPDATE_PROMPT не содержит плейсхолдеры %s для имени, старого био и новых сообщений.")
+		}
+	}
+	// --- Конец валидации Auto Bio ---
 
 	return nil
 }

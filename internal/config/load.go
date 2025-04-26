@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"log"
 	"net/url" // Нужен для maskSecretURI
 	"os"
@@ -376,6 +375,7 @@ func Load() (*Config, error) {
 		MongoDbMessagesCollection:        mongoMessagesCollection,
 		MongoDbUserProfilesCollection:    mongoUserProfilesCollection,
 		MongoDbSettingsCollection:        mongoSettingsCollection, // Новое поле
+		StorageType:                      StorageType(storageTypeStr),
 		SrachAnalysisEnabled:             srachEnabledStr == "true" || srachEnabledStr == "1" || srachEnabledStr == "yes",
 		WelcomePrompt:                    welcomePrompt,
 		VoiceFormatPrompt:                voiceFormatPrompt,
@@ -410,107 +410,8 @@ func Load() (*Config, error) {
 		MongoCleanupChunkDurationHours: mongoCleanupChunkDurationHours, // Может быть 0 или отрицательным, если парсинг не удался
 	}
 
-	// --- Установка значений по умолчанию для MongoDB cleanup, если они не были установлены или невалидны ---
-	if cfg.MongoCleanupSizeLimitMB <= 0 {
-		cfg.MongoCleanupSizeLimitMB = 500 // Дефолтное значение
-		log.Println("[Config Load] MONGO_CLEANUP_SIZE_LIMIT_MB не установлен или невалиден, используется значение по умолчанию: 500")
-	}
-	if cfg.MongoCleanupIntervalMinutes <= 0 {
-		cfg.MongoCleanupIntervalMinutes = 60 // Дефолтное значение
-		log.Println("[Config Load] MONGO_CLEANUP_INTERVAL_MINUTES не установлен или невалиден, используется значение по умолчанию: 60")
-	}
-	if cfg.MongoCleanupChunkDurationHours <= 0 {
-		cfg.MongoCleanupChunkDurationHours = 24 // Дефолтное значение
-		log.Println("[Config Load] MONGO_CLEANUP_CHUNK_DURATION_HOURS не установлен или невалиден, используется значение по умолчанию: 24")
-	}
-
-	// Валидация и установка StorageType
-	switch StorageType(storageTypeStr) {
-	case StorageTypeFile:
-		cfg.StorageType = StorageTypeFile
-	case StorageTypePostgres:
-		cfg.StorageType = StorageTypePostgres
-	case StorageTypeMongo:
-		cfg.StorageType = StorageTypeMongo
-	default:
-		log.Printf("Предупреждение: Неизвестный STORAGE_TYPE '%s'. Используется MongoDB по умолчанию.", storageTypeStr)
-		cfg.StorageType = StorageTypeMongo // Устанавливаем значение по умолчанию
-	}
-
-	// Валидация LLM провайдера и ключей
-	// llmProviderStr = strings.ToLower(string(cfg.LLMProvider)) // Преобразуем к строке для switch
-	// Используем уже определенную переменную llmProvider
-	switch cfg.LLMProvider {
-	case ProviderGemini:
-		// cfg.LLMProvider = ProviderGemini // Уже установлено
-		if cfg.GeminiAPIKey == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='gemini', но GEMINI_API_KEY не установлен")
-		}
-		// Установка DefaultModel уже произошла выше, если он был пуст
-	case ProviderDeepSeek:
-		// cfg.LLMProvider = ProviderDeepSeek // Уже установлено
-		if cfg.DeepSeekAPIKey == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='deepseek', но DEEPSEEK_API_KEY не установлен")
-		}
-		// Установка DefaultModel уже произошла выше, если он был пуст
-	case ProviderOpenRouter:
-		if cfg.OpenRouterAPIKey == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: LLM_PROVIDER='openrouter', но OPENROUTER_API_KEY не установлен")
-		}
-		// Установка DefaultModel уже произошла выше, если он был пуст
-	default: // Этот кейс не должен достигаться из-за валидации выше, но на всякий случай
-		log.Printf("[Config Load CRITICAL] Неожиданное значение LLMProvider '%s'.", cfg.LLMProvider)
-		// Возвращаем ошибку, т.к. состояние неопределенное
-		return nil, fmt.Errorf("неожиданная ошибка конфигурации LLM провайдера")
-	}
-
-	// Валидация интервалов
-	if dailyTakeTime < 0 || dailyTakeTime > 23 {
-		log.Printf("Интервал для темы дня должен быть в диапазоне 0-23, используем 19")
-		cfg.DailyTakeTime = 19 // Обновляем значение в cfg
-	}
-	if minMsg < 1 || minMsg > 100 {
-		log.Printf("Минимальное количество сообщений должно быть в диапазоне 1-100, используем 10")
-		cfg.MinMessages = 10 // Обновляем значение в cfg
-	}
-	if maxMsg < 1 || maxMsg > 100 {
-		log.Printf("Максимальное количество сообщений должно быть в диапазоне 1-100, используем 30")
-		cfg.MaxMessages = 30 // Обновляем значение в cfg
-	}
-	if contextWindow < 1 { // Убираем верхний предел для окна контекста, т.к. Gemini может больше
-		log.Printf("Контекстное окно должно быть > 0, используем 1000")
-		cfg.ContextWindow = 1000 // Обновляем значение в cfg
-	}
-	if summaryIntervalHours < 0 || summaryIntervalHours > 24 {
-		log.Printf("Интервал авто-саммари должен быть в диапазоне 0-24, используем 2")
-		cfg.SummaryIntervalHours = 2 // Обновляем значение в cfg
-	}
-
-	// Валидация настроек хранилища
-	switch cfg.StorageType {
-	case StorageTypePostgres:
-		if cfg.PostgresqlHost == "" || cfg.PostgresqlUser == "" || cfg.PostgresqlDbname == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='postgres', но не все POSTGRESQL_* переменные установлены (HOST, USER, DBNAME)")
-		}
-	case StorageTypeMongo:
-		if cfg.MongoDbURI == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_URI не установлен")
-		}
-		if cfg.MongoDbName == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_DBNAME не установлен")
-		}
-		if cfg.MongoDbMessagesCollection == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_MESSAGES_COLLECTION не установлен")
-		}
-		if cfg.MongoDbUserProfilesCollection == "" {
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_USER_PROFILES_COLLECTION не установлен")
-		}
-		if cfg.MongoDbSettingsCollection == "" { // Проверяем новую коллекцию
-			return nil, fmt.Errorf("ошибка конфигурации: STORAGE_TYPE='mongo', но MONGODB_SETTINGS_COLLECTION не установлен")
-		}
-	}
-
-	// Администраторы
+	// Загрузка списка администраторов
+	adminUsernamesStr = getEnvOrDefault("ADMIN_USERNAMES", "lightnight")
 	cfg.AdminUsernames = strings.Split(adminUsernamesStr, ",")
 	// Очистка пробелов и пустых строк
 	cleanedAdmins := make([]string, 0, len(cfg.AdminUsernames))
@@ -521,13 +422,25 @@ func Load() (*Config, error) {
 		}
 	}
 	cfg.AdminUsernames = cleanedAdmins
-	// Убедимся, что хотя бы один админ есть (lightnight по умолчанию)
 	if len(cfg.AdminUsernames) == 0 {
-		cfg.AdminUsernames = []string{"lightnight"}
+		cfg.AdminUsernames = []string{"lightnight"} // Гарантируем хотя бы одного админа
 	}
 
-	// Логирование загруженной конфигурации (без секретов)
-	logLoadedConfig(&cfg)
+	// --- Загрузка настроек Auto Bio ---
+	cfg.AutoBioEnabled = parseBoolOrDefault(getEnvOrDefault("AUTO_BIO_ENABLED", "true"), true)
+	cfg.AutoBioIntervalHours = parseIntOrDefault(getEnvOrDefault("AUTO_BIO_INTERVAL_HOURS", "6"), 6)
+	cfg.AutoBioInitialAnalysisPrompt = getEnvOrDefault("AUTO_BIO_INITIAL_ANALYSIS_PROMPT", "Проанализируй следующие сообщения пользователя ([%s]). Составь краткое (1-2 предложения) резюме его стиля общения, основных тем, тона и возможных интересов, основываясь *только* на тексте сообщений. Не делай медицинских или психологических диагнозов. Сообщения:\n---\n%s")
+	cfg.AutoBioUpdatePrompt = getEnvOrDefault("AUTO_BIO_UPDATE_PROMPT", "Вот текущее резюме стиля общения пользователя ([%s]):\n%s\n\nВот его *новые* сообщения с момента последнего обновления:\n---\n%s\n---\nОбнови или дополни резюме, основываясь *только* на новых сообщениях. Если стиль не изменился, просто отметь новые темы или подтверди старые наблюдения. Сохраняй краткость (1-3 предложения).")
+	cfg.AutoBioMessagesLookbackDays = parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MESSAGES_LOOKBACK_DAYS", "30"), 30)
+	cfg.AutoBioMinMessagesForAnalysis = parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS", "10"), 10)
+	cfg.AutoBioMaxMessagesForAnalysis = parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MAX_MESSAGES_FOR_ANALYSIS", "2500"), 2500)
+	// --- Конец загрузки настроек Auto Bio ---
+
+	logLoadedConfig(&cfg) // Выводим лог после загрузки всех переменных
+
+	if err := ValidateConfig(&cfg); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
 }
@@ -568,4 +481,20 @@ func maskSecretURI(uri string) string {
 		return u.String()
 	}
 	return uri // Возвращаем как есть, если нет UserInfo
+}
+
+// parseBoolOrDefault возвращает значение bool по умолчанию, если переменная не установлена
+func parseBoolOrDefault(value string, defaultValue bool) bool {
+	if parsed, err := strconv.ParseBool(value); err == nil {
+		return parsed
+	}
+	return defaultValue
+}
+
+// parseIntOrDefault возвращает значение int по умолчанию, если переменная не установлена
+func parseIntOrDefault(value string, defaultValue int) int {
+	if parsed, err := strconv.Atoi(value); err == nil {
+		return parsed
+	}
+	return defaultValue
 }

@@ -120,4 +120,13 @@ type Config struct {
 	MongoCleanupSizeLimitMB        int  // Максимальный размер коллекции в МБ перед очисткой
 	MongoCleanupIntervalMinutes    int  // Интервал проверки коллекций в минутах
 	MongoCleanupChunkDurationHours int  // Длительность удаляемого "куска" старых сообщений в часах
+	// --- НОВЫЕ Настройки Auto Bio ---
+	AutoBioEnabled                bool   // Включен ли автоматический анализ профилей
+	AutoBioIntervalHours          int    // Интервал анализа в часах
+	AutoBioInitialAnalysisPrompt  string // Промпт для первого анализа
+	AutoBioUpdatePrompt           string // Промпт для обновления существующего био
+	AutoBioMessagesLookbackDays   int    // На сколько дней назад смотреть сообщения при первом анализе
+	AutoBioMinMessagesForAnalysis int    // Мин. кол-во сообщений пользователя для анализа
+	AutoBioMaxMessagesForAnalysis int    // Макс. кол-во сообщений пользователя для анализа (для LLM)
+	// --- КОНЕЦ Настроек Auto Bio ---
 }

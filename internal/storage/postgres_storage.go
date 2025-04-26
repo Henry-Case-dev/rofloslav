@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -110,10 +111,12 @@ func (ps *PostgresStorage) createTablesIfNotExists() error {
 		gender VARCHAR(50) DEFAULT '',  -- Пол (ранее last_name), varchar т.к. может быть не только m/f
 		real_name TEXT DEFAULT '', -- Реальное имя
 		bio TEXT DEFAULT '',       -- Био/Описание
-		last_seen TIMESTAMPTZ,     -- Время последнего сообщения
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (chat_id, user_id) -- Составной первичный ключ
+		last_seen TIMESTAMP WITH TIME ZONE,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		auto_bio TEXT,                         -- Новое поле для Auto Bio
+		last_auto_bio_update TIMESTAMP WITH TIME ZONE, -- Новое поле для времени обновления Auto Bio
+		PRIMARY KEY (chat_id, user_id) -- Добавляем первичный ключ
 	);`
 	if _, err := tx.ExecContext(ctx, profilesTableQuery); err != nil {
 		return fmt.Errorf("ошибка создания таблицы user_profiles: %w", err)
@@ -143,6 +146,13 @@ func (ps *PostgresStorage) createTablesIfNotExists() error {
 		return fmt.Errorf("ошибка создания триггера для user_profiles: %w", err)
 	}
 	log.Println("Триггер updated_at для user_profiles проверен/создан.")
+
+	// Создаем индекс для chat_id и user_id в user_profiles для быстрого поиска GetUserProfile
+	_, err = ps.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_chat_user ON user_profiles (chat_id, user_id);`)
+	if err != nil {
+		return fmt.Errorf("ошибка создания индекса idx_user_profiles_chat_user: %w", err)
+	}
+	log.Println("Индекс idx_user_profiles_chat_user проверен/создан.")
 
 	// Коммит транзакции
 	if err := tx.Commit(); err != nil {
@@ -394,26 +404,36 @@ func (ps *PostgresStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Mes
 	return messages, nil
 }
 
-// GetMessagesSince извлекает сообщения из указанного чата, начиная с определенного времени.
-// Добавляем context.Context как первый параметр
-func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, since time.Time) ([]*tgbotapi.Message, error) {
+// GetMessagesSince извлекает сообщения из указанного чата, начиная с определенного времени,
+// для конкретного пользователя и с ограничением по количеству.
+// Возвращает сообщения в хронологическом порядке (старые -> новые).
+func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, userID int64, since time.Time, limit int) ([]*tgbotapi.Message, error) {
+	args := []interface{}{chatID, since}
 	query := `
 	SELECT
 		message_id, user_id, username, first_name, last_name, is_bot,
 		message_text, message_date, reply_to_message_id, entities, raw_message,
 		is_forward, forwarded_from_user_id, forwarded_from_chat_id, forwarded_from_message_id, forwarded_date
 	FROM chat_messages
-	WHERE chat_id = $1 AND message_date >= $2
-	ORDER BY message_date ASC; -- Сортируем по возрастанию, чтобы получить сообщения в правильном порядке
-	`
-	// Убираем создание контекста с таймаутом, используем переданный ctx
-	// ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Увеличим таймаут
-	// defer cancel()
+	WHERE chat_id = $1 AND message_date >= $2`
 
-	// Используем переданный ctx
-	rows, err := ps.db.QueryContext(ctx, query, chatID, since)
+	// Добавляем фильтр по userID, если он указан (не 0)
+	if userID != 0 {
+		query += fmt.Sprintf(" AND user_id = $%d", len(args)+1)
+		args = append(args, userID)
+	}
+
+	// Добавляем сортировку и лимит
+	query += " ORDER BY message_date DESC" // Сортируем по убыванию (новые сначала) для LIMIT
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, limit)
+	}
+	query += ";" // Завершаем запрос
+
+	rows, err := ps.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		log.Printf("[PostgresStorage GetMessagesSince ERROR] Ошибка запроса сообщений для chatID %d с %v: %v", chatID, since, err)
+		log.Printf("[PostgresStorage GetMessagesSince ERROR] Чат %d, User %d: Ошибка запроса сообщений (since %v, limit %d): %v", chatID, userID, since, limit, err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -421,7 +441,7 @@ func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, s
 	messages := make([]*tgbotapi.Message, 0)
 	for rows.Next() {
 		var msg tgbotapi.Message
-		var userID sql.NullInt64
+		var dbUserID sql.NullInt64 // Переименовано, чтобы не конфликтовать с параметром userID
 		var username, firstName, lastName sql.NullString
 		var isBot sql.NullBool
 		var messageText sql.NullString
@@ -436,7 +456,7 @@ func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, s
 		var forwardedDate sql.NullTime
 
 		err := rows.Scan(
-			&msg.MessageID, &userID, &username, &firstName, &lastName, &isBot,
+			&msg.MessageID, &dbUserID, &username, &firstName, &lastName, &isBot,
 			&messageText, &messageDate, &replyToMessageID, &entitiesJSON, &rawMessageJSON,
 			&isForward, &forwardedFromUserID, &forwardedFromChatID, &forwardedFromMessageID, &forwardedDate,
 		)
@@ -461,9 +481,9 @@ func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, s
 		msg.Date = int(messageDate.Unix())
 		msg.Text = messageText.String
 
-		if userID.Valid {
+		if dbUserID.Valid {
 			msg.From = &tgbotapi.User{
-				ID:        userID.Int64,
+				ID:        dbUserID.Int64,
 				UserName:  username.String,
 				FirstName: firstName.String,
 				LastName:  lastName.String,
@@ -499,6 +519,16 @@ func (ps *PostgresStorage) GetMessagesSince(ctx context.Context, chatID int64, s
 	if err = rows.Err(); err != nil {
 		log.Printf("[PostgresStorage GetMessagesSince ERROR] Ошибка итерации по строкам сообщений для chatID %d: %v", chatID, err)
 		return nil, err
+	}
+
+	// Так как мы получали в обратном порядке (новые сначала),
+	// нужно развернуть слайс для возврата в хронологическом порядке (старые -> новые).
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+
+	if ps.debug {
+		log.Printf("[PostgresStorage GetMessagesSince DEBUG] Чат %d, User %d: Успешно получено %d сообщений (since %v, limit %d).", chatID, userID, len(messages), since, limit)
 	}
 
 	return messages, nil
@@ -614,23 +644,23 @@ func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProf
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	query := `
-		SELECT username, alias, gender, real_name, bio, last_seen, created_at, updated_at
-		FROM user_profiles
-		WHERE chat_id = $1 AND user_id = $2;
-	`
+	// Добавляем auto_bio и last_auto_bio_update в SELECT
+	query := `SELECT username, alias, gender, real_name, bio, last_seen, created_at, updated_at, auto_bio, last_auto_bio_update
+             FROM user_profiles WHERE chat_id = $1 AND user_id = $2`
+
 	row := ps.db.QueryRowContext(ctx, query, chatID, userID)
 
 	var profile UserProfile
-	profile.ChatID = chatID // Заполняем известные поля
+	profile.ChatID = chatID // Сразу установим известные поля
 	profile.UserID = userID
 
-	// Используем NullString и NullTime для полей, которые могут быть NULL
-	var username, alias, gender, realName, bio sql.NullString
-	var lastSeen, createdAt, updatedAt sql.NullTime
+	// Используем NullString/NullTime для полей, которые могут быть NULL
+	var username, alias, gender, realName, bio, autoBio sql.NullString
+	var lastSeen, createdAt, updatedAt, lastAutoBioUpdate sql.NullTime
 
+	// Добавляем &autoBio, &lastAutoBioUpdate в Scan
 	err := row.Scan(
-		&username, &alias, &gender, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
+		&username, &alias, &gender, &realName, &bio, &lastSeen, &createdAt, &updatedAt, &autoBio, &lastAutoBioUpdate,
 	)
 
 	if err != nil {
@@ -669,6 +699,14 @@ func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProf
 	if updatedAt.Valid {
 		profile.UpdatedAt = updatedAt.Time
 	}
+	if autoBio.Valid {
+		profile.AutoBio = autoBio.String // Присваиваем auto_bio
+	}
+	if lastAutoBioUpdate.Valid {
+		profile.LastAutoBioUpdate = lastAutoBioUpdate.Time // Присваиваем время, если оно не NULL
+	} else {
+		profile.LastAutoBioUpdate = time.Time{} // Устанавливаем zero value, если NULL
+	}
 
 	if ps.debug {
 		log.Printf("DEBUG: Профиль пользователя userID %d в чате %d успешно получен из PostgreSQL.", userID, chatID)
@@ -678,37 +716,47 @@ func (ps *PostgresStorage) GetUserProfile(chatID int64, userID int64) (*UserProf
 
 // SetUserProfile создает или обновляет профиль пользователя в PostgreSQL (UPSERT).
 func (ps *PostgresStorage) SetUserProfile(profile *UserProfile) error {
-	if profile == nil || profile.ChatID == 0 || profile.UserID == 0 {
-		return fmt.Errorf("невалидный профиль для сохранения (nil, chat_id=0 или user_id=0)")
+	if profile == nil {
+		return errors.New("нельзя сохранить nil профиль")
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Используем INSERT ... ON CONFLICT ... DO UPDATE для UPSERT
 	query := `
-		INSERT INTO user_profiles (
-			chat_id, user_id, username, alias, gender, real_name, bio, last_seen, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-		ON CONFLICT (chat_id, user_id) DO UPDATE SET
-			username = EXCLUDED.username,
-			alias = EXCLUDED.alias,
-			gender = EXCLUDED.gender,
-			real_name = EXCLUDED.real_name,
-			bio = EXCLUDED.bio,
-			last_seen = EXCLUDED.last_seen,
-			updated_at = NOW(); -- Обновляем updated_at при обновлении (триггер тоже это делает, но так надежнее)
-	`
+        INSERT INTO user_profiles (chat_id, user_id, username, alias, gender, real_name, bio, last_seen, auto_bio, last_auto_bio_update, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+        ON CONFLICT (chat_id, user_id)
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            alias = EXCLUDED.alias,
+            gender = EXCLUDED.gender,
+            real_name = EXCLUDED.real_name,
+            bio = EXCLUDED.bio,
+            last_seen = EXCLUDED.last_seen,
+            auto_bio = EXCLUDED.auto_bio,                       -- Обновляем auto_bio
+            last_auto_bio_update = EXCLUDED.last_auto_bio_update, -- Обновляем время
+            updated_at = NOW();
+    ` // Обновляем запрос для новых полей
+
+	// Обработка potentially NULL time
+	var lastAutoBioUpdateArg sql.NullTime
+	if !profile.LastAutoBioUpdate.IsZero() {
+		lastAutoBioUpdateArg = sql.NullTime{Time: profile.LastAutoBioUpdate, Valid: true}
+	} else {
+		lastAutoBioUpdateArg = sql.NullTime{Valid: false}
+	}
 
 	_, err := ps.db.ExecContext(ctx, query,
 		profile.ChatID,
 		profile.UserID,
-		sql.NullString{String: profile.Username, Valid: profile.Username != ""},
-		sql.NullString{String: profile.Alias, Valid: profile.Alias != ""},
-		sql.NullString{String: profile.Gender, Valid: profile.Gender != ""},
-		sql.NullString{String: profile.RealName, Valid: true}, // real_name и bio всегда Valid, но могут быть пустыми
-		sql.NullString{String: profile.Bio, Valid: true},
-		sql.NullTime{Time: profile.LastSeen, Valid: !profile.LastSeen.IsZero()}, // Сохраняем, если не нулевое время
+		profile.Username,
+		profile.Alias,
+		profile.Gender,
+		profile.RealName,
+		profile.Bio,
+		profile.LastSeen,
+		profile.AutoBio,      // Передаем auto_bio
+		lastAutoBioUpdateArg, // Передаем обработанное время
 	)
 
 	if err != nil {
@@ -724,15 +772,13 @@ func (ps *PostgresStorage) SetUserProfile(profile *UserProfile) error {
 
 // GetAllUserProfiles возвращает все профили пользователей для указанного чата из PostgreSQL.
 func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	query := `
-		SELECT user_id, username, alias, gender, real_name, bio, last_seen, created_at, updated_at
-		FROM user_profiles
-		WHERE chat_id = $1
-		ORDER BY last_seen DESC NULLS LAST, updated_at DESC; -- Сортируем для возможной релевантности
-	`
+	// Добавляем auto_bio и last_auto_bio_update в SELECT
+	query := `SELECT user_id, username, alias, gender, real_name, bio, last_seen, created_at, updated_at, auto_bio, last_auto_bio_update
+             FROM user_profiles WHERE chat_id = $1`
+
 	rows, err := ps.db.QueryContext(ctx, query, chatID)
 	if err != nil {
 		log.Printf("ERROR: Ошибка получения всех профилей пользователей из PostgreSQL (чат %d): %v", chatID, err)
@@ -746,13 +792,13 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 		profile.ChatID = chatID // Заполняем chatID
 
 		var userID int64
-		var username, alias, gender, realName, bio sql.NullString
-		var lastSeen, createdAt, updatedAt sql.NullTime
+		var username, alias, gender, realName, bio, autoBio sql.NullString
+		var lastSeen, createdAt, updatedAt, lastAutoBioUpdate sql.NullTime
 
 		if err := rows.Scan(
-			&userID, &username, &alias, &gender, &realName, &bio, &lastSeen, &createdAt, &updatedAt,
+			&userID, &username, &alias, &gender, &realName, &bio, &lastSeen, &createdAt, &updatedAt, &autoBio, &lastAutoBioUpdate,
 		); err != nil {
-			log.Printf("ERROR: Ошибка сканирования строки профиля пользователя PostgreSQL (чат %d): %v", chatID, err)
+			log.Printf("ERROR: Ошибка сканирования строки профиля для чата %d: %v", chatID, err)
 			continue
 		}
 
@@ -780,6 +826,14 @@ func (ps *PostgresStorage) GetAllUserProfiles(chatID int64) ([]*UserProfile, err
 		}
 		if updatedAt.Valid {
 			profile.UpdatedAt = updatedAt.Time
+		}
+		if autoBio.Valid {
+			profile.AutoBio = autoBio.String // Присваиваем auto_bio
+		}
+		if lastAutoBioUpdate.Valid {
+			profile.LastAutoBioUpdate = lastAutoBioUpdate.Time // Присваиваем время, если оно не NULL
+		} else {
+			profile.LastAutoBioUpdate = time.Time{} // Устанавливаем zero value, если NULL
 		}
 
 		profiles = append(profiles, &profile)
@@ -854,6 +908,8 @@ func (ps *PostgresStorage) GetChatSettings(chatID int64) (*ChatSettings, error) 
 			// Настройки не найдены, возвращаем дефолтные (не сохраняя их в БД здесь)
 			log.Printf("[Postgres GetChatSettings DEBUG] Настройки для chatID %d не найдены. Возвращаю дефолтные.", chatID)
 			// Заполняем дефолтными значениями (из конфига, если он доступен, или стандартными)
+			// TODO: Нужна ссылка на config в PostgresStorage, чтобы брать дефолты оттуда!
+			// Пока что используем заглушки или пустые значения.
 			// TODO: Нужна ссылка на config в PostgresStorage, чтобы брать дефолты оттуда!
 			// Пока что используем заглушки или пустые значения.
 			// settings.ConversationStyle = "default_style"
@@ -1063,4 +1119,26 @@ func (ps *PostgresStorage) GetReplyChain(ctx context.Context, chatID int64, mess
 	log.Printf("[PostgresStorage WARN] GetReplyChain не реализован для PostgreSQL.")
 	// Реализация потребует рекурсивных запросов или CTE (Common Table Expressions)
 	return nil, fmt.Errorf("GetReplyChain не реализован для PostgresStorage")
+}
+
+// ResetAutoBioTimestamps сбрасывает LastAutoBioUpdate для всех пользователей в указанном чате.
+func (ps *PostgresStorage) ResetAutoBioTimestamps(chatID int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	query := `UPDATE user_profiles SET last_auto_bio_update = NULL WHERE chat_id = $1`
+
+	result, err := ps.db.ExecContext(ctx, query, chatID)
+	if err != nil {
+		log.Printf("[ERROR][ResetAutoBio] Chat %d: Ошибка сброса времени AutoBio в PostgreSQL: %v", chatID, err)
+		return fmt.Errorf("ошибка сброса времени AutoBio в PostgreSQL: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+
+	if ps.debug {
+		log.Printf("[DEBUG][ResetAutoBio] Chat %d: Успешно сброшено время AutoBio для %d профилей в PostgreSQL.", chatID, rowsAffected)
+	}
+
+	return nil
 }
