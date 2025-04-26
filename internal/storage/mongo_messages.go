@@ -140,8 +140,13 @@ func (ms *MongoStorage) GetMessages(chatID int64, limit int) ([]*tgbotapi.Messag
 	coll := ms.getMessagesCollection(chatID)
 
 	filter := bson.M{"chat_id": chatID}
-	// Сортируем по дате в обратном порядке и берем limit
+	// Сортировка по дате в обратном порядке
 	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: -1}}).SetLimit(int64(limit))
+
+	// --- Добавляем проекцию для исключения message_vector ---
+	projection := bson.D{{"message_vector", 0}}
+	findOptions.SetProjection(projection)
+	// --- Конец добавления проекции ---
 
 	// Используем coll вместо ms.messagesCollection
 	cursor, err := coll.Find(ctx, filter, findOptions)
@@ -187,6 +192,11 @@ func (ms *MongoStorage) GetMessagesSince(ctx context.Context, chatID int64, sinc
 	}
 	// Сортируем по дате в прямом порядке
 	findOptions := options.Find().SetSort(bson.D{{Key: "date", Value: 1}})
+
+	// --- Добавляем проекцию для исключения message_vector ---
+	projection := bson.D{{"message_vector", 0}}
+	findOptions.SetProjection(projection)
+	// --- Конец добавления проекции ---
 
 	// Используем coll вместо ms.messagesCollection
 	cursor, err := coll.Find(ctx, filter, findOptions)

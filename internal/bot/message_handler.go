@@ -210,23 +210,29 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		if b.config.Debug {
 			log.Printf("[DEBUG][MH] Chat %d: IsReplyToBot: %t, MentionsBot: %t. Checking direct reply limit.", chatID, isReplyToBot, mentionsBot)
 		}
-		// Используем функцию checkDirectReplyLimit
-		// Она возвращает true, если лимит ПРЕВЫШЕН
-		if b.checkDirectReplyLimit(chatID, message.From.ID) {
-			// Лимит превышен
-			if b.config.Debug {
-				log.Printf("[DEBUG][MH] Chat %d: Direct reply limit EXCEEDED.", chatID)
+		// Проверяем лимит прямых ответов
+		limitEnabled, _, _ := b.getDirectReplyLimitSettings(chatID) // Используем _ для неиспользуемых count и duration
+		if limitEnabled {
+			if !b.checkDirectReplyLimit(chatID, message.From.ID) { // ИНВЕРТИРОВАНО: ! checkDirectReplyLimit возвращает false, если лимит превышен
+				if b.config.Debug {
+					log.Printf("[DEBUG][MH] Chat %d: Direct reply limit EXCEEDED.", chatID)
+				}
+				b.sendDirectLimitExceededReply(chatID, message.MessageID)
+				// Выход после обработки прямого ответа (лимит превышен)
+				log.Printf("[DEBUG][MH EXIT POINT] Chat %d: Reached EXIT point after direct reply/mention (limit exceeded).", chatID)
+				return
+			} else {
+				// Лимит не превышен, продолжаем с прямым ответом
+				if b.config.Debug {
+					log.Printf("[DEBUG][MH] Chat %d: Direct reply limit NOT exceeded. Proceeding with direct response.", chatID)
+				}
 			}
-			b.sendDirectLimitExceededReply(chatID, message.MessageID)
-		} else {
-			// Лимит не превышен
-			if b.config.Debug {
-				log.Printf("[DEBUG][MH] Chat %d: Direct reply limit not exceeded. Sending direct response.", chatID)
-			}
-			b.sendDirectResponse(chatID, message) // Используем message
 		}
-		// После прямого ответа (или ответа о лимите) выходим
-		log.Printf("[DEBUG][MH EXIT POINT] Chat %d: Reached EXIT point after direct reply/mention.", chatID)
+
+		// Если лимит выключен ИЛИ не превышен - отправляем прямой ответ
+		b.sendDirectResponse(chatID, message)
+		// Выход после обработки прямого ответа
+		log.Printf("[DEBUG][MH EXIT POINT] Chat %d: Reached EXIT point after direct reply/mention (sent direct response).", chatID)
 		return
 	}
 

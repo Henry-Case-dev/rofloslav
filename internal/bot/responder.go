@@ -382,37 +382,43 @@ func (b *Bot) checkDirectReplyLimit(chatID int64, userID int64) bool {
 	b.settingsMutex.Lock()
 	defer b.settingsMutex.Unlock() // Гарантируем разблокировку
 
-	// 1. Проверяем и инициализируем карту для чата, если нужно
-	userMap, chatExists := b.directReplyTimestamps[chatID]
-	if !chatExists {
-		userMap = make(map[int64][]time.Time)
-		b.directReplyTimestamps[chatID] = userMap
-	}
-
-	// 2. Получаем таймстампы для пользователя
-	timestamps := userMap[userID] // timestamps может быть nil
-
-	// 3. Фильтруем устаревшие таймстампы
-	now := time.Now()
-	validTimestamps := []time.Time{}
-	for _, ts := range timestamps { // Безопасно итерироваться по nil слайсу
-		if now.Sub(ts) <= limitDuration {
-			validTimestamps = append(validTimestamps, ts)
+	// --- Ensure the map for the chatID exists ---
+	if _, ok := b.directReplyTimestamps[chatID]; !ok {
+		b.directReplyTimestamps[chatID] = make(map[int64][]time.Time)
+		if b.config.Debug {
+			log.Printf("[DEBUG][RateLimit] Initialized directReplyTimestamps map for chat %d", chatID)
 		}
 	}
+	// --- End ensure map exists ---
 
-	// 4. Проверяем лимит
-	limitExceeded := len(validTimestamps) >= limitCount
+	// Now it's safe to access b.directReplyTimestamps[chatID]
+	userTimestamps := b.directReplyTimestamps[chatID][userID] // Read timestamps for the user
 
-	// 5. Если лимит НЕ превышен, добавляем текущий таймстамп
-	if !limitExceeded {
-		validTimestamps = append(validTimestamps, now)
-		// Обновляем карту новыми валидными таймстампами (включая текущий)
-		userMap[userID] = validTimestamps
+	// Clean up timestamps older than the duration
+	now := time.Now()
+	cutoff := now.Add(-limitDuration)
+	cleanedTimestamps := make([]time.Time, 0, len(userTimestamps))
+	for _, ts := range userTimestamps {
+		if ts.After(cutoff) {
+			cleanedTimestamps = append(cleanedTimestamps, ts)
+		}
 	}
-	// Если лимит превышен, не добавляем новый таймстамп и не обновляем userMap[userID]
+	userTimestamps = cleanedTimestamps // Update userTimestamps with cleaned slice
 
-	return limitExceeded
+	// Check limit BEFORE adding the new timestamp
+	if len(userTimestamps) >= limitCount {
+		log.Printf("[INFO][RateLimit] Chat %d, User %d: Direct reply limit exceeded (%d/%d in %v)", chatID, userID, len(userTimestamps), limitCount, limitDuration)
+		// Don't add the timestamp if the limit is already hit
+		return false // Limit exceeded
+	}
+
+	// Append the new timestamp to the cleaned slice (limit not exceeded)
+	b.directReplyTimestamps[chatID][userID] = append(userTimestamps, now)
+
+	if b.config.Debug {
+		log.Printf("[DEBUG][RateLimit] Chat %d, User %d: Timestamp added. Count: %d/%d", chatID, userID, len(b.directReplyTimestamps[chatID][userID]), limitCount)
+	}
+	return true // Limit not exceeded
 }
 
 // sendDirectLimitExceededReply отправляет сообщение о превышении лимита прямых обращений.
@@ -436,5 +442,25 @@ func (b *Bot) sendDirectLimitExceededReply(chatID int64, replyToMessageID int) {
 	_, errSend := b.api.Send(msg)
 	if errSend != nil {
 		log.Printf("[ERROR][DirectLimit] Ошибка отправки сообщения о лимите в чат %d: %v", chatID, errSend)
+	}
+}
+
+// sendErrorReply отправляет стандартизированное сообщение об ошибке в чат.
+func (b *Bot) sendErrorReply(chatID int64, replyToMessageID int, errorContext string) {
+	// Логируем детальную ошибку перед отправкой общего сообщения
+	log.Printf("[ERROR] Подробности ошибки для чата %d (ReplyTo: %d): %s", chatID, replyToMessageID, errorContext)
+
+	errorMsg := "⚠️ Извините, возникла проблема при генерации ответа."
+	// Если включен режим отладки, добавляем контекст ошибки в сообщение
+	if b.config.Debug {
+		errorMsg = fmt.Sprintf("⚠️ Ошибка (%s)", errorContext)
+	}
+
+	msg := tgbotapi.NewMessage(chatID, errorMsg)
+	msg.ReplyToMessageID = replyToMessageID
+	_, err := b.api.Send(msg)
+	if err != nil {
+		// Логируем, если не удалось отправить даже сообщение об ошибке
+		log.Printf("[CRITICAL] НЕ УДАЛОСЬ отправить сообщение об ошибке в чат %d: %v", chatID, err)
 	}
 }

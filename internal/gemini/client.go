@@ -90,7 +90,7 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 	// Устанавливаем SystemInstruction
 	if systemPrompt != "" {
 		model.SystemInstruction = &genai.Content{
-			Parts: []genai.Part{genai.Text(systemPrompt)},
+			Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
 		}
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Запрос: Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
@@ -117,7 +117,7 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 	}
 
 	if lastMessageText != "" {
-		contentToSend = genai.Text(lastMessageText)
+		contentToSend = genai.Text(utils.SanitizeUTF8(lastMessageText))
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Запрос: Текст lastMessage для отправки: %s...", utils.TruncateString(lastMessageText, 50))
 		}
@@ -261,7 +261,7 @@ func (c *Client) convertMessageToGenaiContent(msg *tgbotapi.Message) *genai.Cont
 	}
 
 	return &genai.Content{
-		Parts: []genai.Part{genai.Text(textContent)}, // Используем textContent
+		Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(textContent))},
 		Role:  role,
 	}
 }
@@ -281,7 +281,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 	// Устанавливаем системный промпт через специальное поле
 	if systemPrompt != "" {
 		model.SystemInstruction = &genai.Content{
-			Parts: []genai.Part{genai.Text(systemPrompt)},
+			Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
 		}
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
@@ -290,7 +290,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 
 	// Убираем формирование fullPrompt
 	// fullPrompt := systemPrompt + "\n\nКонтекст для анализа:\n" + contextText
-	contentToSend := genai.Text(contextText) // Формируем контент только из contextText
+	contentToSend := genai.Text(utils.SanitizeUTF8(contextText)) // Формируем контент только из contextText
 
 	if c.debug {
 		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Текст для отправки: %s...", utils.TruncateString(contextText, 150))
@@ -338,7 +338,9 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 	model.SetMaxOutputTokens(8192) // Максимум для Gemini 1.5 Flash/Pro
 
 	// Формируем контент для Gemini: системный промпт и контекст как единый текст
-	fullText := systemPrompt + "\n\n---\n\n" + contextText
+	sanitizedSystemPrompt := utils.SanitizeUTF8(systemPrompt)
+	sanitizedContextText := utils.SanitizeUTF8(contextText)
+	fullText := sanitizedSystemPrompt + "\n\n---\n\n" + sanitizedContextText
 	part := genai.Text(fullText)
 
 	if c.debug {
@@ -461,11 +463,13 @@ func (c *Client) EmbedContent(text string) ([]float32, error) {
 		return nil, fmt.Errorf("модель эмбеддингов '%s' не найдена или не инициализирована", c.embeddingModelName)
 	}
 
+	sanitizedText := utils.SanitizeUTF8(text)
+
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Embed Запрос: Модель %s, Текст: %s...", c.embeddingModelName, utils.TruncateString(text, 50))
+		log.Printf("[DEBUG] Gemini Embed Запрос: Модель %s, Текст: %s...", c.embeddingModelName, utils.TruncateString(sanitizedText, 50))
 	}
 
-	res, err := em.EmbedContent(ctx, genai.Text(text))
+	res, err := em.EmbedContent(ctx, genai.Text(sanitizedText))
 	if err != nil {
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Embed Ошибка API: %v", err)
@@ -508,7 +512,7 @@ func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt stri
 	// Устанавливаем системный промпт
 	if systemPrompt != "" {
 		model.SystemInstruction = &genai.Content{
-			Parts: []genai.Part{genai.Text(systemPrompt)},
+			Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
 		}
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Image Запрос: Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
@@ -526,7 +530,7 @@ func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt stri
 
 	// Сначала добавляем текст (если есть)
 	if caption != "" {
-		parts = append(parts, genai.Text(caption))
+		parts = append(parts, genai.Text(utils.SanitizeUTF8(caption)))
 	}
 
 	// Добавляем изображение

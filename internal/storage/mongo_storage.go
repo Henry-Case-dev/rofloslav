@@ -176,7 +176,7 @@ func (ms *MongoStorage) getMessagesCollection(chatID int64) *mongo.Collection {
 		// Двойная проверка внутри блокировки
 		if !ms.indexedChats[targetName] {
 			if err := ms.ensureIndexesForCollection(coll); err != nil {
-				log.Printf("[WARN] Не удалось создать индексы для коллекции '%s': %v", targetName, err)
+				log.Printf("[WARN] Чат %d: Не удалось создать/проверить индексы для коллекции %s: %v", chatID, coll.Name(), err)
 				// Не фатально, продолжаем работу без индексов для этой коллекции
 			} else {
 				log.Printf("[INFO] Успешно созданы/проверены индексы для коллекции '%s'.", targetName)
