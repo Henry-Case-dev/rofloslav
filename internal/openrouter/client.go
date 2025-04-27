@@ -20,6 +20,10 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5" // Добавляем импорт
 )
 
+// markdownInstructions содержит инструкции по форматированию Markdown для LLM.
+// Обновлено для стандартного Markdown (не V2).
+const markdownInstructions = `\n\nИнструкции по форматированию ответа (Стандартный Markdown):\n- Используй *жирный текст* для выделения важных слов или фраз (одинарные звездочки).\n- Используй _курсив_ для акцентов или названий (одинарные подчеркивания).\n- Используй 'моноширинный текст' для кода, команд или технических терминов (одинарные кавычки).\n- НЕ используй зачеркивание (~~текст~~).\n- НЕ используй спойлеры (||текст||).\n- НЕ используй подчеркивание (__текст__).\n- Ссылки оформляй как [текст ссылки](URL).\n- Блоки кода оформляй тремя обратными кавычками:\n'''\nкод\n'''\nили\n'''go\nкод\n'''\n- Нумерованные списки начинай с \"1. \", \"2. \" и т.д.\n- Маркированные списки начинай с \"- \" или \"* \".\n- Для цитат используй \"> \".\n- Не нужно экранировать символы вроде '.', '-', '!', '(', ')', '+', '#'. Стандартный Markdown менее строгий.\n- Используй ТОЛЬКО указанный Markdown. Не используй HTML.\n`
+
 // Убедимся, что Client реализует интерфейс llm.LLMClient
 var _ llm.LLMClient = (*Client)(nil)
 
@@ -170,33 +174,46 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 
 // GenerateResponseFromTextContext генерирует ответ на основе промпта и готового текстового контекста
 func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextText string) (string, error) {
-	// Формируем сообщения для OpenRouter
-	messages := []ChatCompletionMessage{}
-	if systemPrompt != "" {
-		messages = append(messages, ChatCompletionMessage{Role: "system", Content: systemPrompt})
-	}
-	messages = append(messages, ChatCompletionMessage{Role: "user", Content: contextText})
-
-	// Настройки (можно вынести в конфиг или параметры)
-	temp := 1.0
-	// maxTokens := 8192 // OpenRouter не всегда корректно обрабатывает max_tokens, лучше не ставить или ставить с запасом
-	// topP := 0.95 // Можно добавить
-
-	requestPayload := ChatCompletionRequest{
-		Model:       c.modelName,
-		Messages:    messages,
-		Temperature: &temp,
-		// MaxTokens: &maxTokens, // Осторожно использовать
-		// TopP:        &topP,
+	messages := []ChatCompletionMessage{
+		{
+			Role:    "system",
+			Content: systemPrompt, // Используем оригинальный systemPrompt
+		},
+		{
+			Role:    "user",
+			Content: contextText,
+		},
 	}
 
-	return c.sendRequest(requestPayload)
+	request := ChatCompletionRequest{
+		Model:    c.modelName,
+		Messages: messages,
+		// Temperature, MaxTokens, TopP и т.д. могут быть добавлены сюда из конфига, если нужно
+	}
+
+	return c.sendRequest(request)
 }
 
 // GenerateArbitraryResponse генерирует ответ для задач без истории (саммари, анализ срача)
 func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText string) (string, error) {
-	// Используем ту же логику, что и GenerateResponseFromTextContext
-	return c.GenerateResponseFromTextContext(systemPrompt, contextText)
+	messages := []ChatCompletionMessage{
+		{
+			Role:    "system",
+			Content: systemPrompt, // Используем оригинальный systemPrompt
+		},
+		{
+			Role:    "user",
+			Content: contextText,
+		},
+	}
+
+	request := ChatCompletionRequest{
+		Model:    c.modelName,
+		Messages: messages,
+		// Temperature, MaxTokens, TopP и т.д. могут быть добавлены сюда из конфига, если нужно
+	}
+
+	return c.sendRequest(request)
 }
 
 // sendRequest - внутренняя функция для отправки запроса к OpenRouter API

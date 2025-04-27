@@ -172,13 +172,13 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 		}
 
 		if queryText != "" {
-			log.Printf("[formatHistory LTM DEBUG] Chat %d: Поиск LTM по запросу: '%s...', K=%d", chatID, truncateString(queryText, 50), cfg.LongTermMemoryFetchK)
+			log.Printf("[formatHistory LTM DEBUG] Chat %d: Поиск LTM по запросу: '%s...', K=%d", chatID, utils.TruncateString(queryText, 50), cfg.LongTermMemoryFetchK)
 			relevantMsgs, searchErr := store.SearchRelevantMessages(chatID, queryText, cfg.LongTermMemoryFetchK)
 			if searchErr != nil {
 				log.Printf("[ERROR][formatHistory LTM] Ошибка поиска релевантных сообщений для чата %d (запрос по последнему сообщению): %v", chatID, searchErr)
 			} else if len(relevantMsgs) > 0 {
 				log.Printf("[formatHistory LTM DEBUG] Chat %d: Найдено %d релевантных сообщений.", chatID, len(relevantMsgs))
-				formattedHistory.WriteString(fmt.Sprintf("[Контекст долгосрочной памяти для '%s...']:\n", truncateString(queryText, 30)))
+				formattedHistory.WriteString(fmt.Sprintf("[Контекст долгосрочной памяти для '%s...']:\n", utils.TruncateString(queryText, 30)))
 				// Сортируем по дате от старых к новым
 				sort.SliceStable(relevantMsgs, func(i, j int) bool {
 					// Сравнение может потребовать парсинга или использования временных меток, если они есть

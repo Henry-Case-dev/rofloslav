@@ -226,13 +226,25 @@ func (b *Bot) sendDirectResponse(chatID int64, message *tgbotapi.Message) {
 		responseText = responseText[:4093] + "..."
 	}
 
-	// Отправляем ответ
-	msg := tgbotapi.NewMessage(chatID, responseText)
-	msg.ReplyToMessageID = message.MessageID
-	_, err = b.api.Send(msg)
-	if err != nil {
-		log.Printf("[ERROR][DR] Chat %d: Ошибка при отправке сообщения: %v", chatID, err)
+	if responseText == "" {
+		log.Printf("[WARN][DR] Chat %d: LLM вернул пустой ответ.", chatID)
+		b.sendErrorReply(chatID, message.MessageID, "LLM вернул пустой ответ")
+		return
 	}
+
+	// 5. Отправка ответа с ReplyToMessageID
+	msgToSend := tgbotapi.NewMessage(chatID, responseText)
+	msgToSend.ReplyToMessageID = message.MessageID
+	_, errSend := b.api.Send(msgToSend)
+	if errSend != nil {
+		log.Printf("[ERROR][DR] Chat %d: Ошибка отправки прямого ответа: %v", chatID, errSend)
+		// Можно добавить отправку сообщения об ошибке, если не удалось отправить основной ответ
+		// b.sendErrorReply(chatID, message.MessageID, "Не удалось отправить прямой ответ")
+	}
+
+	// Логирование времени выполнения
+	duration := time.Since(startTime)
+	log.Printf("[DEBUG][Timing] Генерация DirectResponse (ReplyID: %d) для чата %d заняла %v", message.MessageID, chatID, duration)
 }
 
 // sendAIResponse генерирует и отправляет обычный AI ответ в чат

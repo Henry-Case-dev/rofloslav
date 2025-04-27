@@ -12,6 +12,10 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// markdownInstructions содержит инструкции по форматированию Markdown для LLM.
+// Скопировано из llm/client.go и обновлено для стандартного Markdown.
+const markdownInstructions = `\n\nИнструкции по форматированию ответа (Стандартный Markdown):\n- Используй *жирный текст* для выделения важных слов или фраз (одинарные звездочки).\n- Используй _курсив_ для акцентов или названий (одинарные подчеркивания).\n- Используй 'моноширинный текст' для кода, команд или технических терминов (одинарные кавычки).\n- НЕ используй зачеркивание (~~текст~~).\n- НЕ используй спойлеры (||текст||).\n- НЕ используй подчеркивание (__текст__).\n- Ссылки оформляй как [текст ссылки](URL).\n- Блоки кода оформляй тремя обратными кавычками:\n'''\nкод\n'''\nили\n'''go\nкод\n'''\n- Нумерованные списки начинай с \"1. \", \"2. \" и т.д.\n- Маркированные списки начинай с \"- \" или \"* \".\n- Для цитат используй \"> \".\n- Не нужно экранировать символы вроде '.', '-', '!', '(', ')', '+', '#'. Стандартный Markdown менее строгий.\n- Используй ТОЛЬКО указанный Markdown. Не используй HTML.\n`
+
 // Load загружает конфигурацию из переменных окружения или использует значения по умолчанию
 func Load() (*Config, error) {
 	// Сначала загружаем секреты, если файл существует
@@ -31,7 +35,7 @@ func Load() (*Config, error) {
 	defaultPrompt := getEnvOrDefault("DEFAULT_PROMPT", "Ты простой бот.")
 	directPrompt := getEnvOrDefault("DIRECT_PROMPT", "Ответь кратко.")
 	dailyTakePrompt := getEnvOrDefault("DAILY_TAKE_PROMPT", "Какая тема дня?")
-	summaryPrompt := getEnvOrDefault("SUMMARY_PROMPT", "Сделай саммари.")
+	summaryPrompt := getEnvOrDefault("SUMMARY_PROMPT", "Создай краткое саммари следующего диалога:")
 	rateLimitErrorMsg := getEnvOrDefault("RATE_LIMIT_ERROR_MESSAGE", "Слишком часто! Попробуйте позже.")
 	timeZone := getEnvOrDefault("TIME_ZONE", "UTC")
 	dailyTakeTimeStr := getEnvOrDefault("DAILY_TAKE_TIME", "19")
@@ -93,7 +97,7 @@ func Load() (*Config, error) {
 	storageTypeStr := strings.ToLower(getEnvOrDefault("STORAGE_TYPE", string(StorageTypeMongo))) // По умолчанию Mongo
 	adminUsernamesStr := getEnvOrDefault("ADMIN_USERNAMES", "lightnight")                        // По умолчанию lightnight
 	welcomePrompt := getEnvOrDefault("WELCOME_PROMPT", "Привет, чат! Я Рофлослав, ваш новый повелитель сарказма. Погнали нахуй.")
-	voiceFormatPrompt := getEnvOrDefault("VOICE_FORMAT_PROMPT", "Format the following recognized text with punctuation and paragraphs:\n")
+	voiceFormatPrompt := getEnvOrDefault("VOICE_FORMAT_PROMPT", "Отформатируй следующий распознанный текст голосового сообщения, исправив пунктуацию и заглавные буквы, но сохранив оригинальный смысл и стиль:")
 	voiceTranscriptionEnabledDefaultStr := getEnvOrDefault("VOICE_TRANSCRIPTION_ENABLED_DEFAULT", "true")
 	directLimitEnabledStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_ENABLED_DEFAULT", "true")
 	directLimitCountStr := getEnvOrDefault("DIRECT_REPLY_LIMIT_COUNT_DEFAULT", "2")
@@ -435,6 +439,13 @@ func Load() (*Config, error) {
 	cfg.AutoBioMinMessagesForAnalysis = parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS", "10"), 10)
 	cfg.AutoBioMaxMessagesForAnalysis = parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MAX_MESSAGES_FOR_ANALYSIS", "2500"), 2500)
 	// --- Конец загрузки настроек Auto Bio ---
+
+	// --- Добавляем инструкции Markdown к нужным промптам ---
+	if cfg.SummaryPrompt != "" {
+		cfg.SummaryPrompt += markdownInstructions
+		log.Println("[Config Load] Добавлены инструкции Markdown к SummaryPrompt.")
+	}
+	// --- Конец добавления инструкций ---
 
 	logLoadedConfig(&cfg) // Выводим лог после загрузки всех переменных
 

@@ -19,6 +19,10 @@ import (
 
 var botUserID int64
 
+// markdownInstructions содержит инструкции по форматированию Markdown для LLM.
+// Обновлено для стандартного Markdown (не V2).
+const markdownInstructions = `\n\nИнструкции по форматированию ответа (Стандартный Markdown):\n- Используй *жирный текст* для выделения важных слов или фраз (одинарные звездочки).\n- Используй _курсив_ для акцентов или названий (одинарные подчеркивания).\n- Используй 'моноширинный текст' для кода, команд или технических терминов (одинарные кавычки).\n- НЕ используй зачеркивание (~~текст~~).\n- НЕ используй спойлеры (||текст||).\n- НЕ используй подчеркивание (__текст__).\n- Ссылки оформляй как [текст ссылки](URL).\n- Блоки кода оформляй тремя обратными кавычками:\n'''\nкод\n'''\nили\n'''go\nкод\n'''\n- Нумерованные списки начинай с \"1. \", \"2. \" и т.д.\n- Маркированные списки начинай с \"- \" или \"* \".\n- Для цитат используй \"> \".\n- Не нужно экранировать символы вроде '.', '-', '!', '(', ')', '+', '#'. Стандартный Markdown менее строгий.\n- Используй ТОЛЬКО указанный Markdown. Не используй HTML.\n`
+
 // Client для взаимодействия с Gemini API
 type Client struct {
 	genaiClient        *genai.Client
@@ -278,7 +282,7 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 	model.SetTopP(0.95)
 	model.SetMaxOutputTokens(8192)
 
-	// Устанавливаем системный промпт через специальное поле
+	// Устанавливаем системный промпт через специальное поле БЕЗ ИНСТРУКЦИЙ MARKDOWN
 	if systemPrompt != "" {
 		model.SystemInstruction = &genai.Content{
 			Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
@@ -288,17 +292,14 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 		}
 	}
 
-	// Убираем формирование fullPrompt
-	// fullPrompt := systemPrompt + "\n\nКонтекст для анализа:\n" + contextText
-	contentToSend := genai.Text(utils.SanitizeUTF8(contextText)) // Формируем контент только из contextText
+	// Формируем контент только из contextText
+	contentToSend := genai.Text(utils.SanitizeUTF8(contextText))
 
 	if c.debug {
 		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Текст для отправки: %s...", utils.TruncateString(contextText, 150))
-		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Модель %s, Temp: %v, TopP: %v, MaxTokens: %v",
-			c.modelName, model.Temperature, model.TopP, model.MaxOutputTokens)
 	}
 
-	// Отправляем сообщение (без истории чата), только контекст
+	// Отправляем запрос
 	resp, err := model.GenerateContent(ctx, contentToSend)
 	if err != nil {
 		if c.debug {
@@ -337,17 +338,27 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 	model.SetTemperature(1.0)      // Можно сделать настраиваемым
 	model.SetMaxOutputTokens(8192) // Максимум для Gemini 1.5 Flash/Pro
 
-	// Формируем контент для Gemini: системный промпт и контекст как единый текст
+	// Формируем контент для Gemini: СИСТЕМНЫЙ ПРОМПТ БЕЗ ИНСТРУКЦИЙ MARKDOWN
 	sanitizedSystemPrompt := utils.SanitizeUTF8(systemPrompt)
 	sanitizedContextText := utils.SanitizeUTF8(contextText)
-	fullText := sanitizedSystemPrompt + "\n\n---\n\n" + sanitizedContextText
-	part := genai.Text(fullText)
+	// fullText := sanitizedSystemPrompt + "\n\n---\n\n" + sanitizedContextText // СТАРЫЙ КОД С ИНСТРУКЦИЯМИ
 
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос (Text Context): Модель %s", c.modelName)
+	// Новый подход: создаем контент из частей - сначала системный, потом пользовательский
+	cs := model.StartChat()
+	cs.History = []*genai.Content{
+		{
+			Parts: []genai.Part{genai.Text(sanitizedSystemPrompt)},
+			Role:  "model", // Системный промпт имитируем как сообщение модели?
+		},
 	}
 
-	resp, err := model.GenerateContent(ctx, part) // Передаем одну часть
+	if c.debug {
+		log.Printf("[DEBUG] Gemini Запрос (Text Context): System Prompt Part: %s...", utils.TruncateString(sanitizedSystemPrompt, 100))
+		log.Printf("[DEBUG] Gemini Запрос (Text Context): Context Text Part: %s...", utils.TruncateString(sanitizedContextText, 150))
+	}
+
+	// Отправляем контекст как пользовательское сообщение
+	resp, err := cs.SendMessage(ctx, genai.Text(sanitizedContextText))
 	if err != nil {
 		log.Printf("[ERROR] Gemini Ошибка API (Text Context): %v", err)
 		// Добавляем парсинг специфичной ошибки Gemini, если возможно
