@@ -52,15 +52,21 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 	var editText, sendText string // Тексты для редактирования и отправки
 	var parseMode string = ""     // ParseMode для отправки/редактирования
 
-	// 2. Получаем сообщения за последние 24 часа (или с момента последнего авто-саммари, если есть)
+	// Получаем сообщения за последние 24 часа (или с момента последнего авто-саммари, если есть)
 	sinceTime := time.Now().Add(-24 * time.Hour)
-	b.settingsMutex.RLock()
-	if settings, exists := b.chatSettings[chatID]; exists {
-		if !settings.LastAutoSummaryTime.IsZero() && settings.LastAutoSummaryTime.After(sinceTime) {
-			sinceTime = settings.LastAutoSummaryTime
+	// Убираем чтение настроек здесь, т.к. sinceTime больше не меняется
+	/*
+		b.settingsMutex.RLock()
+		if _, exists := b.chatSettings[chatID]; exists { // Используем _ вместо settings
+			// Закомментируем этот блок, чтобы sinceTime всегда был -24h
+			/*
+			if !settings.LastAutoSummaryTime.IsZero() && settings.LastAutoSummaryTime.After(sinceTime) {
+				sinceTime = settings.LastAutoSummaryTime
+			}
+			* /
 		}
-	}
-	b.settingsMutex.RUnlock()
+		b.settingsMutex.RUnlock()
+	*/
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

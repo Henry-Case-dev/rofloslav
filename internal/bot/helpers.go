@@ -151,6 +151,10 @@ func formatHistoryWithProfiles(chatID int64, messages []*tgbotapi.Message, store
 			if p.Bio != "" {
 				formattedHistory.WriteString(fmt.Sprintf("  Bio: %s\n", p.Bio))
 			}
+			// Добавляем AutoBio, если оно есть
+			if p.AutoBio != "" {
+				formattedHistory.WriteString(fmt.Sprintf("  AutoBio: %s\n", p.AutoBio))
+			}
 			formattedHistory.WriteString(fmt.Sprintf("  Последнее сообщение: %s\n", p.LastSeen.In(loc).Format("2006-01-02 15:04")))
 		}
 	} else {
