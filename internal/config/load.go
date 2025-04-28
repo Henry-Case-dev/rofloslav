@@ -45,10 +45,10 @@ func Load() (*Config, error) {
 	debugStr := getEnvOrDefault("DEBUG", "false")
 
 	// --- Загрузка новых переменных для настроек по умолчанию ---
-	defaultConvStyle := getEnvOrDefault("DEFAULT_CONVERSATION_STYLE", "balanced") // Например, "balanced", "creative", "precise"
-	defaultTempStr := getEnvOrDefault("DEFAULT_TEMPERATURE", "0.7")
-	defaultModel := getEnvOrDefault("DEFAULT_MODEL", "") // Пусто по умолчанию, будет определен ниже на основе провайдера
-	defaultSafety := getEnvOrDefault("DEFAULT_SAFETY_THRESHOLD", "BLOCK_MEDIUM_AND_ABOVE")
+	defaultConvStyle := getEnvOrDefault("DEFAULT_CONVERSATION_STYLE", "default") // default|creative|precise
+	defaultTempStr := getEnvOrDefault("DEFAULT_TEMPERATURE", "0.7")              // 0.0 - 2.0
+	defaultModel := getEnvOrDefault("DEFAULT_MODEL", "")                         // По умолчанию пусто - берется из провайдера
+	defaultSafety := getEnvOrDefault("DEFAULT_SAFETY_THRESHOLD", "BLOCK_NONE")   // BLOCK_NONE|BLOCK_LOW|BLOCK_MEDIUM|BLOCK_HIGH
 
 	// --- Загрузка переменных Gemini ---
 	geminiAPIKey := getEnvOrDefault("GEMINI_API_KEY", "")
@@ -65,11 +65,20 @@ func Load() (*Config, error) {
 	openRouterSiteURL := getEnvOrDefault("OPENROUTER_SITE_URL", "")
 	openRouterSiteTitle := getEnvOrDefault("OPENROUTER_SITE_TITLE", "")
 
+	// --- Загрузка переменных для донатов ---
+	donatePrompt := getEnvOrDefault("DONATE_PROMPT", "Расскажи, что для продолжения работы бота требуются донаты. Сделай мотивирующий призыв с юмором пожертвовать средства разработчику. Упомяни, что платежи принимаются через https://www.donationalerts.com/r/lightnight")
+	donateTimeHoursStr := getEnvOrDefault("DONATE_TIME_HOURS", "24") // По умолчанию раз в сутки
+	donateTimeHours, err := strconv.Atoi(donateTimeHoursStr)
+	if err != nil || donateTimeHours < 0 {
+		log.Printf("Ошибка парсинга DONATE_TIME_HOURS: %v, используем 24", err)
+		donateTimeHours = 24
+	}
+
 	// --- Загрузка промптов для настроек и срачей ---
-	classifyDirectMessagePrompt := getEnvOrDefault("CLASSIFY_DIRECT_MESSAGE_PROMPT", "Классифицируй это сообщение: serious или casual?")
-	seriousDirectPrompt := getEnvOrDefault("SERIOUS_DIRECT_PROMPT", "Ответь серьезно.")
-	promptEnterMin := getEnvOrDefault("PROMPT_ENTER_MIN_MESSAGES", "Введите минимальный интервал:")
-	promptEnterMax := getEnvOrDefault("PROMPT_ENTER_MAX_MESSAGES", "Введите максимальный интервал:")
+	classifyDirectMessagePrompt := getEnvOrDefault("CLASSIFY_DIRECT_MESSAGE_PROMPT", "Это обращение требует серьезного ответа? Ответь только yes или no. Серьезное обращение: запрос совета, запрос информации, или человек явно расстроен.")
+	seriousDirectPrompt := getEnvOrDefault("SERIOUS_DIRECT_PROMPT", "Ответь на вопрос человека, убедись что ответ содержит полезную информацию и серьезный по тону.")
+	promptEnterMin := getEnvOrDefault("PROMPT_ENTER_MIN_MESSAGES", "Введите минимальное количество сообщений:")
+	promptEnterMax := getEnvOrDefault("PROMPT_ENTER_MAX_MESSAGES", "Введите максимальное количество сообщений:")
 	promptEnterDailyTime := getEnvOrDefault("PROMPT_ENTER_DAILY_TIME", "Введите час для темы дня (0-23):")
 	promptEnterSummaryInterval := getEnvOrDefault("PROMPT_ENTER_SUMMARY_INTERVAL", "Введите интервал авто-саммари (в часах, 0=выкл):")
 	summaryIntervalStr := getEnvOrDefault("SUMMARY_INTERVAL_HOURS", "2") // По умолчанию 2 часа
@@ -352,21 +361,25 @@ func Load() (*Config, error) {
 		SummaryPrompt:               summaryPrompt,
 		RateLimitStaticText:         getEnvOrDefault("RATE_LIMIT_STATIC_TEXT", "Слишком часто! Попробуйте позже."),
 		RateLimitPrompt:             getEnvOrDefault("RATE_LIMIT_PROMPT", "Скажи пользователю, что он слишком часто нажимает кнопку."),
-		PromptEnterMinMessages:      promptEnterMin,
-		PromptEnterMaxMessages:      promptEnterMax,
-		PromptEnterDailyTime:        promptEnterDailyTime,
-		PromptEnterSummaryInterval:  promptEnterSummaryInterval,
-		SRACH_WARNING_PROMPT:        srachWarningPrompt,
-		SRACH_ANALYSIS_PROMPT:       srachAnalysisPrompt,
-		SRACH_CONFIRM_PROMPT:        srachConfirmPrompt,
-		SrachKeywords:               srachKeywordsList,
-		DailyTakeTime:               dailyTakeTime,
-		TimeZone:                    timeZone,
-		SummaryIntervalHours:        summaryIntervalHours,
-		MinMessages:                 minMsg,
-		MaxMessages:                 maxMsg,
-		ContextWindow:               contextWindow,
-		Debug:                       debug,
+		// --- Настройки донатов ---
+		DonatePrompt:    donatePrompt,
+		DonateTimeHours: donateTimeHours,
+		// --- Конец настроек донатов ---
+		PromptEnterMinMessages:     promptEnterMin,
+		PromptEnterMaxMessages:     promptEnterMax,
+		PromptEnterDailyTime:       promptEnterDailyTime,
+		PromptEnterSummaryInterval: promptEnterSummaryInterval,
+		SRACH_WARNING_PROMPT:       srachWarningPrompt,
+		SRACH_ANALYSIS_PROMPT:      srachAnalysisPrompt,
+		SRACH_CONFIRM_PROMPT:       srachConfirmPrompt,
+		SrachKeywords:              srachKeywordsList,
+		DailyTakeTime:              dailyTakeTime,
+		TimeZone:                   timeZone,
+		SummaryIntervalHours:       summaryIntervalHours,
+		MinMessages:                minMsg,
+		MaxMessages:                maxMsg,
+		ContextWindow:              contextWindow,
+		Debug:                      debug,
 		// Заполняем новые поля для БД с префиксом Postgresql
 		PostgresqlHost:     dbHost,
 		PostgresqlPort:     dbPort,

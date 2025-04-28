@@ -1,11 +1,16 @@
 package bot
 
 import (
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/storage"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // scheduleDailyTake запускает планировщик для ежедневного тейка
@@ -132,6 +137,182 @@ func (b *Bot) scheduleAutoSummary() {
 			return
 		}
 	}
+}
+
+// scheduleDonate запускает планировщик для отправки сообщений о донате
+func (b *Bot) scheduleDonate() {
+	if b.config.DonateTimeHours <= 0 {
+		log.Println("[Scheduler] Планировщик донатов не запущен (DonateTimeHours <= 0).")
+		return
+	}
+
+	log.Println("[Scheduler DEBUG] Запущен цикл планировщика Donate.")
+
+	// Период отправки сообщений о донате (из конфига)
+	donateInterval := time.Duration(b.config.DonateTimeHours) * time.Hour
+
+	// Отправляем первое сообщение о донате через 30 секунд после запуска
+	initialDelay := 30 * time.Second
+	time.Sleep(initialDelay)
+
+	// Отправляем первое сообщение о донате
+	b.sendDonateMessageToAllChats()
+
+	// Основной цикл планировщика
+	for {
+		// Проверяем, не остановлен ли бот
+		select {
+		case <-b.stop:
+			log.Println("Остановка планировщика Donate...")
+			return
+		default:
+			// Продолжаем работу
+		}
+
+		// Ожидаем до следующей отправки
+		timer := time.NewTimer(donateInterval)
+		select {
+		case <-timer.C:
+			// Время пришло, отправляем сообщение о донате
+			b.sendDonateMessageToAllChats()
+		case <-b.stop:
+			// Остановка во время ожидания
+			timer.Stop() // Останавливаем таймер
+			log.Println("Планировщик Donate остановлен во время ожидания.")
+			return
+		}
+	}
+}
+
+// sendDonateMessageToAllChats отправляет сообщение о донате с фотографией во все активные чаты
+func (b *Bot) sendDonateMessageToAllChats() {
+	if b.config.Debug {
+		log.Printf("[DEBUG] Отправка сообщений о донате во все активные чаты")
+	}
+
+	// Проверяем, есть ли промпт для доната
+	if b.config.DonatePrompt == "" {
+		log.Printf("[WARNING] DonatePrompt не задан в конфигурации, сообщения о донате не будут отправлены")
+		return
+	}
+
+	// Генерируем сообщение о донате
+	donateMessage, err := b.llm.GenerateArbitraryResponse(b.config.DonatePrompt, "")
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при генерации сообщения о донате: %v", err)
+		return
+	}
+
+	// Форматируем сообщение с добавлением статичной фразы
+	message := donateMessage + "\n\n[Подкинуть деньжат](https://donate.stream/rofloslav)"
+
+	// Выбираем случайное изображение из папки donate_images
+	imageFile, err := b.getRandomDonateImage()
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при выборе изображения для доната: %v", err)
+		// Если не удалось получить изображение, отправляем только текст
+		b.sendDonateTextToAllChats(message)
+		return
+	}
+
+	// Отправляем во все активные чаты
+	b.settingsMutex.RLock()
+	activeChatIDs := make([]int64, 0, len(b.chatSettings))
+	for chatID, settings := range b.chatSettings {
+		if settings.Active {
+			activeChatIDs = append(activeChatIDs, chatID)
+		}
+	}
+	b.settingsMutex.RUnlock()
+
+	activeCount := len(activeChatIDs)
+	if b.config.Debug {
+		log.Printf("[DEBUG] Найдено %d активных чатов для отправки сообщения о донате.", activeCount)
+	}
+
+	var wg sync.WaitGroup
+	for _, chatID := range activeChatIDs {
+		wg.Add(1)
+		go func(cid int64) {
+			defer wg.Done()
+			err := b.sendPhotoWithCaption(cid, imageFile, message)
+			if err != nil {
+				log.Printf("[ERROR] Ошибка отправки фото с сообщением о донате в чат %d: %v", cid, err)
+				// При ошибке пробуем отправить только текст
+				b.sendReplyMarkdown(cid, "💰 "+message)
+			}
+		}(chatID)
+	}
+	wg.Wait() // Ждем завершения отправки во все чаты
+
+	if b.config.Debug {
+		log.Printf("[DEBUG] Сообщение о донате отправлено в %d активных чатов.", activeCount)
+	}
+}
+
+// getRandomDonateImage возвращает путь к случайному изображению из папки donate_images
+func (b *Bot) getRandomDonateImage() (string, error) {
+	// Открываем директорию с изображениями для донатов
+	donateDir := "donate_images"
+	files, err := os.ReadDir(donateDir)
+	if err != nil {
+		return "", fmt.Errorf("ошибка чтения директории %s: %w", donateDir, err)
+	}
+
+	// Фильтруем только PNG и JPG файлы
+	var imageFiles []string
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		name := file.Name()
+		if strings.HasSuffix(strings.ToLower(name), ".png") ||
+			strings.HasSuffix(strings.ToLower(name), ".jpg") ||
+			strings.HasSuffix(strings.ToLower(name), ".jpeg") {
+			imageFiles = append(imageFiles, filepath.Join(donateDir, name))
+		}
+	}
+
+	if len(imageFiles) == 0 {
+		return "", fmt.Errorf("в директории %s нет подходящих изображений (PNG или JPG)", donateDir)
+	}
+
+	// Выбираем случайное изображение
+	randomIndex := b.randSource.Intn(len(imageFiles))
+	return imageFiles[randomIndex], nil
+}
+
+// sendPhotoWithCaption отправляет фото с указанной подписью в чат
+func (b *Bot) sendPhotoWithCaption(chatID int64, imagePath string, caption string) error {
+	photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(imagePath))
+	photo.Caption = caption
+	photo.ParseMode = "Markdown"
+
+	_, err := b.api.Send(photo)
+	return err
+}
+
+// sendDonateTextToAllChats отправляет только текстовое сообщение о донате во все активные чаты
+func (b *Bot) sendDonateTextToAllChats(message string) {
+	b.settingsMutex.RLock()
+	activeChatIDs := make([]int64, 0, len(b.chatSettings))
+	for chatID, settings := range b.chatSettings {
+		if settings.Active {
+			activeChatIDs = append(activeChatIDs, chatID)
+		}
+	}
+	b.settingsMutex.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, chatID := range activeChatIDs {
+		wg.Add(1)
+		go func(cid int64) {
+			defer wg.Done()
+			b.sendReplyMarkdown(cid, "💰 "+message)
+		}(chatID)
+	}
+	wg.Wait()
 }
 
 // runAutoSummaryForAllChats проверяет и запускает авто-саммари для всех чатов, если пришло время

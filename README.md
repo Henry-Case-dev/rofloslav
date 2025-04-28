@@ -81,3 +81,83 @@
 *   Улучшение алгоритма детекции и анализа срачей.
 *   Добавление большего количества команд и настроек (например, управление профилями через меню).
 *   Рефакторинг и оптимизация кода.
+
+## Параметры конфигурации
+
+Конфигурация загружается из переменных окружения или из файла `.env`. Основные параметры:
+
+### Основные настройки
+
+- `TELEGRAM_TOKEN` - токен Telegram бота
+- `LLM_PROVIDER` - провайдер LLM: `Gemini`, `DeepSeek` или `OpenRouter`
+- `DEFAULT_PROMPT` - промпт по умолчанию
+- `DIRECT_PROMPT` - промпт для прямых обращений
+- `DAILY_TAKE_PROMPT` - промпт для ежедневного тейка
+- `SUMMARY_PROMPT` - промпт для саммари диалога
+- `RATE_LIMIT_ERROR_MESSAGE` - сообщение об ошибке при превышении лимита
+
+### Настройки времени и интервалов
+
+- `TIME_ZONE` - часовой пояс (например, `Europe/Moscow`)
+- `DAILY_TAKE_TIME` - час дня для отправки ежедневного тейка (0-23)
+- `MIN_MESSAGES` - минимальное количество сообщений перед ответом
+- `MAX_MESSAGES` - максимальное количество сообщений перед ответом
+- `CONTEXT_WINDOW` - размер контекстного окна (в токенах)
+- `SUMMARY_INTERVAL_HOURS` - интервал автоматического саммари в часах
+
+### Настройки донатов
+
+- `DONATE_PROMPT` - промпт для генерации сообщения о донате
+- `DONATE_TIME_HOURS` - интервал отправки сообщений о донате в часах
+
+### Настройки Gemini
+
+- `GEMINI_API_KEY` - API ключ Gemini
+- `GEMINI_MODEL_NAME` - название модели Gemini
+
+### Настройки DeepSeek
+
+- `DEEPSEEK_API_KEY` - API ключ DeepSeek
+- `DEEPSEEK_MODEL_NAME` - название модели DeepSeek
+- `DEEPSEEK_BASE_URL` - базовый URL для DeepSeek (опционально)
+
+### Настройки OpenRouter
+
+- `OPENROUTER_API_KEY` - API ключ OpenRouter
+- `OPENROUTER_MODEL_NAME` - название модели OpenRouter
+- `OPENROUTER_SITE_URL` - URL сайта для HTTP-Referer (опционально)
+- `OPENROUTER_SITE_TITLE` - Заголовок сайта для X-Title (опционально)
+
+### Настройки хранилища
+
+- `STORAGE_TYPE` - тип хранилища: `file`, `postgres` или `mongo`
+
+#### Настройки PostgreSQL
+
+- `POSTGRESQL_HOST` - хост PostgreSQL
+- `POSTGRESQL_PORT` - порт PostgreSQL
+- `POSTGRESQL_USER` - пользователь PostgreSQL
+- `POSTGRESQL_PASSWORD` - пароль PostgreSQL
+- `POSTGRESQL_DBNAME` - имя базы данных PostgreSQL
+
+#### Настройки MongoDB
+
+- `MONGODB_URI` - URI подключения к MongoDB
+- `MONGODB_DBNAME` - имя базы данных MongoDB
+- `MONGODB_MESSAGES_COLLECTION` - коллекция сообщений
+- `MONGODB_USER_PROFILES_COLLECTION` - коллекция профилей пользователей
+- `MONGODB_SETTINGS_COLLECTION` - коллекция настроек
+
+## Сборка и запуск
+
+```bash
+go build
+./rofloslav
+```
+
+Или с использованием Docker:
+
+```bash
+docker build -t rofloslav .
+docker run -p 80:80 --env-file .env rofloslav
+```

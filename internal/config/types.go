@@ -56,6 +56,10 @@ type Config struct {
 	// Настройки поведения бота
 	RateLimitStaticText string // Статический текст для сообщения о лимите
 	RateLimitPrompt     string // Промпт для LLM для сообщения о лимите
+	// --- Настройки донатов ---
+	DonatePrompt    string // Промпт для генерации сообщения о донате
+	DonateTimeHours int    // Интервал отправки сообщений о донате в часах
+	// --- Конец настроек донатов ---
 	// Промпты для ввода настроек
 	PromptEnterMinMessages     string
 	PromptEnterMaxMessages     string

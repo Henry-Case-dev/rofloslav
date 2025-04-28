@@ -200,6 +200,14 @@ func (b *Bot) Start() error {
 		log.Println("Автоматическое саммари отключено (SUMMARY_INTERVAL_HOURS <= 0).")
 	}
 
+	// Запуск планировщика для отправки сообщений о донате
+	if b.config.DonateTimeHours > 0 {
+		go b.scheduleDonate()
+		log.Printf("Запущен планировщик сообщений о донате с интервалом %d часов", b.config.DonateTimeHours)
+	} else {
+		log.Println("Отправка сообщений о донате отключена (DONATE_TIME_HOURS <= 0).")
+	}
+
 	// Запуск планировщика Auto Bio Analysis
 	go b.scheduleAutoBioAnalysis()
 
