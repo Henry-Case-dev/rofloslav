@@ -53,6 +53,10 @@ func Load() (*Config, error) {
 	// --- Загрузка переменных Gemini ---
 	geminiAPIKey := getEnvOrDefault("GEMINI_API_KEY", "")
 	geminiModelName := getEnvOrDefault("GEMINI_MODEL_NAME", "gemini-1.5-flash-latest")
+	// --- Загрузка резервного ключа Gemini ---
+	geminiAPIKeyReserve := getEnvOrDefault("GEMINI_API_KEY_RESERVE", "")
+	geminiKeyRotationTimeHoursStr := getEnvOrDefault("GEMINI_KEY_ROTATION_TIME_HOURS", "6") // По умолчанию 6 часов
+	geminiKeyRotationTimeHours := parseIntOrDefault(geminiKeyRotationTimeHoursStr, 6)
 
 	// --- Загрузка переменных DeepSeek ---
 	deepSeekAPIKey := getEnvOrDefault("DEEPSEEK_API_KEY", "")
@@ -114,6 +118,7 @@ func Load() (*Config, error) {
 	directLimitPrompt := getEnvOrDefault("DIRECT_REPLY_LIMIT_PROMPT", "Хватит меня дергать.")
 	promptEnterDirectCount := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_COUNT", "Введите макс. кол-во обращений за период:")
 	promptEnterDirectDuration := getEnvOrDefault("PROMPT_ENTER_DIRECT_LIMIT_DURATION", "Введите период лимита в минутах:")
+	errorMessageAutoDeleteSecondsStr := getEnvOrDefault("ERROR_MESSAGE_AUTO_DELETE_SECONDS", "5") // По умолчанию 5 секунд
 
 	// --- Загрузка настроек бэкфилла --- (ДОБАВЛЕНО)
 	backfillBatchSizeStr := getEnvOrDefault("BACKFILL_BATCH_SIZE", "200")
@@ -129,6 +134,8 @@ func Load() (*Config, error) {
 	log.Printf("[Config Load] --- Gemini Settings ---")
 	log.Printf("[Config Load] GEMINI_API_KEY: ...%s (len %d)", utils.TruncateString(geminiAPIKey, 5), len(geminiAPIKey))
 	log.Printf("[Config Load] GEMINI_MODEL_NAME: %s", geminiModelName)
+	log.Printf("[Config Load] GEMINI_API_KEY_RESERVE: ...%s (len %d)", utils.TruncateString(geminiAPIKeyReserve, 5), len(geminiAPIKeyReserve))
+	log.Printf("[Config Load] GEMINI_KEY_ROTATION_TIME_HOURS: %s", geminiKeyRotationTimeHoursStr)
 	log.Printf("[Config Load] --- DeepSeek Settings ---")
 	log.Printf("[Config Load] DEEPSEEK_API_KEY: ...%s (len %d)", utils.TruncateString(deepSeekAPIKey, 5), len(deepSeekAPIKey))
 	log.Printf("[Config Load] DEEPSEEK_MODEL_NAME: %s", deepSeekModelName)
@@ -185,6 +192,7 @@ func Load() (*Config, error) {
 	// --- Лог настроек анализа фотографий ---
 	log.Printf("[Config Load] PHOTO_ANALYSIS_ENABLED: %s", photoAnalysisEnabledStr)
 	log.Printf("[Config Load] PHOTO_ANALYSIS_PROMPT: %s...", utils.TruncateString(photoAnalysisPrompt, 50))
+	log.Printf("[Config Load] ERROR_MESSAGE_AUTO_DELETE_SECONDS: %s", errorMessageAutoDeleteSecondsStr)
 	// --- Конец логирования ---
 
 	// --- Валидация LLM Provider ---
@@ -227,49 +235,17 @@ func Load() (*Config, error) {
 	}
 	log.Printf("Загружено %d ключевых слов для детекции срачей.", len(srachKeywordsList))
 
-	// --- Парсинг числовых значений ---
-	dailyTakeTime, err := strconv.Atoi(dailyTakeTimeStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга DAILY_TAKE_TIME: %v, используем 19", err)
-		dailyTakeTime = 19
-	}
-	minMsg, err := strconv.Atoi(minMsgStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга MIN_MESSAGES: %v, используем 10", err)
-		minMsg = 10
-	}
-	maxMsg, err := strconv.Atoi(maxMsgStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга MAX_MESSAGES: %v, используем 30", err)
-		maxMsg = 30
-	}
-	contextWindow, err := strconv.Atoi(contextWindowStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга CONTEXT_WINDOW: %v, используем 1000", err)
-		contextWindow = 1000
-	}
-	summaryIntervalHours, err := strconv.Atoi(summaryIntervalStr)
-	if err != nil {
-		log.Printf("Ошибка парсинга SUMMARY_INTERVAL_HOURS: %v, используем 2", err)
-		summaryIntervalHours = 2
-	}
-	if summaryIntervalHours < 0 {
-		log.Printf("Интервал саммари не может быть отрицательным, используем 2")
-		summaryIntervalHours = 2
-	}
-	// Парсинг новой переменной - температуры
-	defaultTemp, err := strconv.ParseFloat(defaultTempStr, 64)
-	if err != nil {
-		log.Printf("Ошибка парсинга DEFAULT_TEMPERATURE: %v, используем 0.7", err)
-		defaultTemp = 0.7
-	} else if defaultTemp < 0.0 || defaultTemp > 2.0 {
-		log.Printf("DEFAULT_TEMPERATURE (%f) вне диапазона [0.0, 2.0], используем 0.7", defaultTemp)
-		defaultTemp = 0.7
-	}
+	// --- Парсинг других строк чисел в целые числа ---
+	debug := parseBoolOrDefault(debugStr, false)                                            // Парсим флаг отладки
+	dailyTakeTime := parseIntOrDefault(dailyTakeTimeStr, 19)                                // По умолчанию 19:00
+	minMessages := parseIntOrDefault(minMsgStr, 10)                                         // По умолчанию мин. 10 сообщений
+	maxMessages := parseIntOrDefault(maxMsgStr, 30)                                         // По умолчанию макс. 30 сообщений
+	contextWindow := parseIntOrDefault(contextWindowStr, 1000)                              // По умолчанию 1000 сообщений
+	summaryInterval := parseIntOrDefault(summaryIntervalStr, 2)                             // По умолчанию 2 часа
+	defaultTemp := parseFloatOrDefault(defaultTempStr, 0.7)                                 // По умолчанию 0.7
+	errorMessageAutoDeleteSeconds := parseIntOrDefault(errorMessageAutoDeleteSecondsStr, 5) // По умолчанию 5 секунд
 
-	debug := debugStr == "true" || debugStr == "1" || debugStr == "yes"
-
-	// --- Парсинг числовых значений для лимита прямых обращений ---
+	// --- Парсинг настроек прямых обращений ---
 	directLimitCount, err := strconv.Atoi(directLimitCountStr)
 	if err != nil || directLimitCount <= 0 {
 		log.Printf("Ошибка парсинга DIRECT_REPLY_LIMIT_COUNT_DEFAULT ('%s') или значение <= 0: %v, используем 2", directLimitCountStr, err)
@@ -340,91 +316,92 @@ func Load() (*Config, error) {
 	// --- Конец загрузки настроек автоочистки MongoDB ---
 
 	cfg := Config{
-		TelegramToken: telegramToken,
-		LLMProvider:   llmProvider,
-		// --- Новые поля ---
-		DefaultConversationStyle: defaultConvStyle,
-		DefaultTemperature:       defaultTemp,
-		DefaultModel:             defaultModel,
-		DefaultSafetyThreshold:   defaultSafety,
-		// --- Конец новых полей ---
-		GeminiAPIKey:                geminiAPIKey,
-		GeminiModelName:             geminiModelName,
-		DeepSeekAPIKey:              deepSeekAPIKey,
-		DeepSeekModelName:           deepSeekModelName,
-		DeepSeekBaseURL:             deepSeekBaseURL,
-		DefaultPrompt:               defaultPrompt,
-		DirectPrompt:                directPrompt,
-		ClassifyDirectMessagePrompt: classifyDirectMessagePrompt,
-		SeriousDirectPrompt:         seriousDirectPrompt,
-		DailyTakePrompt:             dailyTakePrompt,
-		SummaryPrompt:               summaryPrompt,
-		RateLimitStaticText:         getEnvOrDefault("RATE_LIMIT_STATIC_TEXT", "Слишком часто! Попробуйте позже."),
-		RateLimitPrompt:             getEnvOrDefault("RATE_LIMIT_PROMPT", "Скажи пользователю, что он слишком часто нажимает кнопку."),
-		// --- Настройки донатов ---
-		DonatePrompt:    donatePrompt,
-		DonateTimeHours: donateTimeHours,
-		// --- Конец настроек донатов ---
-		PromptEnterMinMessages:     promptEnterMin,
-		PromptEnterMaxMessages:     promptEnterMax,
-		PromptEnterDailyTime:       promptEnterDailyTime,
-		PromptEnterSummaryInterval: promptEnterSummaryInterval,
-		SRACH_WARNING_PROMPT:       srachWarningPrompt,
-		SRACH_ANALYSIS_PROMPT:      srachAnalysisPrompt,
-		SRACH_CONFIRM_PROMPT:       srachConfirmPrompt,
-		SrachKeywords:              srachKeywordsList,
-		DailyTakeTime:              dailyTakeTime,
-		TimeZone:                   timeZone,
-		SummaryIntervalHours:       summaryIntervalHours,
-		MinMessages:                minMsg,
-		MaxMessages:                maxMsg,
-		ContextWindow:              contextWindow,
-		Debug:                      debug,
-		// Заполняем новые поля для БД с префиксом Postgresql
-		PostgresqlHost:     dbHost,
-		PostgresqlPort:     dbPort,
-		PostgresqlUser:     dbUser,
-		PostgresqlPassword: dbPassword,
-		PostgresqlDbname:   dbName,
-		// Заполняем поля MongoDB
+		TelegramToken:                    telegramToken,
+		LLMProvider:                      llmProvider,
+		DefaultPrompt:                    defaultPrompt,
+		DirectPrompt:                     directPrompt,
+		ClassifyDirectMessagePrompt:      classifyDirectMessagePrompt,
+		SeriousDirectPrompt:              seriousDirectPrompt,
+		DailyTakePrompt:                  dailyTakePrompt,
+		SummaryPrompt:                    summaryPrompt,
+		DefaultConversationStyle:         defaultConvStyle,
+		DefaultTemperature:               defaultTemp,
+		DefaultModel:                     defaultModel,
+		DefaultSafetyThreshold:           defaultSafety,
+		GeminiAPIKey:                     geminiAPIKey,
+		GeminiModelName:                  geminiModelName,
+		GeminiAPIKeyReserve:              geminiAPIKeyReserve,
+		GeminiKeyRotationTimeHours:       geminiKeyRotationTimeHours,
+		GeminiUsingReserveKey:            false,       // По умолчанию используем основной ключ
+		GeminiLastKeyRotationTime:        time.Time{}, // Пустое время, обозначающее, что переключений еще не было
+		DeepSeekAPIKey:                   deepSeekAPIKey,
+		DeepSeekModelName:                deepSeekModelName,
+		DeepSeekBaseURL:                  deepSeekBaseURL,
+		OpenRouterAPIKey:                 openRouterAPIKey,
+		OpenRouterModelName:              openRouterModelName,
+		OpenRouterSiteURL:                openRouterSiteURL,
+		OpenRouterSiteTitle:              openRouterSiteTitle,
+		RateLimitStaticText:              rateLimitErrorMsg,
+		RateLimitPrompt:                  getEnvOrDefault("RATE_LIMIT_PROMPT", "Скажи пользователю, что он слишком часто нажимает кнопку."),
+		DonatePrompt:                     donatePrompt,
+		DonateTimeHours:                  donateTimeHours,
+		PromptEnterMinMessages:           promptEnterMin,
+		PromptEnterMaxMessages:           promptEnterMax,
+		PromptEnterDailyTime:             promptEnterDailyTime,
+		PromptEnterSummaryInterval:       promptEnterSummaryInterval,
+		SRACH_WARNING_PROMPT:             srachWarningPrompt,
+		SRACH_ANALYSIS_PROMPT:            srachAnalysisPrompt,
+		SRACH_CONFIRM_PROMPT:             srachConfirmPrompt,
+		SrachKeywords:                    srachKeywordsList,
+		SrachAnalysisEnabled:             parseBoolOrDefault(srachEnabledStr, true),
+		DailyTakeTime:                    dailyTakeTime,
+		TimeZone:                         timeZone,
+		SummaryIntervalHours:             summaryInterval,
+		MinMessages:                      minMessages,
+		MaxMessages:                      maxMessages,
+		ContextWindow:                    contextWindow,
+		Debug:                            debug,
+		ErrorMessageAutoDeleteSeconds:    errorMessageAutoDeleteSeconds,
+		PostgresqlHost:                   dbHost,
+		PostgresqlPort:                   dbPort,
+		PostgresqlUser:                   dbUser,
+		PostgresqlPassword:               dbPassword,
+		PostgresqlDbname:                 dbName,
 		MongoDbURI:                       mongoURI,
 		MongoDbName:                      mongoDbName,
 		MongoDbMessagesCollection:        mongoMessagesCollection,
 		MongoDbUserProfilesCollection:    mongoUserProfilesCollection,
-		MongoDbSettingsCollection:        mongoSettingsCollection, // Новое поле
+		MongoDbSettingsCollection:        mongoSettingsCollection,
 		StorageType:                      StorageType(storageTypeStr),
-		SrachAnalysisEnabled:             srachEnabledStr == "true" || srachEnabledStr == "1" || srachEnabledStr == "yes",
+		AdminUsernames:                   strings.Split(adminUsernamesStr, ","),
 		WelcomePrompt:                    welcomePrompt,
 		VoiceFormatPrompt:                voiceFormatPrompt,
 		VoiceTranscriptionEnabledDefault: voiceTranscriptionEnabledDefaultStr == "true" || voiceTranscriptionEnabledDefaultStr == "1" || voiceTranscriptionEnabledDefaultStr == "yes",
-		// --- Настройки лимита прямых обращений (дефолтные) ---
-		DirectReplyLimitEnabledDefault:  directReplyLimitEnabledDefault,
-		DirectReplyLimitCountDefault:    directReplyLimitCountDefault,
-		DirectReplyLimitDurationDefault: directReplyLimitDurationDefault,
-		DirectReplyLimitPrompt:          directReplyLimitPrompt,
-		PromptEnterDirectLimitCount:     promptEnterDirectLimitCount,
-		PromptEnterDirectLimitDuration:  promptEnterDirectLimitDuration,
-		// --- Настройки долгосрочной памяти ---
-		LongTermMemoryEnabled:    longTermMemoryEnabled,
-		GeminiEmbeddingModelName: geminiEmbeddingModelName,
-		MongoVectorIndexName:     mongoVectorIndexName,
-		LongTermMemoryFetchK:     longTermMemoryFetchK,
-		// --- Настройки бэкфилла эмбеддингов ---
-		BackfillBatchSize:  backfillBatchSize,
-		BackfillBatchDelay: backfillBatchDelay,
-		// --- Новые поля для OpenRouter ---
-		OpenRouterAPIKey:    openRouterAPIKey,
-		OpenRouterModelName: openRouterModelName,
-		OpenRouterSiteURL:   openRouterSiteURL,
-		OpenRouterSiteTitle: openRouterSiteTitle,
-		// --- Новые поля для анализа фотографий ---
-		PhotoAnalysisEnabled: photoAnalysisEnabledStr == "true" || photoAnalysisEnabledStr == "1" || photoAnalysisEnabledStr == "yes",
-		PhotoAnalysisPrompt:  photoAnalysisPrompt,
-		// --- Инициализация полей автоочистки MongoDB значениями из парсинга (могут быть 0) ---
-		MongoCleanupEnabled:            mongoCleanupEnabled,
-		MongoCleanupSizeLimitMB:        mongoCleanupSizeLimitMB,        // Может быть 0 или отрицательным, если парсинг не удался
-		MongoCleanupIntervalMinutes:    mongoCleanupIntervalMinutes,    // Может быть 0 или отрицательным, если парсинг не удался
-		MongoCleanupChunkDurationHours: mongoCleanupChunkDurationHours, // Может быть 0 или отрицательным, если парсинг не удался
+		DirectReplyLimitEnabledDefault:   directReplyLimitEnabledDefault,
+		DirectReplyLimitCountDefault:     directReplyLimitCountDefault,
+		DirectReplyLimitDurationDefault:  directReplyLimitDurationDefault,
+		DirectReplyLimitPrompt:           directReplyLimitPrompt,
+		PromptEnterDirectLimitCount:      promptEnterDirectLimitCount,
+		PromptEnterDirectLimitDuration:   promptEnterDirectLimitDuration,
+		LongTermMemoryEnabled:            longTermMemoryEnabled,
+		GeminiEmbeddingModelName:         geminiEmbeddingModelName,
+		MongoVectorIndexName:             mongoVectorIndexName,
+		LongTermMemoryFetchK:             longTermMemoryFetchK,
+		BackfillBatchSize:                backfillBatchSize,
+		BackfillBatchDelay:               backfillBatchDelay,
+		PhotoAnalysisEnabled:             photoAnalysisEnabledStr == "true" || photoAnalysisEnabledStr == "1" || photoAnalysisEnabledStr == "yes",
+		PhotoAnalysisPrompt:              photoAnalysisPrompt,
+		MongoCleanupEnabled:              mongoCleanupEnabled,
+		MongoCleanupSizeLimitMB:          mongoCleanupSizeLimitMB,
+		MongoCleanupIntervalMinutes:      mongoCleanupIntervalMinutes,
+		MongoCleanupChunkDurationHours:   mongoCleanupChunkDurationHours,
+		AutoBioEnabled:                   parseBoolOrDefault(getEnvOrDefault("AUTO_BIO_ENABLED", "true"), true),
+		AutoBioIntervalHours:             parseIntOrDefault(getEnvOrDefault("AUTO_BIO_INTERVAL_HOURS", "6"), 6),
+		AutoBioInitialAnalysisPrompt:     getEnvOrDefault("AUTO_BIO_INITIAL_ANALYSIS_PROMPT", "Проанализируй следующие сообщения пользователя ([%s]). Составь краткое (1-2 предложения) резюме его стиля общения, основных тем, тона и возможных интересов, основываясь *только* на тексте сообщений. Не делай медицинских или психологических диагнозов. Сообщения:\n---\n%s"),
+		AutoBioUpdatePrompt:              getEnvOrDefault("AUTO_BIO_UPDATE_PROMPT", "Вот текущее резюме стиля общения пользователя ([%s]):\n%s\n\nВот его *новые* сообщения с момента последнего обновления:\n---\n%s\n---\nОбнови или дополни резюме, основываясь *только* на новых сообщениях. Если стиль не изменился, просто отметь новые темы или подтверди старые наблюдения. Сохраняй краткость (1-3 предложения)."),
+		AutoBioMessagesLookbackDays:      parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MESSAGES_LOOKBACK_DAYS", "30"), 30),
+		AutoBioMinMessagesForAnalysis:    parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS", "10"), 10),
+		AutoBioMaxMessagesForAnalysis:    parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MAX_MESSAGES_FOR_ANALYSIS", "2500"), 2500),
 	}
 
 	// Загрузка списка администраторов
@@ -518,6 +495,14 @@ func parseBoolOrDefault(value string, defaultValue bool) bool {
 // parseIntOrDefault возвращает значение int по умолчанию, если переменная не установлена
 func parseIntOrDefault(value string, defaultValue int) int {
 	if parsed, err := strconv.Atoi(value); err == nil {
+		return parsed
+	}
+	return defaultValue
+}
+
+// parseFloatOrDefault возвращает значение float64 по умолчанию, если переменная не установлена
+func parseFloatOrDefault(value string, defaultValue float64) float64 {
+	if parsed, err := strconv.ParseFloat(value, 64); err == nil {
 		return parsed
 	}
 	return defaultValue

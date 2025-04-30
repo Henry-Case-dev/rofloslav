@@ -43,6 +43,12 @@ type Config struct {
 	// Настройки Gemini
 	GeminiAPIKey    string
 	GeminiModelName string
+	// --- Настройки резервного ключа Gemini ---
+	GeminiAPIKeyReserve        string    // Резервный ключ API Gemini
+	GeminiUsingReserveKey      bool      // Флаг использования резервного ключа
+	GeminiKeyRotationTimeHours int       // Время в часах, через которое пробовать вернуться к основному ключу
+	GeminiLastKeyRotationTime  time.Time // Время последнего переключения ключа
+	// --- Конец настроек резервного ключа ---
 	// Настройки DeepSeek
 	DeepSeekAPIKey    string
 	DeepSeekModelName string
@@ -79,6 +85,9 @@ type Config struct {
 	MaxMessages          int
 	ContextWindow        int
 	Debug                bool
+	// --- Настройки автоудаления сообщений об ошибках ---
+	ErrorMessageAutoDeleteSeconds int // Время в секундах до автоудаления сообщений об ошибках
+	// --- Конец настроек автоудаления ---
 	// Настройки базы данных PostgreSQL - ИСПОЛЬЗУЕМ ПРЕФИКС POSTGRESQL_
 	PostgresqlHost     string
 	PostgresqlPort     string

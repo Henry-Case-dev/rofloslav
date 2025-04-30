@@ -4,6 +4,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/utils" // Импортируем для TruncateString
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -30,13 +31,15 @@ func (b *Bot) sendReplyTo(chatID int64, messageID int, text string) {
 
 // deleteMessage удаляет сообщение.
 func (b *Bot) deleteMessage(chatID int64, messageID int) {
+	if messageID == 0 {
+		return // Игнорируем удаление с ID = 0
+	}
+
 	deleteReq := tgbotapi.NewDeleteMessage(chatID, messageID)
 	_, err := b.api.Request(deleteReq) // Используем Request для DeleteMessage
 	if err != nil {
-		// Не логируем как ошибку, если сообщение уже удалено или слишком старое
-		if !strings.Contains(err.Error(), "message to delete not found") && !strings.Contains(err.Error(), "message can't be deleted") {
-			log.Printf("[WARN] Ошибка удаления сообщения ID %d в чате %d: %v", messageID, chatID, err)
-		}
+		// Только логируем ошибку, но не выбрасываем её дальше
+		log.Printf("[WARN] Ошибка удаления сообщения ID %d в чате %d: %v", messageID, chatID, err)
 	}
 }
 
@@ -60,8 +63,12 @@ func (b *Bot) sendAndDeleteAfter(chatID int64, text string, delay time.Duration)
 
 // answerCallback отвечает на CallbackQuery (например, подтверждает нажатие кнопки).
 func (b *Bot) answerCallback(callbackID string, text string) {
-	callbackConfig := tgbotapi.NewCallback(callbackID, text)
-	_, err := b.api.Request(callbackConfig)
+	callback := tgbotapi.NewCallback(callbackID, text)
+	// Если текст слишком длинный, обрезаем его до 200 символов
+	if utf8.RuneCountInString(text) > 200 {
+		callback.Text = string([]rune(text)[:197]) + "..."
+	}
+	_, err := b.api.Request(callback)
 	if err != nil {
 		log.Printf("Ошибка ответа на CallbackQuery (%s): %v", callbackID, err)
 	}
@@ -71,16 +78,14 @@ func (b *Bot) answerCallback(callbackID string, text string) {
 // Логирует ошибки.
 func (b *Bot) sendReplyMarkdown(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown" // Устанавливаем ParseMode
+	msg.ParseMode = tgbotapi.ModeMarkdown
 	_, err := b.api.Send(msg)
 	if err != nil {
-		// Улучшаем логирование ошибок API Telegram
-		log.Printf("[ERROR] Ошибка отправки Markdown сообщения в чат %d: %v. Текст: %s...", chatID, err, utils.TruncateString(text, 50))
-		// Дополнительная информация об ошибке, если доступна
-		if tgErr, ok := err.(tgbotapi.Error); ok {
-			log.Printf("[ERROR] Telegram API Error: Code %d, Description: %s", tgErr.Code, tgErr.Message)
-		} else {
-			log.Printf("[ERROR] Не удалось привести ошибку к типу tgbotapi.Error")
+		// Если ошибка связана с Markdown, отправляем обычный текст
+		if strings.Contains(err.Error(), "markdown") || strings.Contains(err.Error(), "parse") {
+			log.Printf("[ERROR] Ошибка отправки Markdown сообщения в чат %d: %v. Текст: %s...", chatID, err, utils.TruncateString(text, 50))
+			plainText := tgbotapi.NewMessage(chatID, text)
+			b.api.Send(plainText)
 		}
 	}
 }
@@ -88,7 +93,6 @@ func (b *Bot) sendReplyMarkdown(chatID int64, text string) {
 // sendReplyReturnMsg - вспомогательная функция для отправки сообщения и возврата его объекта
 func (b *Bot) sendReplyReturnMsg(chatID int64, text string) (*tgbotapi.Message, error) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	// msg.ParseMode = "Markdown" // Убрано, т.к. не всегда нужен Markdown
 	sentMsg, err := b.api.Send(msg)
 	if err != nil {
 		log.Printf("Ошибка отправки сообщения (возврат объекта) в чат %d: %v", chatID, err)
@@ -106,4 +110,31 @@ func (b *Bot) sendReplyAndDeleteInitial(chatID int64, finalMsgText string, initi
 	if initialMsgID != 0 {
 		b.deleteMessage(chatID, initialMsgID) // Вызов перенесенного deleteMessage
 	}
+}
+
+// sendAutoDeleteErrorReply отправляет сообщение об ошибке, которое автоматически удаляется через указанное время
+func (b *Bot) sendAutoDeleteErrorReply(chatID int64, replyToMessageID int, errorText string) {
+	msg := tgbotapi.NewMessage(chatID, errorText)
+	if replyToMessageID != 0 {
+		msg.ReplyToMessageID = replyToMessageID
+	}
+
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("[ERROR] Не удалось отправить сообщение об ошибке в чат %d: %v", chatID, err)
+		return
+	}
+
+	// Запускаем горутину для автоудаления сообщения
+	go func(cID int64, mID int, delaySeconds int) {
+		if delaySeconds <= 0 {
+			return // Не удаляем, если задержка <= 0
+		}
+
+		time.Sleep(time.Duration(delaySeconds) * time.Second)
+		b.deleteMessage(cID, mID)
+		if b.config.Debug {
+			log.Printf("[DEBUG] Автоматически удалено сообщение об ошибке (ID: %d) в чате %d", mID, cID)
+		}
+	}(chatID, sentMsg.MessageID, b.config.ErrorMessageAutoDeleteSeconds)
 }

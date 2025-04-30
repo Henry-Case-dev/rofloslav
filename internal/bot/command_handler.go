@@ -178,24 +178,20 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		// Используем новую функцию для удаления сообщения через 15 секунд
 		go b.sendAndDeleteAfter(chatID, "⏳ Запускаю процесс заполнения векторных представлений для сообщений в этом чате. Это может занять много времени...", 15*time.Second)
 
-	// --- Admin Command: /reset_autobio ---
-	case "reset_autobio":
-		if !isUserAdmin {
-			b.sendReply(chatID, "🚫 У вас нет прав для выполнения этой команды.")
+	// --- Admin Command: /reset_autobio, /autobio_reset ---
+	case "reset_autobio", "autobio_reset":
+		if !b.isAdmin(message.From) {
+			b.sendReply(chatID, "⚠️ Эта команда доступна только администраторам бота.")
 			return
 		}
-		if !b.config.AutoBioEnabled {
-			b.sendReply(chatID, "🚫 Функция AutoBio отключена в конфигурации.")
-			return
-		}
-		log.Printf("[ADMIN CMD] Пользователь %s (%d) инициировал команду /reset_autobio в чате %d.", username, userID, chatID)
+
 		err := b.storage.ResetAutoBioTimestamps(chatID)
 		if err != nil {
-			log.Printf("[ERROR][CmdHandler /reset_autobio] Ошибка сброса времени AutoBio для чата %d: %v", chatID, err)
-			b.sendReply(chatID, fmt.Sprintf("❌ Ошибка при сбросе времени AutoBio: %v", err)) // Ошибку оставляем
+			log.Printf("[ERROR][CommandHandler] Chat %d: Ошибка при сбросе времени AutoBio: %v", chatID, err)
+			errorMsg := fmt.Sprintf("❌ Ошибка при сбросе времени AutoBio: %v", err)
+			b.sendAutoDeleteErrorReply(chatID, message.MessageID, errorMsg)
 		} else {
-			// Сообщение об успехе удаляем через 15 секунд
-			go b.sendAndDeleteAfter(chatID, "✅ Время последнего анализа AutoBio сброшено для всех пользователей этого чата. Полный анализ будет выполнен при следующем запуске.", 15*time.Second)
+			b.sendReply(chatID, "✅ Временные метки AutoBio сброшены. При следующем запуске будет выполнен полный анализ.")
 		}
 
 	// --- Admin Command: /trigger_autobio ---

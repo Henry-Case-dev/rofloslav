@@ -60,30 +60,28 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 		}
 
 		// Ищем следующий пакет сообщений без message_vector, пропуская проблемные ID
-		messagesToProcess, findErr := mongoStore.FindMessagesWithoutEmbedding(chatID, b.config.BackfillBatchSize, skipIDs)
-		if findErr != nil {
-			log.Printf("[Backfill ERROR] Chat %d: Ошибка поиска сообщений без эмбеддинга (пропущено %d ID): %v", chatID, len(skipIDs), findErr)
-			errorCount++
-			// Решаем, стоит ли продолжать или прервать? Пока продолжим, но сообщим об ошибке.
-			b.sendReply(chatID, fmt.Sprintf("❌ Ошибка поиска сообщений для обработки (пакет %d). Пробую продолжить.", (processedCount/b.config.BackfillBatchSize)+1))
-			time.Sleep(5 * time.Second) // Небольшая пауза после ошибки
+		messages, err := mongoStore.FindMessagesWithoutEmbedding(chatID, b.config.BackfillBatchSize, skipIDs)
+		if err != nil {
+			log.Printf("[Backfill ERROR] Chat %d: Ошибка поиска сообщений для пакета %d: %v", chatID, processedCount/b.config.BackfillBatchSize+1, err)
+			b.sendAutoDeleteErrorReply(chatID, 0, fmt.Sprintf("❌ Ошибка поиска сообщений для обработки (пакет %d). Пробую продолжить.", (processedCount/b.config.BackfillBatchSize)+1))
+			time.Sleep(b.config.BackfillBatchDelay) // Пауза перед следующей попыткой
 			continue
 		}
 
 		// Если сообщений для обработки больше нет
-		if len(messagesToProcess) == 0 {
+		if len(messages) == 0 {
 			log.Printf("[Backfill INFO] Chat %d: Не найдено больше сообщений без эмбеддингов.", chatID)
 			break // Выходим из цикла
 		}
 
-		log.Printf("[Backfill PROCESS] Chat %d: Обработка пакета из %d сообщений (Всего успешно обновлено: %d)...", chatID, len(messagesToProcess), processedCount)
+		log.Printf("[Backfill PROCESS] Chat %d: Обработка пакета из %d сообщений (Всего успешно обновлено: %d)...", chatID, len(messages), processedCount)
 
 		batchStartTime := time.Now()
 		batchErrorCount := 0
 		processedInBatch := 0 // Счетчик успешно обработанных в этом пакете
 
 		// Обрабатываем пакет
-		for _, msg := range messagesToProcess {
+		for _, msg := range messages {
 			// --- Проверка, не зациклились ли мы на этом ID ---
 			if failedToModifyIDs[msg.MessageID] {
 				log.Printf("[Backfill SKIP LOOP] Chat %d, Msg %d: Пропуск, так как ранее не удалось модифицировать.", chatID, msg.MessageID)
@@ -162,7 +160,7 @@ func (b *Bot) runBackfillEmbeddings(chatID int64) {
 		}
 
 		// Задержка между пакетами, чтобы не перегружать API/DB
-		if len(messagesToProcess) == b.config.BackfillBatchSize { // Только если пакет был полным
+		if len(messages) == b.config.BackfillBatchSize { // Только если пакет был полным
 			log.Printf("[Backfill DELAY] Chat %d: Задержка перед следующим пакетом: %v", chatID, b.config.BackfillBatchDelay)
 			time.Sleep(b.config.BackfillBatchDelay)
 		}

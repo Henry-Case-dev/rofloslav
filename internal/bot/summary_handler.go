@@ -136,6 +136,15 @@ func (b *Bot) createAndSendSummary(chatID int64) {
 // updateOrSendMessage пытается обновить сообщение messageIDToEdit текстом editText.
 // Если messageIDToEdit = 0 или обновление не удается, отправляет новое сообщение с текстом sendText.
 func (b *Bot) updateOrSendMessage(chatID int64, messageIDToEdit int, editText string, sendText string, parseMode string) {
+	// Проверяем, является ли сообщение ошибкой (содержит символ ❌)
+	isErrorMessage := strings.Contains(editText, "❌") || strings.Contains(sendText, "❌")
+
+	// Если это сообщение об ошибке и оно не редактирование существующего, используем автоудаление
+	if isErrorMessage && messageIDToEdit == 0 {
+		b.sendAutoDeleteErrorReply(chatID, 0, sendText)
+		return
+	}
+
 	updated := false
 	if messageIDToEdit != 0 {
 		// --- Проверяем, существует ли сообщение перед редактированием ---
@@ -164,6 +173,12 @@ func (b *Bot) updateOrSendMessage(chatID int64, messageIDToEdit int, editText st
 	}
 
 	if !updated {
+		// Если это сообщение об ошибке, используем автоудаление
+		if isErrorMessage {
+			b.sendAutoDeleteErrorReply(chatID, 0, sendText)
+			return
+		}
+
 		// Отправляем новое сообщение
 		msg := tgbotapi.NewMessage(chatID, sendText)
 		msg.ParseMode = parseMode

@@ -8,12 +8,15 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
+	"github.com/Henry-Case-dev/rofloslav/internal/config"
 	"github.com/Henry-Case-dev/rofloslav/internal/utils"
 )
 
@@ -26,15 +29,17 @@ const markdownInstructions = `\n\nИнструкции по форматиров
 // Client для взаимодействия с Gemini API
 type Client struct {
 	genaiClient        *genai.Client
+	cfg                *config.Config // Ссылка на конфигурацию
 	modelName          string
 	embeddingModelName string
 	debug              bool
+	keyMutex           sync.Mutex // Мьютекс для безопасного переключения ключей
 }
 
 // New создает и инициализирует новый клиент Gemini.
 // Принимает API ключ, имя основной модели, имя модели для эмбеддингов и флаг отладки.
-func New(apiKey, modelName, embeddingModelName string, debug bool) (*Client, error) {
-	if apiKey == "" {
+func New(cfg *config.Config, modelName, embeddingModelName string, debug bool) (*Client, error) {
+	if cfg.GeminiAPIKey == "" {
 		return nil, fmt.Errorf("API ключ Gemini не предоставлен")
 	}
 	if modelName == "" {
@@ -55,6 +60,13 @@ func New(apiKey, modelName, embeddingModelName string, debug bool) (*Client, err
 		log.Printf("[WARN] Переменная окружения BOT_USER_ID не установлена. Определение сообщений бота может быть неточным.")
 	}
 
+	// Выбираем API ключ в зависимости от флага использования резервного ключа
+	apiKey := cfg.GeminiAPIKey
+	if cfg.GeminiUsingReserveKey && cfg.GeminiAPIKeyReserve != "" {
+		apiKey = cfg.GeminiAPIKeyReserve
+		log.Printf("[INFO] Gemini: Используется резервный ключ API.")
+	}
+
 	ctx := context.Background()
 	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
@@ -65,14 +77,19 @@ func New(apiKey, modelName, embeddingModelName string, debug bool) (*Client, err
 
 	return &Client{
 		genaiClient:        genaiClient,
+		cfg:                cfg,
 		modelName:          modelName,
 		embeddingModelName: embeddingModelName,
 		debug:              debug,
+		keyMutex:           sync.Mutex{},
 	}, nil
 }
 
 // Close закрывает клиент Gemini
 func (c *Client) Close() error {
+	c.keyMutex.Lock()
+	defer c.keyMutex.Unlock()
+
 	if c.genaiClient != nil {
 		return c.genaiClient.Close()
 	}
@@ -83,6 +100,13 @@ func (c *Client) Close() error {
 // history - сообщения ДО lastMessage
 // lastMessage - сообщение, на которое отвечаем
 func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Message, lastMessage *tgbotapi.Message) (string, error) {
+	// Попробуем вернуться к основному ключу, если используется резервный и прошло достаточно времени
+	if c.cfg.GeminiUsingReserveKey {
+		if err := c.tryRevertToMainKey(); err != nil {
+			log.Printf("[WARN] Не удалось вернуться к основному ключу Gemini: %v", err)
+		}
+	}
+
 	ctx := context.Background()
 	model := c.genaiClient.GenerativeModel(c.modelName)
 
@@ -148,7 +172,40 @@ func (c *Client) GenerateResponse(systemPrompt string, history []*tgbotapi.Messa
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Ошибка отправки: %v", err)
 		}
-		return "", fmt.Errorf("ошибка отправки сообщения в Gemini: %w", err)
+
+		// Обрабатываем ошибку и проверяем необходимость переключения ключа
+		handledErr := c.handleAPIError(err)
+
+		// Если произошло переключение ключа, пробуем запрос снова с новой сессией
+		if handledErr != nil && handledErr.Error() == "ключ API Gemini был переключен на резервный, повторите запрос" {
+			// Создаем новую модель с новым клиентом
+			model = c.genaiClient.GenerativeModel(c.modelName)
+
+			// Применяем те же настройки
+			model.SetTemperature(1)
+			model.SetTopP(0.95)
+			model.SetMaxOutputTokens(8192)
+
+			// Устанавливаем SystemInstruction
+			if systemPrompt != "" {
+				model.SystemInstruction = &genai.Content{
+					Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
+				}
+			}
+
+			// Создаем новую сессию
+			session = model.StartChat()
+			session.History = preparedHistory
+
+			// Повторяем запрос
+			resp, err = session.SendMessage(ctx, contentToSend)
+			if err != nil {
+				return "", fmt.Errorf("ошибка отправки сообщения в Gemini (после переключения ключа): %w", err)
+			}
+		} else if handledErr != nil {
+			// Если ошибка не связана с переключением ключа или другая проблема
+			return "", fmt.Errorf("ошибка отправки сообщения в Gemini: %w", handledErr)
+		}
 	}
 
 	// Извлекаем ответ
@@ -270,54 +327,76 @@ func (c *Client) convertMessageToGenaiContent(msg *tgbotapi.Message) *genai.Cont
 	}
 }
 
-// GenerateArbitraryResponse генерирует ответ на основе системного промпта и произвольного текстового контекста
+// GenerateArbitraryResponse генерирует ответ по произвольному текстовому контексту с минимальной обработкой
 func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText string) (string, error) {
+	// Попробуем вернуться к основному ключу, если используется резервный и прошло достаточно времени
+	if c.cfg.GeminiUsingReserveKey {
+		if err := c.tryRevertToMainKey(); err != nil {
+			log.Printf("[WARN] Не удалось вернуться к основному ключу Gemini: %v", err)
+		}
+	}
+
 	ctx := context.Background()
 	model := c.genaiClient.GenerativeModel(c.modelName)
 
-	// Используем те же настройки модели, что и в GenerateResponse
-	model.SetTemperature(1)
-	// Убираем TopK
-	// model.SetTopK(40)
+	// Установка параметров генерации
+	model.SetTemperature(1.0)
 	model.SetTopP(0.95)
 	model.SetMaxOutputTokens(8192)
 
-	// Устанавливаем системный промпт через специальное поле БЕЗ ИНСТРУКЦИЙ MARKDOWN
-	if systemPrompt != "" {
+	// Подготовка сообщения
+	sanitizedSystemPrompt := utils.SanitizeUTF8(systemPrompt)
+	sanitizedContextText := utils.SanitizeUTF8(contextText)
+
+	// Устанавливаем системный промпт
+	if sanitizedSystemPrompt != "" {
 		model.SystemInstruction = &genai.Content{
-			Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
-		}
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
+			Parts: []genai.Part{genai.Text(sanitizedSystemPrompt)},
 		}
 	}
 
-	// Формируем контент только из contextText
-	contentToSend := genai.Text(utils.SanitizeUTF8(contextText))
-
-	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос (Arbitrary): Текст для отправки: %s...", utils.TruncateString(contextText, 150))
-	}
-
-	// Отправляем запрос
-	resp, err := model.GenerateContent(ctx, contentToSend)
+	// Отправляем контекст для генерации
+	resp, err := model.GenerateContent(ctx, genai.Text(sanitizedContextText))
 	if err != nil {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ошибка генерации (Arbitrary): %v", err)
+		// Обрабатываем ошибку и проверяем необходимость переключения ключа
+		handledErr := c.handleAPIError(err)
+
+		// Если произошло переключение ключа, пробуем запрос снова
+		if handledErr != nil && handledErr.Error() == "ключ API Gemini был переключен на резервный, повторите запрос" {
+			// Получаем новую модель с обновленным клиентом
+			model = c.genaiClient.GenerativeModel(c.modelName)
+
+			// Применяем те же настройки к новой модели
+			model.SetTemperature(1.0)
+			model.SetTopP(0.95)
+			model.SetMaxOutputTokens(8192)
+
+			// Устанавливаем системный промпт для новой модели
+			if sanitizedSystemPrompt != "" {
+				model.SystemInstruction = &genai.Content{
+					Parts: []genai.Part{genai.Text(sanitizedSystemPrompt)},
+				}
+			}
+
+			// Повторяем запрос с новым ключом
+			resp, err = model.GenerateContent(ctx, genai.Text(sanitizedContextText))
+			if err != nil {
+				// Если снова ошибка, возвращаем её
+				return "", fmt.Errorf("ошибка Gemini API при генерации произвольного ответа (после переключения ключа): %w", err)
+			}
+		} else if handledErr != nil {
+			// Если ошибка не связана с переключением ключа, возвращаем обработанную ошибку
+			return "", fmt.Errorf("ошибка Gemini API при генерации произвольного ответа: %w", handledErr)
 		}
-		return "", fmt.Errorf("ошибка генерации контента в Gemini: %w", err)
 	}
 
-	// Извлекаем ответ (аналогично GenerateResponse)
+	// Извлекаем и возвращаем ответ
 	var responseText strings.Builder
 	if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
 		for _, part := range resp.Candidates[0].Content.Parts {
 			responseText.WriteString(fmt.Sprintf("%s", part))
 		}
 	} else {
-		if c.debug {
-			log.Printf("[DEBUG] Gemini Ответ (Arbitrary): Получен пустой ответ или нет кандидатов.")
-		}
 		return "", fmt.Errorf("Gemini не вернул валидный ответ")
 	}
 
@@ -329,80 +408,96 @@ func (c *Client) GenerateArbitraryResponse(systemPrompt string, contextText stri
 	return finalResponse, nil
 }
 
-// GenerateResponseFromTextContext генерирует ответ на основе промпта и готового текстового контекста
+// GenerateResponseFromTextContext генерирует ответ на основе предварительно отформатированного контекста
 func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextText string) (string, error) {
+	// Попробуем вернуться к основному ключу, если используется резервный и прошло достаточно времени
+	if c.cfg.GeminiUsingReserveKey {
+		if err := c.tryRevertToMainKey(); err != nil {
+			log.Printf("[WARN] Не удалось вернуться к основному ключу Gemini: %v", err)
+		}
+	}
+
 	ctx := context.Background()
 	model := c.genaiClient.GenerativeModel(c.modelName)
 
-	// Настраиваем генерацию
-	model.SetTemperature(1.0)      // Можно сделать настраиваемым
-	model.SetMaxOutputTokens(8192) // Максимум для Gemini 1.5 Flash/Pro
+	// Настройки модели
+	model.SetTemperature(1)
+	model.SetTopP(0.95)
+	model.SetMaxOutputTokens(8192)
 
-	// Формируем контент для Gemini: СИСТЕМНЫЙ ПРОМПТ БЕЗ ИНСТРУКЦИЙ MARKDOWN
-	sanitizedSystemPrompt := utils.SanitizeUTF8(systemPrompt)
-	sanitizedContextText := utils.SanitizeUTF8(contextText)
-	// fullText := sanitizedSystemPrompt + "\n\n---\n\n" + sanitizedContextText // СТАРЫЙ КОД С ИНСТРУКЦИЯМИ
-
-	// Новый подход: создаем контент из частей - сначала системный, потом пользовательский
-	cs := model.StartChat()
-	cs.History = []*genai.Content{
-		{
-			Parts: []genai.Part{genai.Text(sanitizedSystemPrompt)},
-			Role:  "model", // Системный промпт имитируем как сообщение модели?
-		},
+	// Устанавливаем SystemInstruction (новый формат)
+	if systemPrompt != "" {
+		model.SystemInstruction = &genai.Content{
+			Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
+		}
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Text Запрос: Установлен SystemInstruction: %s...", utils.TruncateString(systemPrompt, 100))
+		}
 	}
 
+	sanitizedContext := utils.SanitizeUTF8(contextText)
 	if c.debug {
-		log.Printf("[DEBUG] Gemini Запрос (Text Context): System Prompt Part: %s...", utils.TruncateString(sanitizedSystemPrompt, 100))
-		log.Printf("[DEBUG] Gemini Запрос (Text Context): Context Text Part: %s...", utils.TruncateString(sanitizedContextText, 150))
+		log.Printf("[DEBUG] Gemini Text Запрос: Контекст: %s...", utils.TruncateString(sanitizedContext, 100))
 	}
 
-	// Отправляем контекст как пользовательское сообщение
-	resp, err := cs.SendMessage(ctx, genai.Text(sanitizedContextText))
+	// Создаем контент запроса с заранее отформатированным контекстом
+	content := []genai.Part{genai.Text(sanitizedContext)}
+
+	// Отправляем запрос
+	resp, err := model.GenerateContent(ctx, content...)
 	if err != nil {
-		log.Printf("[ERROR] Gemini Ошибка API (Text Context): %v", err)
-		// Добавляем парсинг специфичной ошибки Gemini, если возможно
-		if genErr, ok := err.(*googleapi.Error); ok { // <-- Убедимся, что google.golang.org/api/googleapi импортирован
-			log.Printf("[ERROR] Gemini API Error Details: Code=%d, Message=%s", genErr.Code, genErr.Message)
-			// Проверка на Blocked prompt
-			if strings.Contains(genErr.Message, "blocked") || strings.Contains(genErr.Message, "SAFETY") {
-				log.Printf("[WARN] Gemini Запрос заблокирован (Safety/Policy): %s", genErr.Message)
-				return "[Заблокировано]", fmt.Errorf("запрос заблокирован политикой безопасности: %w", err)
-			}
-			// Проверка на Rate limit (429)
-			if genErr.Code == 429 {
-				log.Printf("[WARN] Gemini Достигнут лимит запросов (429): %s", genErr.Message)
-				return "[Лимит]", fmt.Errorf("достигнут лимит запросов Gemini: %w", err)
-			}
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Text Ошибка API: %v", err)
 		}
-		return "", fmt.Errorf("ошибка генерации ответа Gemini (Text Context): %w", err)
+
+		// Обрабатываем ошибку и проверяем необходимость переключения ключа
+		handledErr := c.handleAPIError(err)
+
+		// Если произошло переключение ключа, пробуем запрос снова
+		if handledErr != nil && handledErr.Error() == "ключ API Gemini был переключен на резервный, повторите запрос" {
+			// Получаем новую модель с обновленным клиентом
+			model = c.genaiClient.GenerativeModel(c.modelName)
+
+			// Применяем те же настройки к новой модели
+			model.SetTemperature(1)
+			model.SetTopP(0.95)
+			model.SetMaxOutputTokens(8192)
+
+			// Устанавливаем системный промпт для новой модели
+			if systemPrompt != "" {
+				model.SystemInstruction = &genai.Content{
+					Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
+				}
+			}
+
+			// Повторяем запрос с новым ключом
+			resp, err = model.GenerateContent(ctx, content...)
+			if err != nil {
+				// Если снова ошибка, возвращаем её
+				return "", fmt.Errorf("ошибка Gemini API при генерации ответа из текстового контекста (после переключения ключа): %w", err)
+			}
+		} else if handledErr != nil {
+			// Если ошибка не связана с переключением ключа, возвращаем обработанную ошибку
+			return "", fmt.Errorf("ошибка Gemini API при генерации ответа из текстового контекста: %w", handledErr)
+		}
 	}
 
-	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
-		log.Println("[WARN] Gemini Ответ (Text Context): Получен пустой ответ или нет валидных частей.")
-		return "", fmt.Errorf("Gemini вернул пустой ответ (Text Context)")
-	}
-
-	// Собираем текст из всех частей ответа
+	// Извлекаем ответ
 	var responseText strings.Builder
-	for _, part := range resp.Candidates[0].Content.Parts {
-		if text, ok := part.(genai.Text); ok {
-			responseText.WriteString(string(text))
+	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
+		for _, part := range resp.Candidates[0].Content.Parts {
+			responseText.WriteString(fmt.Sprintf("%s", part))
 		}
+	} else {
+		if c.debug {
+			log.Printf("[DEBUG] Gemini Text Ответ: Получен пустой ответ или нет кандидатов.")
+		}
+		return "", fmt.Errorf("Gemini API не вернул валидный ответ")
 	}
 
 	finalResponse := responseText.String()
-
 	if c.debug {
-		finishReason := resp.Candidates[0].FinishReason
-		tokenCount := resp.Candidates[0].TokenCount
-		log.Printf("[DEBUG] Gemini Ответ (Text Context): Причина завершения: %s, Токенов: %d", finishReason, tokenCount)
-		log.Printf("[DEBUG] Gemini Ответ (Text Context): %s...", utils.TruncateString(finalResponse, 100))
-	}
-
-	if resp.Candidates[0].FinishReason == genai.FinishReasonSafety || resp.Candidates[0].FinishReason == genai.FinishReasonRecitation {
-		log.Printf("[WARN] Gemini Ответ заблокирован: Причина=%s", resp.Candidates[0].FinishReason)
-		return "[Заблокировано]", fmt.Errorf("ответ заблокирован Gemini: %s", resp.Candidates[0].FinishReason)
+		log.Printf("[DEBUG] Gemini Text Ответ: %s...", utils.TruncateString(finalResponse, 100))
 	}
 
 	return finalResponse, nil
@@ -410,6 +505,13 @@ func (c *Client) GenerateResponseFromTextContext(systemPrompt string, contextTex
 
 // TranscribeAudio транскрибирует аудиоданные с помощью Gemini API
 func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, error) {
+	// Попробуем вернуться к основному ключу, если используется резервный и прошло достаточно времени
+	if c.cfg.GeminiUsingReserveKey {
+		if err := c.tryRevertToMainKey(); err != nil {
+			log.Printf("[WARN] Не удалось вернуться к основному ключу Gemini: %v", err)
+		}
+	}
+
 	// Проверяем, поддерживает ли модель аудио (хотя бы по названию)
 	if !strings.Contains(c.modelName, "1.5") && !strings.Contains(c.modelName, "flash") { // Обновил проверку, flash тоже должен работать
 		log.Printf("[WARN][TranscribeAudio] Текущая модель '%s' может не поддерживать аудио. Для транскрибации рекомендуется Gemini 1.5/2.0 Flash/Pro.", c.modelName)
@@ -437,7 +539,25 @@ func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, err
 		if c.debug {
 			log.Printf("[DEBUG][TranscribeAudio] Ошибка API Gemini: %v", err)
 		}
-		return "", fmt.Errorf("ошибка транскрибации аудио в Gemini: %w", err)
+
+		// Обрабатываем ошибку и проверяем необходимость переключения ключа
+		handledErr := c.handleAPIError(err)
+
+		// Если произошло переключение ключа, пробуем запрос снова
+		if handledErr != nil && handledErr.Error() == "ключ API Gemini был переключен на резервный, повторите запрос" {
+			// Получаем новую модель с обновленным клиентом
+			model = c.genaiClient.GenerativeModel(c.modelName)
+
+			// Повторяем запрос с новым ключом
+			resp, err = model.GenerateContent(ctx, prompt, audioPart)
+			if err != nil {
+				// Если снова ошибка, возвращаем её
+				return "", fmt.Errorf("ошибка транскрибации аудио в Gemini (после переключения ключа): %w", err)
+			}
+		} else if handledErr != nil {
+			// Если ошибка не связана с переключением ключа, возвращаем обработанную ошибку
+			return "", fmt.Errorf("ошибка транскрибации аудио в Gemini: %w", handledErr)
+		}
 	}
 
 	// Извлекаем текст из ответа
@@ -468,6 +588,13 @@ func (c *Client) TranscribeAudio(audioData []byte, mimeType string) (string, err
 
 // EmbedContent генерирует векторное представление (эмбеддинг) для текста с использованием Gemini API.
 func (c *Client) EmbedContent(text string) ([]float32, error) {
+	// Попробуем вернуться к основному ключу, если используется резервный и прошло достаточно времени
+	if c.cfg.GeminiUsingReserveKey {
+		if err := c.tryRevertToMainKey(); err != nil {
+			log.Printf("[WARN] Не удалось вернуться к основному ключу Gemini: %v", err)
+		}
+	}
+
 	ctx := context.Background()
 	em := c.genaiClient.EmbeddingModel(c.embeddingModelName) // Используем модель из конфига
 	if em == nil {
@@ -485,16 +612,28 @@ func (c *Client) EmbedContent(text string) ([]float32, error) {
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Embed Ошибка API: %v", err)
 		}
-		// Попытка извлечь более детальную ошибку из googleapi.Error
-		var gerr *googleapi.Error
-		if errors.As(err, &gerr) {
-			// Если ошибка связана с квотой (429 Too Many Requests)
-			if gerr.Code == 429 {
-				log.Printf("[WARN] Gemini Embed API: Достигнут лимит запросов (429 Too Many Requests) для модели %s.", c.embeddingModelName)
-				return nil, fmt.Errorf("ошибка API Gemini (лимит запросов): %w", err)
+
+		// Обрабатываем ошибку и проверяем необходимость переключения ключа
+		handledErr := c.handleAPIError(err)
+
+		// Если произошло переключение ключа, пробуем запрос снова
+		if handledErr != nil && handledErr.Error() == "ключ API Gemini был переключен на резервный, повторите запрос" {
+			// Получаем новую модель эмбеддингов с обновленным клиентом
+			em = c.genaiClient.EmbeddingModel(c.embeddingModelName)
+			if em == nil {
+				return nil, fmt.Errorf("модель эмбеддингов '%s' не найдена после переключения ключа", c.embeddingModelName)
 			}
+
+			// Повторяем запрос с новым ключом
+			res, err = em.EmbedContent(ctx, genai.Text(sanitizedText))
+			if err != nil {
+				// Если снова ошибка, возвращаем её
+				return nil, fmt.Errorf("ошибка API Gemini при генерации эмбеддинга (после переключения ключа): %w", err)
+			}
+		} else if handledErr != nil {
+			// Если ошибка не связана с переключением ключа, возвращаем обработанную ошибку
+			return nil, handledErr
 		}
-		return nil, fmt.Errorf("ошибка API Gemini при генерации эмбеддинга: %w", err)
 	}
 
 	if res.Embedding == nil || len(res.Embedding.Values) == 0 {
@@ -513,6 +652,13 @@ func (c *Client) EmbedContent(text string) ([]float32, error) {
 
 // GenerateContentWithImage генерирует ответ на основе изображения и текстового промпта
 func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt string, imageData []byte, caption string) (string, error) {
+	// Попробуем вернуться к основному ключу, если используется резервный и прошло достаточно времени
+	if c.cfg.GeminiUsingReserveKey {
+		if err := c.tryRevertToMainKey(); err != nil {
+			log.Printf("[WARN] Не удалось вернуться к основному ключу Gemini: %v", err)
+		}
+	}
+
 	model := c.genaiClient.GenerativeModel(c.modelName)
 
 	// Настройки модели
@@ -561,7 +707,37 @@ func (c *Client) GenerateContentWithImage(ctx context.Context, systemPrompt stri
 		if c.debug {
 			log.Printf("[DEBUG] Gemini Image Ошибка: %v", err)
 		}
-		return "", fmt.Errorf("ошибка генерации анализа изображения: %w", err)
+
+		// Обрабатываем ошибку и проверяем необходимость переключения ключа
+		handledErr := c.handleAPIError(err)
+
+		// Если произошло переключение ключа, пробуем запрос снова
+		if handledErr != nil && handledErr.Error() == "ключ API Gemini был переключен на резервный, повторите запрос" {
+			// Получаем новую модель с обновленным клиентом
+			model = c.genaiClient.GenerativeModel(c.modelName)
+
+			// Применяем те же настройки к новой модели
+			model.SetTemperature(1)
+			model.SetTopP(0.95)
+			model.SetMaxOutputTokens(8192)
+
+			// Устанавливаем системный промпт для новой модели
+			if systemPrompt != "" {
+				model.SystemInstruction = &genai.Content{
+					Parts: []genai.Part{genai.Text(utils.SanitizeUTF8(systemPrompt))},
+				}
+			}
+
+			// Повторяем запрос с новым ключом
+			resp, err = model.GenerateContent(ctx, parts...)
+			if err != nil {
+				// Если снова ошибка, возвращаем её
+				return "", fmt.Errorf("ошибка генерации анализа изображения (после переключения ключа): %w", err)
+			}
+		} else if handledErr != nil {
+			// Если ошибка не связана с переключением ключа, возвращаем обработанную ошибку
+			return "", fmt.Errorf("ошибка генерации анализа изображения: %w", handledErr)
+		}
 	}
 
 	// Извлекаем ответ
@@ -606,4 +782,123 @@ func detectMimeType(data []byte) string {
 	}
 
 	return ""
+}
+
+// switchToReserveKey переключается на резервный ключ API
+func (c *Client) switchToReserveKey() error {
+	c.keyMutex.Lock()
+	defer c.keyMutex.Unlock()
+
+	// Проверяем, что у нас есть резервный ключ и мы еще не используем его
+	if c.cfg.GeminiAPIKeyReserve == "" {
+		return fmt.Errorf("резервный ключ API Gemini не предоставлен")
+	}
+
+	if c.cfg.GeminiUsingReserveKey {
+		return nil // Уже используем резервный ключ
+	}
+
+	// Закрываем текущий клиент, если он существует
+	if c.genaiClient != nil {
+		if err := c.genaiClient.Close(); err != nil {
+			log.Printf("[WARN] Ошибка при закрытии текущего клиента Gemini: %v", err)
+		}
+	}
+
+	// Создаем новый клиент с резервным ключом
+	ctx := context.Background()
+	newClient, err := genai.NewClient(ctx, option.WithAPIKey(c.cfg.GeminiAPIKeyReserve))
+	if err != nil {
+		return fmt.Errorf("ошибка создания клиента genai с резервным ключом: %w", err)
+	}
+
+	// Обновляем клиент и флаг
+	c.genaiClient = newClient
+	c.cfg.GeminiUsingReserveKey = true
+	c.cfg.GeminiLastKeyRotationTime = time.Now()
+
+	log.Printf("[INFO] Gemini: Переключение на резервный ключ API выполнено. Следующая попытка основного ключа через %d часов.", c.cfg.GeminiKeyRotationTimeHours)
+
+	return nil
+}
+
+// tryRevertToMainKey пытается вернуться к основному ключу API, если прошло достаточно времени
+func (c *Client) tryRevertToMainKey() error {
+	c.keyMutex.Lock()
+	defer c.keyMutex.Unlock()
+
+	// Если мы не используем резервный ключ, ничего делать не нужно
+	if !c.cfg.GeminiUsingReserveKey {
+		return nil
+	}
+
+	// Проверяем, прошло ли достаточно времени с последнего переключения
+	timeSinceRotation := time.Since(c.cfg.GeminiLastKeyRotationTime)
+	if timeSinceRotation < time.Duration(c.cfg.GeminiKeyRotationTimeHours)*time.Hour {
+		return nil // Еще рано для переключения обратно
+	}
+
+	// Закрываем текущий клиент, если он существует
+	if c.genaiClient != nil {
+		if err := c.genaiClient.Close(); err != nil {
+			log.Printf("[WARN] Ошибка при закрытии текущего клиента Gemini: %v", err)
+		}
+	}
+
+	// Создаем новый клиент с основным ключом
+	ctx := context.Background()
+	newClient, err := genai.NewClient(ctx, option.WithAPIKey(c.cfg.GeminiAPIKey))
+	if err != nil {
+		// Если не удалось создать клиент с основным ключом, остаемся на резервном
+		log.Printf("[WARN] Не удалось вернуться к основному ключу API: %v. Продолжаем использовать резервный.", err)
+
+		// Пробуем восстановить клиент с резервным ключом
+		reserveClient, reserveErr := genai.NewClient(ctx, option.WithAPIKey(c.cfg.GeminiAPIKeyReserve))
+		if reserveErr != nil {
+			return fmt.Errorf("критическая ошибка: не удалось создать клиента ни с основным, ни с резервным ключом: %w", reserveErr)
+		}
+		c.genaiClient = reserveClient
+		c.cfg.GeminiLastKeyRotationTime = time.Now() // Обновляем время последнего переключения
+
+		return err
+	}
+
+	// Обновляем клиент и флаг
+	c.genaiClient = newClient
+	c.cfg.GeminiUsingReserveKey = false
+	c.cfg.GeminiLastKeyRotationTime = time.Time{} // Сбрасываем время последнего переключения
+
+	log.Printf("[INFO] Gemini: Успешное возвращение к основному ключу API.")
+
+	return nil
+}
+
+// handleAPIError обрабатывает ошибки API и переключается на резервный ключ при необходимости
+func (c *Client) handleAPIError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Проверяем, связана ли ошибка с квотой
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		// Если ошибка связана с квотой (429 Too Many Requests)
+		if gerr.Code == 429 {
+			log.Printf("[WARN] Gemini API: Достигнут лимит запросов (429 Too Many Requests). Пробуем переключиться на резервный ключ.")
+
+			// Проверяем, что у нас есть резервный ключ и мы еще не используем его
+			if c.cfg.GeminiAPIKeyReserve != "" && !c.cfg.GeminiUsingReserveKey {
+				if switchErr := c.switchToReserveKey(); switchErr != nil {
+					log.Printf("[ERROR] Не удалось переключиться на резервный ключ Gemini: %v", switchErr)
+					// Возвращаем оригинальную ошибку
+					return fmt.Errorf("ошибка API Gemini (лимит запросов): %w", err)
+				}
+				// Ключ успешно переключен, возвращаем специальную ошибку для повторного запроса
+				return fmt.Errorf("ключ API Gemini был переключен на резервный, повторите запрос")
+			}
+		}
+	}
+
+	// Для других типов ошибок или если нет резервного ключа, просто возвращаем исходную ошибку
+	return err
 }

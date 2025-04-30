@@ -465,14 +465,9 @@ func (b *Bot) sendErrorReply(chatID int64, replyToMessageID int, errorContext st
 	errorMsg := "⚠️ Извините, возникла проблема при генерации ответа."
 	// Если включен режим отладки, добавляем контекст ошибки в сообщение
 	if b.config.Debug {
-		errorMsg = fmt.Sprintf("⚠️ Ошибка (%s)", errorContext)
+		errorMsg = fmt.Sprintf("❌ Ошибка (%s)", errorContext)
 	}
 
-	msg := tgbotapi.NewMessage(chatID, errorMsg)
-	msg.ReplyToMessageID = replyToMessageID
-	_, err := b.api.Send(msg)
-	if err != nil {
-		// Логируем, если не удалось отправить даже сообщение об ошибке
-		log.Printf("[CRITICAL] НЕ УДАЛОСЬ отправить сообщение об ошибке в чат %d: %v", chatID, err)
-	}
+	// Используем новую функцию для автоудаления сообщения об ошибке
+	b.sendAutoDeleteErrorReply(chatID, replyToMessageID, errorMsg)
 }

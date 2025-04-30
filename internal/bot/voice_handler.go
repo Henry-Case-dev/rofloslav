@@ -90,7 +90,8 @@ func (b *Bot) handleVoiceMessage(message *tgbotapi.Message) error {
 		log.Printf("Chat %d: Ошибка транскрибации аудио из файла %s через embeddingClient (Gemini): %v", chatID, fileID, err)
 		errMsg := fmt.Sprintf("❌ Ошибка транскрибации (Gemini): %v", err)
 		log.Printf("[ERROR] %s", errMsg)
-		b.sendReply(message.Chat.ID, errMsg)
+		// Используем функцию с автоудалением сообщения об ошибке
+		b.sendAutoDeleteErrorReply(message.Chat.ID, messageID, errMsg)
 		return fmt.Errorf("ошибка транскрипции (Gemini): %w", err)
 	}
 
