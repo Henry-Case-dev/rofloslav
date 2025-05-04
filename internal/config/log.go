@@ -95,45 +95,24 @@ func logLoadedConfig(cfg *Config) {
 	}
 	// --- Конец логгирования ---
 
+	// --- Логгирование настроек модерации ---
+	log.Printf("  ModInterval: %d", cfg.ModInterval)
+	log.Printf("  ModMuteTimeMin: %d", cfg.ModMuteTimeMin)
+	log.Printf("  ModBanTimeMin: %d", cfg.ModBanTimeMin)
+	log.Printf("  ModPurgeDuration: %v", cfg.ModPurgeDuration)
+	log.Printf("  ModCheckAdminRights: %t", cfg.ModCheckAdminRights)
+	log.Printf("  ModDefaultNotify: %t", cfg.ModDefaultNotify)
+	log.Printf("  ModRules Count: %d", len(cfg.ModRules))
+	// Опционально: можно добавить более детальное логгирование правил,
+	// но нужно быть осторожным с потенциально длинными llm_instruction.
+	/*
+		for i, rule := range cfg.ModRules {
+			log.Printf("    Rule #%d (%s): ChatID=%s(%d), UserID=%s(%d), Keywords=%d, Punishment=%s, LLM=%t, NotifyUser=%t, NotifyChat=%t",
+				i+1, rule.RuleName, rule.ChatID, rule.ParsedChatID, rule.UserID, rule.ParsedUserID, len(rule.Keywords),
+				rule.Punishment, rule.LLMInstruction != "none", rule.NotifyUser, rule.NotifyChat)
+		}
+	*/
+	// --- Конец логгирования модерации ---
+
 	log.Println("--- Конфигурация завершена ---")
 }
-
-/* // Комментируем или удаляем ошибочно размещенный код
-func validateConfig(cfg *Config) error {
-	if cfg.MongoCleanupChunkDurationHours <= 0 {
-		return fmt.Errorf("MONGO_CLEANUP_CHUNK_DURATION_HOURS (%d) должен быть > 0", cfg.MongoCleanupChunkDurationHours)
-	}
-
-	// --- Валидация настроек Auto Bio ---
-	if cfg.AutoBioEnabled {
-		if cfg.AutoBioIntervalHours <= 0 {
-			return fmt.Errorf("AUTO_BIO_INTERVAL_HOURS (%d) должен быть > 0, если AutoBio включен", cfg.AutoBioIntervalHours)
-		}
-		if cfg.AutoBioInitialAnalysisPrompt == "" {
-			return fmt.Errorf("AUTO_BIO_INITIAL_ANALYSIS_PROMPT не должен быть пустым, если AutoBio включен")
-		}
-		if cfg.AutoBioUpdatePrompt == "" {
-			return fmt.Errorf("AUTO_BIO_UPDATE_PROMPT не должен быть пустым, если AutoBio включен")
-		}
-		if cfg.AutoBioMessagesLookbackDays <= 0 {
-			return fmt.Errorf("AUTO_BIO_MESSAGES_LOOKBACK_DAYS (%d) должен быть > 0", cfg.AutoBioMessagesLookbackDays)
-		}
-		if cfg.AutoBioMinMessagesForAnalysis < 0 { // Может быть 0, если хотим анализировать даже с одним сообщением
-			return fmt.Errorf("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS (%d) должен быть >= 0", cfg.AutoBioMinMessagesForAnalysis)
-		}
-		// Дополнительно: Проверить, что промпты содержат нужные плейсхолдеры? (пока опционально)
-		// Проверим наличие плейсхолдеров %s
-		if cfg.AutoBioInitialAnalysisPrompt != "" && (!strings.Contains(cfg.AutoBioInitialAnalysisPrompt, "%s")) {
-			log.Println("[WARN] AUTO_BIO_INITIAL_ANALYSIS_PROMPT не содержит плейсхолдеры %s для имени и сообщений.")
-		}
-		if cfg.AutoBioUpdatePrompt != "" && (!strings.Contains(cfg.AutoBioUpdatePrompt, "%s") || strings.Count(cfg.AutoBioUpdatePrompt, "%s") < 3) {
-			log.Println("[WARN] AUTO_BIO_UPDATE_PROMPT не содержит плейсхолдеры %s для имени, старого био и новых сообщений.")
-		}
-		log.Printf("    AutoBioMinMessagesForAnalysis: %d", cfg.AutoBioMinMessagesForAnalysis)
-		log.Printf("    AutoBioMaxMessagesForAnalysis: %d", cfg.AutoBioMaxMessagesForAnalysis)
-	}
-	// --- Конец валидации Auto Bio ---
-
-	return nil
-}
-*/

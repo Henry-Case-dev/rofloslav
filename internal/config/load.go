@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/url" // Нужен для maskSecretURI
 	"os"
@@ -251,7 +253,6 @@ func Load() (*Config, error) {
 		log.Printf("Ошибка парсинга DIRECT_REPLY_LIMIT_COUNT_DEFAULT ('%s') или значение <= 0: %v, используем 2", directLimitCountStr, err)
 		directLimitCount = 2
 	}
-	directLimitDurationStr = getEnvOrDefault("DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT", "10")
 	directLimitDurationMinutes, err := strconv.Atoi(directLimitDurationStr)
 	if err != nil || directLimitDurationMinutes <= 0 {
 		log.Printf("Ошибка парсинга DIRECT_REPLY_LIMIT_DURATION_MINUTES_DEFAULT ('%s') или значение <= 0: %v, используем 10", directLimitDurationStr, err)
@@ -314,6 +315,16 @@ func Load() (*Config, error) {
 	}
 
 	// --- Конец загрузки настроек автоочистки MongoDB ---
+
+	// --- Загрузка настроек модерации ---
+	modIntervalStr := getEnvOrDefault("MOD_INTERVAL", "10")
+	modMuteTimeMinStr := getEnvOrDefault("MOD_MUTE_TIME_MIN", "60")
+	modBanTimeMinStr := getEnvOrDefault("MOD_BAN_TIME_MIN", "1440")
+	modPurgeDurationStr := getEnvOrDefault("MOD_PURGE_TIME_MIN", "1m")
+	modCheckAdminRightsStr := getEnvOrDefault("MOD_CHECK_ADMIN_RIGHTS", "true")
+	modDefaultNotifyStr := getEnvOrDefault("MOD_DEFAULT_NOTIFY", "true")
+	modRulesJSON := getEnvOrDefault("MOD_RULES", "[]")
+	// --- Конец загрузки настроек модерации ---
 
 	cfg := Config{
 		TelegramToken:                    telegramToken,
@@ -402,7 +413,62 @@ func Load() (*Config, error) {
 		AutoBioMessagesLookbackDays:      parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MESSAGES_LOOKBACK_DAYS", "30"), 30),
 		AutoBioMinMessagesForAnalysis:    parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MIN_MESSAGES_FOR_ANALYSIS", "10"), 10),
 		AutoBioMaxMessagesForAnalysis:    parseIntOrDefault(getEnvOrDefault("AUTO_BIO_MAX_MESSAGES_FOR_ANALYSIS", "2500"), 2500),
+		// --- Заполнение настроек модерации ---
+		ModInterval:         parseIntOrDefault(modIntervalStr, 10),
+		ModMuteTimeMin:      parseIntOrDefault(modMuteTimeMinStr, 60),
+		ModBanTimeMin:       parseIntOrDefault(modBanTimeMinStr, 1440),
+		ModPurgeDuration:    0,
+		ModCheckAdminRights: parseBoolOrDefault(modCheckAdminRightsStr, true),
+		ModDefaultNotify:    parseBoolOrDefault(modDefaultNotifyStr, true),
+		ModRules:            []ModerationRule{}, // Инициализация пустым срезом
+		// --- Конец заполнения ---
 	}
+
+	// --- Парсинг правил модерации из JSON ---
+	if err := json.Unmarshal([]byte(modRulesJSON), &cfg.ModRules); err != nil {
+		log.Printf("[Config Load ERROR] Ошибка парсинга MOD_RULES JSON: %v. JSON: %s", err, modRulesJSON)
+		// Можно вернуть ошибку или продолжить с пустыми правилами
+		return nil, fmt.Errorf("ошибка парсинга MOD_RULES: %w", err)
+	}
+	log.Printf("[Config Load] Загружено %d правил модерации.", len(cfg.ModRules))
+
+	// Устанавливаем Duration для Purge из строки
+	if dur, err := time.ParseDuration(modPurgeDurationStr); err != nil {
+		log.Printf("[Config Load WARN] Неверный формат MOD_PURGE_TIME_MIN ('%s'), ожидается duration (например '1m', '30s'): %v. Используется 1m.", modPurgeDurationStr, err)
+		cfg.ModPurgeDuration = time.Minute
+	} else {
+		cfg.ModPurgeDuration = dur
+	}
+
+	// --- Парсинг ID в правилах ---
+	for i := range cfg.ModRules {
+		rule := &cfg.ModRules[i] // Получаем указатель для модификации
+
+		if strings.ToLower(rule.ChatID) == "none" {
+			rule.ParsedChatID = 0 // Используем 0 как признак "все чаты"
+		} else {
+			parsed, err := strconv.ParseInt(rule.ChatID, 10, 64)
+			if err != nil {
+				log.Printf("[Config Load WARN] Ошибка парсинга chat_id '%s' в правиле '%s': %v. Правило будет игнорироваться для конкретных чатов.", rule.ChatID, rule.RuleName, err)
+				rule.ParsedChatID = -1 // Используем -1 как признак ошибки парсинга
+			} else {
+				rule.ParsedChatID = parsed
+			}
+		}
+
+		if strings.ToLower(rule.UserID) == "none" {
+			rule.ParsedUserID = 0 // Используем 0 как признак "все пользователи"
+		} else {
+			parsed, err := strconv.ParseInt(rule.UserID, 10, 64)
+			if err != nil {
+				log.Printf("[Config Load WARN] Ошибка парсинга user_id '%s' в правиле '%s': %v. Правило будет игнорироваться для конкретных пользователей.", rule.UserID, rule.RuleName, err)
+				rule.ParsedUserID = -1 // Используем -1 как признак ошибки парсинга
+			} else {
+				rule.ParsedUserID = parsed
+			}
+		}
+	}
+	// --- Конец парсинга ID ---
 
 	// Загрузка списка администраторов
 	adminUsernamesStr = getEnvOrDefault("ADMIN_USERNAMES", "lightnight")

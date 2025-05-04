@@ -33,9 +33,10 @@ type Bot struct {
 	stop                  chan struct{}
 	summaryMutex          sync.RWMutex
 	lastSummaryRequest    map[int64]time.Time
-	autoSummaryTicker     *time.Ticker  // Оставляем для авто-саммари
-	randSource            *rand.Rand    // Источник случайных чисел
-	autoBioSemaphore      chan struct{} // Семафор для ограничения параллельного анализа AutoBio
+	autoSummaryTicker     *time.Ticker       // Оставляем для авто-саммари
+	randSource            *rand.Rand         // Источник случайных чисел
+	autoBioSemaphore      chan struct{}      // Семафор для ограничения параллельного анализа AutoBio
+	moderation            *ModerationService // Сервис модерации
 }
 
 // New создает и инициализирует новый экземпляр бота
@@ -150,7 +151,11 @@ func New(cfg *config.Config) (*Bot, error) {
 		autoSummaryTicker:     nil,
 		randSource:            randGen,
 		autoBioSemaphore:      make(chan struct{}, 1), // Инициализация семафора
+		// moderation будет инициализирован ниже
 	}
+
+	// Инициализация сервиса модерации ПОСЛЕ создания объекта Bot
+	b.moderation = NewModerationService(b)
 
 	// Загрузка всех настроек чатов при старте
 	b.loadAllChatSettingsFromStorage()
@@ -535,6 +540,13 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 			// Бот добавлен или вернулся
 			log.Printf("Бот добавлен или вернулся в чат %d.", chatID)
 			// Настройки должны были быть созданы в ensureChatInitializedAndWelcome
+			// Запускаем проверку прав для активации модерации
+			go b.moderation.CheckAdminRightsAndActivate(chatID)
+		} else if myStatus == "administrator" {
+			// Боту дали права администратора
+			log.Printf("Бот получил права администратора в чате %d.", chatID)
+			// Запускаем проверку прав для активации модерации
+			go b.moderation.CheckAdminRightsAndActivate(chatID)
 		}
 	} else {
 		// Изменение статуса другого пользователя (не бота)

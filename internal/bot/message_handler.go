@@ -288,6 +288,15 @@ func (b *Bot) handleMessage(update tgbotapi.Update) {
 		// Оставляем вызов здесь, он будет исправлен позже при модификации структуры Bot
 		go b.updateUserProfileIfNeeded(chatID, message.From, message.Date) // Передаем оригинальное время сообщения
 	}
+
+	// === Обработка модерацией ===
+	// Вызываем ProcessIncomingMessage ПОСЛЕ сохранения сообщения в хранилище
+	// и ПОСЛЕ обработки других важных кейсов (прямые ответы, команды, ввод настроек)
+	if b.moderation != nil {
+		// Передаем оригинальное сообщение (message), а не textMessage,
+		// так как textMessage может быть результатом транскрипции, а нам нужно оригинальное.
+		b.moderation.ProcessIncomingMessage(update.Message)
+	}
 }
 
 // Commenting out moved function sendReplyAndDeleteAfter

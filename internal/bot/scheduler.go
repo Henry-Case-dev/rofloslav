@@ -381,7 +381,7 @@ func (b *Bot) runAutoBioAnalysisForChat(chatID int64) {
 		// Проверяем стоп-сигнал перед запуском горутины
 		select {
 		case <-b.stop:
-			log.Println("[AutoBio] Остановка во время итерации по пользователям чата %d.", chatID)
+			log.Printf("[AutoBio] Остановка во время итерации по пользователям чата %d.", chatID)
 			return
 		default:
 		}

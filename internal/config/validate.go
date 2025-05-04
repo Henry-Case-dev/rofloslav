@@ -184,5 +184,49 @@ func ValidateConfig(cfg *Config) error {
 	}
 	// --- Конец валидации Auto Bio ---
 
+	// --- Валидация настроек модерации ---
+	if cfg.ModInterval <= 0 {
+		return fmt.Errorf("MOD_INTERVAL (%d) должен быть > 0", cfg.ModInterval)
+	}
+	if cfg.ModMuteTimeMin < 0 {
+		return fmt.Errorf("MOD_MUTE_TIME_MIN (%d) должен быть >= 0 (0 - навсегда)", cfg.ModMuteTimeMin)
+	}
+	if cfg.ModBanTimeMin < 0 {
+		return fmt.Errorf("MOD_BAN_TIME_MIN (%d) должен быть >= 0 (0 - навсегда)", cfg.ModBanTimeMin)
+	}
+	if cfg.ModPurgeDuration <= 0 {
+		return fmt.Errorf("MOD_PURGE_TIME_MIN (%s) должен быть > 0 (например '30s' или '1m')", cfg.ModPurgeDuration)
+	}
+
+	// Валидация правил
+	validPunishments := map[PunishmentType]bool{
+		PunishMute:  true,
+		PunishKick:  true,
+		PunishBan:   true,
+		PunishPurge: true,
+		PunishNone:  true,
+	}
+	for i, rule := range cfg.ModRules {
+		if rule.RuleName == "" {
+			log.Printf("[Config Validate WARN] Правило модерации #%d не имеет имени (rule_name).", i+1)
+			// Не фатально, но лучше предупредить
+		}
+		if !validPunishments[rule.Punishment] {
+			return fmt.Errorf("недопустимый тип наказания '%s' в правиле '%s' (№%d)", rule.Punishment, rule.RuleName, i+1)
+		}
+		if rule.ParsedChatID == -1 {
+			log.Printf("[Config Validate WARN] Не удалось распарсить chat_id ('%s') в правиле '%s' (№%d). Правило будет применяться только если chat_id='none'.", rule.ChatID, rule.RuleName, i+1)
+			// Не фатально, правило просто не будет срабатывать для конкретных чатов
+		}
+		if rule.ParsedUserID == -1 {
+			log.Printf("[Config Validate WARN] Не удалось распарсить user_id ('%s') в правиле '%s' (№%d). Правило будет применяться только если user_id='none'.", rule.UserID, rule.RuleName, i+1)
+			// Не фатально, правило просто не будет срабатывать для конкретных пользователей
+		}
+		if len(rule.Keywords) == 0 {
+			return fmt.Errorf("список keywords не должен быть пустым в правиле '%s' (№%d). Используйте [\"Любые\"] для срабатывания без ключевых слов.", rule.RuleName, i+1)
+		}
+	}
+	// --- Конец валидации модерации ---
+
 	return nil
 }

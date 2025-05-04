@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Henry-Case-dev/rofloslav/internal/bot"
@@ -20,6 +21,14 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	f, err := os.OpenFile("cursor_logs.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666)
+	if err != nil {
+		log.Fatalf("Не удалось открыть файл логов: %v", err)
+	}
+	defer f.Close()
+	log.SetOutput(f)                             // Перенаправляем все вызовы log.* в файл
+	log.SetFlags(log.LstdFlags | log.Lshortfile) // По желанию: формат логов
+
 	log.Println("=== Application Starting ===")
 	log.Printf("Timestamp: %s", time.Now().UTC().Format(time.RFC3339))
 

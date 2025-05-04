@@ -210,6 +210,41 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		// Сообщение о запуске удаляем через 15 секунд
 		go b.sendAndDeleteAfter(chatID, "⏳ Запускаю анализ AutoBio для всех пользователей этого чата. Это может занять некоторое время...", 15*time.Second)
 
+	// --- Admin Command: /stop_purge ---
+	case "stop_purge":
+		if !isUserAdmin {
+			b.sendReply(chatID, "🚫 У вас нет прав для выполнения этой команды.")
+			return
+		}
+
+		args := message.CommandArguments()
+		if args == "" {
+			go b.sendAndDeleteAfter(chatID, "⚠️ Укажите @username пользователя, для которого нужно остановить очистку сообщений. Пример: `/stop_purge @имя_пользователя`", 15*time.Second)
+			return
+		}
+
+		targetUsername := strings.TrimSpace(args)
+		if !strings.HasPrefix(targetUsername, "@") {
+			targetUsername = "@" + targetUsername // Добавляем @, если его нет
+		}
+
+		log.Printf("[ADMIN CMD] Пользователь %s (%d) инициировал команду /stop_purge для %s в чате %d.", username, userID, targetUsername, chatID)
+
+		// Ищем пользователя по username в этом чате
+		targetUserID, err := b.getUserIDByUsername(chatID, targetUsername)
+		if err != nil {
+			log.Printf("[ADMIN CMD /stop_purge WARN] Не удалось найти пользователя %s в чате %d: %v", targetUsername, chatID, err)
+			go b.sendAndDeleteAfter(chatID, fmt.Sprintf("⚠️ Не удалось найти пользователя %s в этом чате.", targetUsername), 15*time.Second)
+			return
+		}
+
+		// Вызываем метод остановки purge
+		if b.moderation.StopPurge(chatID, targetUserID) {
+			go b.sendAndDeleteAfter(chatID, fmt.Sprintf("✅ Активная задача очистки сообщений для %s остановлена.", targetUsername), 10*time.Second)
+		} else {
+			go b.sendAndDeleteAfter(chatID, fmt.Sprintf("ℹ️ Для пользователя %s не найдено активных задач очистки сообщений.", targetUsername), 10*time.Second)
+		}
+
 	default:
 		// Проверяем, не админская ли это команда, чтобы не писать "Неизвестная команда" админам
 		if !isUserAdmin {

@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -137,4 +138,34 @@ func (b *Bot) sendAutoDeleteErrorReply(chatID int64, replyToMessageID int, error
 			log.Printf("[DEBUG] Автоматически удалено сообщение об ошибке (ID: %d) в чате %d", mID, cID)
 		}
 	}(chatID, sentMsg.MessageID, b.config.ErrorMessageAutoDeleteSeconds)
+}
+
+// getBotMember получает информацию о боте как участнике чата
+func (b *Bot) getBotMember(chatID int64) (*tgbotapi.ChatMember, error) {
+	memberConfig := tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: chatID,
+			UserID: b.api.Self.ID,
+		},
+	}
+	member, err := b.api.GetChatMember(memberConfig)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения информации о боте в чате %d: %w", chatID, err)
+	}
+	return &member, nil
+}
+
+// sendAutoDeleteMessage отправляет сообщение и удаляет его через указанную задержку
+func (b *Bot) sendAutoDeleteMessage(chatID int64, text string, delay time.Duration) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("[sendAutoDeleteMessage ERROR] Чат %d: Ошибка отправки сообщения для автоудаления: %v", chatID, err)
+		return
+	}
+
+	// Запускаем таймер для удаления сообщения
+	time.AfterFunc(delay, func() {
+		b.deleteMessage(chatID, sentMsg.MessageID)
+	})
 }
