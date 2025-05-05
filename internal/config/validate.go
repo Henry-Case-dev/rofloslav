@@ -205,6 +205,7 @@ func ValidateConfig(cfg *Config) error {
 		PunishBan:   true,
 		PunishPurge: true,
 		PunishNone:  true,
+		PunishEdit:  true,
 	}
 	for i, rule := range cfg.ModRules {
 		if rule.RuleName == "" {

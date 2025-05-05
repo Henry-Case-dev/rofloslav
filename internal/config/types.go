@@ -30,19 +30,21 @@ const (
 	PunishBan   PunishmentType = "ban"
 	PunishPurge PunishmentType = "purge"
 	PunishNone  PunishmentType = "none"
+	PunishEdit  PunishmentType = "edit" // Новый тип наказания: редактировать сообщение
 )
 
 // ModerationRule определяет структуру одного правила модерации
 type ModerationRule struct {
-	RuleName       string         `json:"rule_name"`
-	ChatID         string         `json:"chat_id"` // "none" or Telegram ID as string
-	UserID         string         `json:"user_id"` // "none" or Telegram ID as string
-	Keywords       []string       `json:"keywords"`
-	LLMInstruction string         `json:"llm_instruction"` // "none" or prompt for LLM
-	Punishment     PunishmentType `json:"punishment"`
-	NotifyUser     bool           `json:"notify_user"`
-	NotifyChat     bool           `json:"notify_chat"`
-	PunishmentNote string         `json:"punishment_note"`
+	RuleName        string         `json:"rule_name"`
+	ChatID          string         `json:"chat_id"` // "none" or Telegram ID as string
+	UserID          string         `json:"user_id"` // "none" or Telegram ID as string
+	Keywords        []string       `json:"keywords"`
+	LLMInstruction  string         `json:"llm_instruction"` // "none" or prompt for LLM
+	Punishment      PunishmentType `json:"punishment"`
+	NotifyUser      bool           `json:"notify_user"`
+	NotifyChat      bool           `json:"notify_chat"`
+	PunishmentNote  string         `json:"punishment_note"`
+	ReplacementText string         `json:"replacement_text"` // Текст для замены при PunishEdit
 	// Parsed fields (filled after loading)
 	ParsedChatID int64 `json:"-"`
 	ParsedUserID int64 `json:"-"`

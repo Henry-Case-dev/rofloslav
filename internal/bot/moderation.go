@@ -399,24 +399,61 @@ func (ms *ModerationService) applyPunishment(chatID int64, userID int64, usernam
 		}
 
 	case config.PunishPurge:
+		// Запускаем отложенный purge: после истечения ModPurgeDuration
 		purgeDuration := ms.bot.config.ModPurgeDuration
-		log.Printf("%s Запуск PURGE сообщений пользователя за последние %v.", logPrefix, purgeDuration)
-		// Запускаем асинхронную очистку
+		log.Printf("%s Запуск отложенной очистки %v.", logPrefix, purgeDuration)
+		// Контекст для отмены задачи по команде /stop_purge
 		purgeCtx, cancelFunc := context.WithCancel(context.Background())
-		ms.mutex.Lock() // Защищаем доступ к activePurges
+		// Регистрируем cancelFunc
+		ms.mutex.Lock()
+		if ms.activePurges == nil {
+			ms.activePurges = make(map[int64]map[int64]context.CancelFunc)
+		}
 		if _, ok := ms.activePurges[chatID]; !ok {
 			ms.activePurges[chatID] = make(map[int64]context.CancelFunc)
 		}
-		// Отменяем предыдущий purge для этого юзера, если он был
-		if existingCancel, ok := ms.activePurges[chatID][userID]; ok {
-			log.Printf("%s Обнаружен предыдущий активный purge, отменяем его.", logPrefix)
-			existingCancel()
+		// Отменяем предыдущий, если есть
+		if prev, ok := ms.activePurges[chatID][userID]; ok {
+			log.Printf("%s Отмена предыдущей задачи purge.", logPrefix)
+			prev()
 		}
 		ms.activePurges[chatID][userID] = cancelFunc
 		ms.mutex.Unlock()
+		// Запуск горутины для таймера
+		go func() {
+			timer := time.NewTimer(purgeDuration)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				// Время вышло — выполняем очистку
+				ms.purgeUserMessages(purgeCtx, chatID, userID, purgeDuration, rule.RuleName)
+			case <-purgeCtx.Done():
+				// Задача отменена — убираем запись
+				ms.mutex.Lock()
+				if chatMap, ok := ms.activePurges[chatID]; ok {
+					delete(chatMap, userID)
+					if len(chatMap) == 0 {
+						delete(ms.activePurges, chatID)
+					}
+				}
+				ms.mutex.Unlock()
+			}
+		}()
+		success = true // Задача запланирована
 
-		go ms.purgeUserMessages(purgeCtx, chatID, userID, purgeDuration, rule.RuleName)
-		success = true // Считаем успешным запуск задачи
+	case config.PunishEdit:
+		// EDIT: удаляем исходное сообщение и отправляем замену
+		ms.bot.deleteMessage(chatID, triggerMessage.MessageID)
+		if rule.ReplacementText != "" {
+			msg := tgbotapi.NewMessage(chatID, rule.ReplacementText)
+			_, apiErr = ms.bot.api.Send(msg)
+			if apiErr == nil {
+				success = true
+				log.Printf("%s Применен EDIT: сообщение заменено на '%s'.", logPrefix, rule.ReplacementText)
+			}
+		} else {
+			success = true
+		}
 
 	case config.PunishNone:
 		log.Printf("%s Тип наказания 'none', никаких действий не предпринято.", logPrefix)
@@ -450,6 +487,9 @@ func (ms *ModerationService) applyPunishment(chatID int64, userID int64, usernam
 
 		baseNotifyText := fmt.Sprintf("Модерация: К @%s применено наказание '%s'%s по правилу '%s'.",
 			username, rule.Punishment, punishmentDurationStr, rule.RuleName)
+		if rule.Punishment == config.PunishEdit {
+			baseNotifyText = fmt.Sprintf("Модерация: Сообщение пользователя @%s заменено по правилу '%s'.", username, rule.RuleName)
+		}
 		if rule.Punishment == config.PunishKick {
 			baseNotifyText = fmt.Sprintf("Модерация: @%s кикнут по правилу '%s'.", username, rule.RuleName)
 		}
