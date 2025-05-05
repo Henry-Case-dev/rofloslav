@@ -419,6 +419,8 @@ func (b *Bot) ensureChatInitializedAndWelcome(update tgbotapi.Update) (*ChatSett
 
 		// После приветствия загружаем историю
 		go b.loadChatHistory(chatID)
+		// Активируем модерацию для нового чата
+		go b.moderation.CheckAdminRightsAndActivate(chatID)
 	}
 
 	return settings, justInitialized
@@ -505,6 +507,8 @@ func (b *Bot) loadAllChatSettingsFromStorage() {
 		}
 		b.chatSettings[chatID] = memSettings
 		loadedCount++
+		// Активируем модерацию для этого чата после загрузки настроек при старте
+		go b.moderation.CheckAdminRightsAndActivate(chatID)
 	}
 
 	log.Printf("Загружено настроек для %d чатов. Ошибок: %d.", loadedCount, failedCount)
