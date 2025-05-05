@@ -175,7 +175,7 @@ type Config struct {
 	ModInterval         int              `json:"-"` // Interval for checking messages
 	ModMuteTimeMin      int              `json:"-"` // Mute duration in minutes (0 = forever)
 	ModBanTimeMin       int              `json:"-"` // Ban duration in minutes (0 = forever)
-	ModPurgeDuration    time.Duration    `json:"-"` // Duration for message deletion (e.g., "1m", "30s")
+	ModPurgeDuration    time.Duration    `json:"-"` // Duration for message deletion (in minutes)
 	ModCheckAdminRights bool             `json:"-"` // Check bot admin rights before enabling moderation
 	ModDefaultNotify    bool             `json:"-"` // Default notification setting for punishments
 	ModRules            []ModerationRule `json:"-"` // Parsed moderation rules

@@ -194,8 +194,8 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.ModBanTimeMin < 0 {
 		return fmt.Errorf("MOD_BAN_TIME_MIN (%d) должен быть >= 0 (0 - навсегда)", cfg.ModBanTimeMin)
 	}
-	if cfg.ModPurgeDuration <= 0 {
-		return fmt.Errorf("MOD_PURGE_TIME_MIN (%s) должен быть > 0 (например '30s' или '1m')", cfg.ModPurgeDuration)
+	if cfg.ModPurgeDuration < 0 {
+		return fmt.Errorf("MOD_PURGE_TIME_MIN (%v) должен быть >= 0 (0 - мгновенная очистка)", cfg.ModPurgeDuration)
 	}
 
 	// Валидация правил

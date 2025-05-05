@@ -320,7 +320,7 @@ func Load() (*Config, error) {
 	modIntervalStr := getEnvOrDefault("MOD_INTERVAL", "10")
 	modMuteTimeMinStr := getEnvOrDefault("MOD_MUTE_TIME_MIN", "60")
 	modBanTimeMinStr := getEnvOrDefault("MOD_BAN_TIME_MIN", "1440")
-	modPurgeDurationStr := getEnvOrDefault("MOD_PURGE_TIME_MIN", "1m")
+	modPurgeDurationStr := getEnvOrDefault("MOD_PURGE_TIME_MIN", "1")
 	modCheckAdminRightsStr := getEnvOrDefault("MOD_CHECK_ADMIN_RIGHTS", "true")
 	modDefaultNotifyStr := getEnvOrDefault("MOD_DEFAULT_NOTIFY", "true")
 	modRulesJSON := getEnvOrDefault("MOD_RULES", "[]")
@@ -432,12 +432,13 @@ func Load() (*Config, error) {
 	}
 	log.Printf("[Config Load] Загружено %d правил модерации.", len(cfg.ModRules))
 
-	// Устанавливаем Duration для Purge из строки
-	if dur, err := time.ParseDuration(modPurgeDurationStr); err != nil {
-		log.Printf("[Config Load WARN] Неверный формат MOD_PURGE_TIME_MIN ('%s'), ожидается duration (например '1m', '30s'): %v. Используется 1m.", modPurgeDurationStr, err)
-		cfg.ModPurgeDuration = time.Minute
-	} else {
+	// Устанавливаем задержку для очистки сообщений (MOD_PURGE_TIME_MIN): поддержка duration (например "30s", "2m") или целых минут
+	if dur, err := time.ParseDuration(modPurgeDurationStr); err == nil {
 		cfg.ModPurgeDuration = dur
+	} else {
+		minutes := parseIntOrDefault(modPurgeDurationStr, 1)
+		cfg.ModPurgeDuration = time.Duration(minutes) * time.Minute
+		log.Printf("[Config Load] MOD_PURGE_TIME_MIN='%s' распознан как %d минут(ы)", modPurgeDurationStr, minutes)
 	}
 
 	// --- Парсинг ID в правилах ---
