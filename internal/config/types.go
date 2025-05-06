@@ -172,12 +172,13 @@ type Config struct {
 	AutoBioMaxMessagesForAnalysis int    // Макс. кол-во сообщений пользователя для анализа (для LLM)
 	// --- КОНЕЦ Настроек Auto Bio ---
 	// --- НОВЫЕ Настройки модерации ---
-	ModInterval         int              `json:"-"` // Interval for checking messages
-	ModMuteTimeMin      int              `json:"-"` // Mute duration in minutes (0 = forever)
-	ModBanTimeMin       int              `json:"-"` // Ban duration in minutes (0 = forever)
-	ModPurgeDuration    time.Duration    `json:"-"` // Duration for message deletion (in minutes)
-	ModCheckAdminRights bool             `json:"-"` // Check bot admin rights before enabling moderation
-	ModDefaultNotify    bool             `json:"-"` // Default notification setting for punishments
-	ModRules            []ModerationRule `json:"-"` // Parsed moderation rules
+	ModInterval         int              `json:"-"`                                        // Interval for checking messages
+	ModMuteTimeMin      int              `env:"MOD_MUTE_TIME_MIN" envDefault:"5"`          // Default mute time in minutes
+	ModBanTimeMin       int              `env:"MOD_BAN_TIME_MIN" envDefault:"60"`          // Default ban time in minutes
+	ModPurgeDuration    time.Duration    `env:"MOD_PURGE_WINDOW_DURATION" envDefault:"1h"` // Duration for purging messages (window)
+	ModPurgeDelay       time.Duration    `env:"MOD_PURGE_DELAY_DURATION" envDefault:"0s"`  // Delay before starting purge
+	ModCheckAdminRights bool             `env:"MOD_CHECK_ADMIN_RIGHTS" envDefault:"true"`  // Check if bot is admin before activating moderation
+	ModDefaultNotify    bool             `env:"MOD_DEFAULT_NOTIFY" envDefault:"false"`     // Default notification setting for rules without explicit value
+	ModRules            []ModerationRule `env:"MOD_RULES"`                                 // Moderation rules (JSON string)
 	// --- КОНЕЦ Настроек модерации ---
 }

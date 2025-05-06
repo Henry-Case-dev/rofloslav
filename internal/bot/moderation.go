@@ -24,6 +24,7 @@ type ModerationService struct {
 	rules        []config.ModerationRule // Загруженные правила модерации
 	activeChats  map[int64]bool          // Чаты, в которых модерация активна [chatID]isActive
 	mutex        sync.RWMutex            // Мьютекс для защиты доступа к картам
+	purgeWG      sync.WaitGroup          // WaitGroup для ожидания завершения очистки
 }
 
 // NewModerationService создает новый экземпляр сервиса модерации
@@ -36,6 +37,7 @@ func NewModerationService(bot *Bot) *ModerationService {
 		rules:           bot.config.ModRules, // Копируем правила из конфига
 		activeChats:     make(map[int64]bool),
 		mutex:           sync.RWMutex{},
+		purgeWG:         sync.WaitGroup{},
 	}
 }
 
@@ -399,56 +401,42 @@ func (ms *ModerationService) applyPunishment(chatID int64, userID int64, usernam
 		}
 
 	case config.PunishPurge:
-		// Обработка очистки сообщений (Purge)
-		purgeDuration := ms.bot.config.ModPurgeDuration
-		triggerTime := time.Unix(int64(triggerMessage.Date), 0)
-		if purgeDuration <= 0 {
-			// Мгновенная очистка без задержки
-			log.Printf("%s Мгновенная очистка сообщений.", logPrefix)
-			ms.purgeUserMessages(context.Background(), chatID, userID, triggerTime, rule.RuleName)
-			success = true
-			break
-		}
-		// Планируем массовую очистку сообщений через ModPurgeDuration
-		log.Printf("%s Запланирована очистка сообщений через %v.", logPrefix, purgeDuration)
-		// Подготовка контекста для отмены задачи (/stop_purge)
-		purgeCtx, cancelFunc := context.WithCancel(context.Background())
-		// Регистрация задачи очистки
-		ms.mutex.Lock()
-		if ms.activePurges == nil {
-			ms.activePurges = make(map[int64]map[int64]context.CancelFunc)
-		}
-		if ms.activePurges[chatID] == nil {
-			ms.activePurges[chatID] = make(map[int64]context.CancelFunc)
-		}
-		if prev, ok := ms.activePurges[chatID][userID]; ok {
-			log.Printf("%s Отмена предыдущей задачи purge.", logPrefix)
-			prev()
-		}
-		ms.activePurges[chatID][userID] = cancelFunc
-		ms.mutex.Unlock()
-		// Запуск отложенной очистки по таймеру
-		go func(chID, uID int64, startTime time.Time, ctx context.Context, ruleName string) {
-			timer := time.NewTimer(purgeDuration)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				ms.purgeUserMessages(ctx, chID, uID, startTime, ruleName)
-			case <-ctx.Done():
-				log.Printf("%s Массовая очистка отменена.", logPrefix)
-				return
-			}
-			// Очистка записи о задаче
-			ms.mutex.Lock()
-			if userMap, ok := ms.activePurges[chID]; ok {
-				delete(userMap, uID)
-				if len(userMap) == 0 {
-					delete(ms.activePurges, chID)
+		purgeWindow := ms.bot.config.ModPurgeDuration
+		purgeDelay := ms.bot.config.ModPurgeDelay
+		log.Printf("[Moderation] Applying PURGE punishment for user %d in chat %d (rule: %s). Window: %v, Delay: %v", userID, chatID, rule.RuleName, purgeWindow, purgeDelay)
+
+		if purgeDelay > 0 {
+			log.Printf("[Moderation] Scheduling PURGE for user %d in chat %d after %v", userID, chatID, purgeDelay)
+			time.AfterFunc(purgeDelay, func() {
+				ctx, cancel := context.WithCancel(context.Background()) // Создаем новый контекст для отложенной задачи
+				ms.purgeWG.Add(1)
+				go func() {
+					defer ms.purgeWG.Done()
+					ms.purgeUserMessages(ctx, chatID, userID, purgeWindow, rule.RuleName)
+					cancel() // Освобождаем ресурсы контекста после выполнения
+				}()
+				ms.mutex.Lock()
+				if ms.activePurges[chatID] == nil {
+					ms.activePurges[chatID] = make(map[int64]context.CancelFunc)
 				}
+				ms.activePurges[chatID][userID] = cancel // Сохраняем функцию отмены
+				ms.mutex.Unlock()
+			})
+		} else {
+			log.Printf("[Moderation] Starting immediate PURGE for user %d in chat %d", userID, chatID)
+			ctx, cancel := context.WithCancel(context.Background()) // Используем Background, т.к. горутина сама по себе
+			ms.mutex.Lock()
+			if ms.activePurges[chatID] == nil {
+				ms.activePurges[chatID] = make(map[int64]context.CancelFunc)
 			}
+			ms.activePurges[chatID][userID] = cancel // Сохраняем функцию отмены до запуска горутины
 			ms.mutex.Unlock()
-		}(chatID, userID, triggerTime, purgeCtx, rule.RuleName)
-		success = true
+			ms.purgeWG.Add(1)
+			go func() {
+				defer ms.purgeWG.Done()
+				ms.purgeUserMessages(ctx, chatID, userID, purgeWindow, rule.RuleName)
+			}()
+		}
 
 	case config.PunishEdit:
 		// EDIT: удаляем исходное сообщение и отправляем замену
@@ -532,8 +520,8 @@ func (ms *ModerationService) applyPunishment(chatID int64, userID int64, usernam
 	}
 }
 
-// purgeUserMessages асинхронно удаляет сообщения пользователя, начиная с sinceTime.
-func (ms *ModerationService) purgeUserMessages(ctx context.Context, chatID int64, userID int64, sinceTime time.Time, ruleName string) {
+// purgeUserMessages асинхронно удаляет сообщения пользователя за указанный период.
+func (ms *ModerationService) purgeUserMessages(ctx context.Context, chatID int64, userID int64, duration time.Duration, ruleName string) {
 	logPrefix := fmt.Sprintf("[Moderation Purge] Чат %d, Правило '%s', Пользователь %d:", chatID, ruleName, userID)
 	startTime := time.Now()
 	deletedCount := 0
@@ -551,31 +539,35 @@ func (ms *ModerationService) purgeUserMessages(ctx context.Context, chatID int64
 		log.Printf("%s Завершена очистка сообщений. Удалено: %d. Время: %v.", logPrefix, deletedCount, time.Since(startTime))
 	}()
 
-	// Обрезаем sinceTime до секунд для включения сообщений на границе
-	sinceTime = sinceTime.Truncate(time.Second)
-	messagesToDelete, err := ms.bot.storage.GetMessagesSince(ctx, chatID, userID, sinceTime, 0)
+	// 1. Получаем сообщения пользователя за период
+	sinceTime := time.Now().Add(-duration)
+	messagesToDelete, err := ms.bot.storage.GetMessagesSince(ctx, chatID, userID, sinceTime, 0) // 0 - без лимита
 	if err != nil {
 		log.Printf("%s Ошибка получения сообщений для удаления: %v", logPrefix, err)
 		return
 	}
+
 	if len(messagesToDelete) == 0 {
-		log.Printf("%s Не найдено сообщений для удаления, начиная с %v.", logPrefix, sinceTime)
+		log.Printf("%s Не найдено сообщений для удаления за период %v.", logPrefix, duration)
 		return
 	}
-	log.Printf("%s Найдено %d сообщений для удаления, начиная с %v.", logPrefix, len(messagesToDelete), sinceTime)
 
-	// Удаляем сообщения по одному с небольшой задержкой
+	log.Printf("%s Найдено %d сообщений для удаления.", logPrefix, len(messagesToDelete))
+
+	// 2. Удаляем сообщения по одному с небольшой задержкой
 	for _, msg := range messagesToDelete {
+		// Проверяем контекст отмены перед каждым удалением
 		select {
 		case <-ctx.Done():
 			log.Printf("%s Операция очистки отменена.", logPrefix)
 			return
 		default:
+			// Продолжаем удаление
 		}
 
 		ms.bot.deleteMessage(chatID, msg.MessageID)
 		deletedCount++
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond) // Небольшая задержка, чтобы не перегружать API
 	}
 }
 

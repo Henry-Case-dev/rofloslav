@@ -320,7 +320,8 @@ func Load() (*Config, error) {
 	modIntervalStr := getEnvOrDefault("MOD_INTERVAL", "10")
 	modMuteTimeMinStr := getEnvOrDefault("MOD_MUTE_TIME_MIN", "60")
 	modBanTimeMinStr := getEnvOrDefault("MOD_BAN_TIME_MIN", "1440")
-	modPurgeDurationStr := getEnvOrDefault("MOD_PURGE_TIME_MIN", "1")
+	modPurgeWindowDurationStr := getEnvOrDefault("MOD_PURGE_WINDOW_DURATION", "1m")
+	modPurgeDelayDurationStr := getEnvOrDefault("MOD_PURGE_DELAY_DURATION", "0")
 	modCheckAdminRightsStr := getEnvOrDefault("MOD_CHECK_ADMIN_RIGHTS", "true")
 	modDefaultNotifyStr := getEnvOrDefault("MOD_DEFAULT_NOTIFY", "true")
 	modRulesJSON := getEnvOrDefault("MOD_RULES", "[]")
@@ -418,6 +419,7 @@ func Load() (*Config, error) {
 		ModMuteTimeMin:      parseIntOrDefault(modMuteTimeMinStr, 60),
 		ModBanTimeMin:       parseIntOrDefault(modBanTimeMinStr, 1440),
 		ModPurgeDuration:    0,
+		ModPurgeDelay:       0,
 		ModCheckAdminRights: parseBoolOrDefault(modCheckAdminRightsStr, true),
 		ModDefaultNotify:    parseBoolOrDefault(modDefaultNotifyStr, true),
 		ModRules:            []ModerationRule{}, // Инициализация пустым срезом
@@ -432,14 +434,24 @@ func Load() (*Config, error) {
 	}
 	log.Printf("[Config Load] Загружено %d правил модерации.", len(cfg.ModRules))
 
-	// Устанавливаем задержку для очистки сообщений (MOD_PURGE_TIME_MIN): поддержка duration (например "30s", "2m") или целых минут
-	if dur, err := time.ParseDuration(modPurgeDurationStr); err == nil {
-		cfg.ModPurgeDuration = dur
+	// Устанавливаем Duration для Purge из строки
+	if dur, err := time.ParseDuration(modPurgeWindowDurationStr); err != nil {
+		log.Printf("[Config Load WARN] Неверный формат MOD_PURGE_WINDOW_DURATION ('%s'), ожидается duration (например '1m', '30s'): %v. Используется 1m.", modPurgeWindowDurationStr, err)
+		cfg.ModPurgeDuration = time.Minute
 	} else {
-		minutes := parseIntOrDefault(modPurgeDurationStr, 1)
-		cfg.ModPurgeDuration = time.Duration(minutes) * time.Minute
-		log.Printf("[Config Load] MOD_PURGE_TIME_MIN='%s' распознан как %d минут(ы)", modPurgeDurationStr, minutes)
+		cfg.ModPurgeDuration = dur
 	}
+
+	// Устанавливаем Duration для Purge Delay из строки
+	if delayDur, err := time.ParseDuration(modPurgeDelayDurationStr); err != nil {
+		log.Printf("[Config Load WARN] Неверный формат MOD_PURGE_DELAY_DURATION ('%s'), ожидается duration (например '5s', '1m'): %v. Используется 0s.", modPurgeDelayDurationStr, err)
+		cfg.ModPurgeDelay = 0
+	} else {
+		cfg.ModPurgeDelay = delayDur
+	}
+
+	// Парсинг правил модерации из JSON
+	modRulesJSON = os.Getenv("MOD_RULES")
 
 	// --- Парсинг ID в правилах ---
 	for i := range cfg.ModRules {
